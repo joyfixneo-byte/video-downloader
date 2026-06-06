@@ -111,6 +111,57 @@ def build_format(quality: str) -> dict:
     return {"format": fmt, "merge_output_format": "mp4"}
 
 
+def friendly_error(e) -> str:
+    """Переводит технические ошибки yt-dlp в понятное сообщение по-русски."""
+    msg = str(e)
+    low = msg.lower()
+    if "unsupported url" in low:
+        return "Этот сайт или ссылка пока не поддерживаются."
+    if "timed out" in low or "timeout" in low or "read operation" in low:
+        return ("Сайт не ответил вовремя. Возможно, он недоступен с этого "
+                "сервера или перегружен — проверьте ссылку или попробуйте позже.")
+    if "video unavailable" in low:
+        return "Видео недоступно — удалено или закрыто владельцем."
+    if "private" in low:
+        return "Видео приватное, доступ к нему закрыт."
+    if "age" in low and ("confirm" in low or "restrict" in low or "sign" in low):
+        return "Сайт требует подтверждение возраста или вход — скачать не получится."
+    if "sign in" in low or "log in" in low or "login required" in low:
+        return "Сайт требует вход в аккаунт — скачать без авторизации нельзя."
+    if "drm" in low:
+        return "Видео защищено DRM — такое скачать невозможно."
+    if "no video" in low or "no media" in low:
+        return "На этой странице не найдено видео."
+    if ("name or service not known" in low or "failed to resolve" in low
+            or "connection" in low or "network is unreachable" in low):
+        return ("Не удалось соединиться с сайтом. Проверьте ссылку "
+                "или попробуйте позже.")
+    # Запасной вариант — коротко показываем суть.
+    return "Не удалось обработать ссылку: " + msg[:200]
+
+
+def _extract_with_timeout(url: str, opts: dict, timeout: int):
+    """Запускает yt-dlp в отдельном потоке с жёстким таймаутом,
+    чтобы запрос не висел бесконечно."""
+    box: dict = {}
+
+    def run():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                box["data"] = ydl.extract_info(url, download=False)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError("Сайт слишком долго не отвечает")
+    if "error" in box:
+        raise box["error"]
+    return box.get("data")
+
+
 # --- API-модели ------------------------------------------------------------
 
 class InfoRequest(BaseModel):
@@ -132,17 +183,23 @@ def info(req: InfoRequest):
 
     # extract_flat — быстро узнаём, плейлист это или одно видео,
     # не скачивая ничего и не разбирая каждый элемент целиком.
+    # socket_timeout + ограничение повторов, чтобы запрос не висел вечно.
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
+        "socket_timeout": 20,
+        "retries": 1,
+        "extractor_retries": 1,
+        "noprogress": True,
     }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            data = ydl.extract_info(url, download=False)
+        data = _extract_with_timeout(url, opts, timeout=60)
     except Exception as e:
-        raise HTTPException(400, f"Не удалось разобрать ссылку: {e}")
+        raise HTTPException(400, friendly_error(e))
+    if not data:
+        raise HTTPException(400, "На этой странице не найдено видео.")
 
     if data.get("_type") == "playlist" and data.get("entries"):
         entries = []
@@ -200,6 +257,8 @@ def _run_download(job_id: str, url: str, quality: str):
         "noplaylist": True,  # качаем именно это видео, а не весь плейлист
         "progress_hooks": [hook],
         "restrictfilenames": False,
+        "socket_timeout": 30,
+        "retries": 3,
     }
     opts.update(build_format(quality))
 
@@ -217,7 +276,7 @@ def _run_download(job_id: str, url: str, quality: str):
     except Exception as e:
         traceback.print_exc()
         with JOBS_LOCK:
-            JOBS[job_id].update(state="error", error=str(e))
+            JOBS[job_id].update(state="error", error=friendly_error(e))
 
 
 @app.post("/api/download", dependencies=[Depends(check_password)])

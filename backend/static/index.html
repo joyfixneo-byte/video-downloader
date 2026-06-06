@@ -147,17 +147,39 @@ async function init() {
 async function check() {
   const url = document.getElementById("url").value.trim();
   const hint = document.getElementById("checkHint");
-  if (!url) { hint.textContent = "Вставьте ссылку"; return; }
+  hint.className = "hint";
+  if (!url) { hint.classList.add("err"); hint.textContent = "Вставьте ссылку"; return; }
   const btn = document.getElementById("checkBtn");
-  btn.disabled = true; hint.textContent = "Проверяю...";
+  btn.disabled = true;
+
+  // Живой счётчик: показываем, что идёт обработка и сколько уже длится.
+  let sec = 0;
+  hint.textContent = "⏳ Проверяю ссылку… (0 с). Иногда это занимает до минуты.";
+  const timer = setInterval(() => {
+    sec++;
+    hint.textContent = `⏳ Проверяю ссылку… (${sec} с). Иногда это занимает до минуты.`;
+  }, 1000);
+
+  // Жёсткий таймаут на стороне браузера, чтобы не ждать вечно.
+  const ctrl = new AbortController();
+  const abortTimer = setTimeout(() => ctrl.abort(), 70000);
+
   try {
     PARSED = await api("/api/info", {
-      method: "POST", body: JSON.stringify({ url }) });
+      method: "POST", body: JSON.stringify({ url }), signal: ctrl.signal });
+    hint.className = "hint"; hint.textContent = "";
     renderPick();
-    hint.textContent = "";
   } catch (e) {
-    hint.textContent = "⚠ " + e.message;
+    hint.classList.add("err");
+    if (e.name === "AbortError") {
+      hint.textContent = "⚠ Сайт слишком долго не отвечает. Проверьте ссылку "
+        + "или попробуйте позже — возможно, этот сайт недоступен с сервера.";
+    } else {
+      hint.textContent = "⚠ " + e.message;
+    }
   } finally {
+    clearInterval(timer);
+    clearTimeout(abortTimer);
     btn.disabled = false;
   }
 }
