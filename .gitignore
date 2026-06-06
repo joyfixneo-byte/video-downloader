@@ -1,0 +1,9 @@
+# Скачанные видео — не храним в репозитории
+backend/downloads/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Локальные настройки
+.env

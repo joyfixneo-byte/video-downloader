@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Скачать видео</title>
+<style>
+  :root { --bg:#0f1220; --card:#1a1f33; --line:#2a3150; --txt:#e8ecf5;
+          --muted:#8b93b0; --accent:#5b7cff; --ok:#33c481; --err:#ff5d6c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--txt); }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 28px 18px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 22px; }
+  .card { background: var(--card); border:1px solid var(--line);
+          border-radius: 14px; padding: 18px; margin-bottom: 16px; }
+  label { display:block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 12px 14px; border-radius: 10px;
+    border:1px solid var(--line); background:#11152a; color: var(--txt);
+    font-size: 15px; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); }
+  .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 160px; }
+  button { padding: 12px 18px; border-radius: 10px; border:none; cursor:pointer;
+           background: var(--accent); color:#fff; font-size: 15px; font-weight:600; }
+  button:disabled { opacity:.5; cursor: default; }
+  button.ghost { background: transparent; border:1px solid var(--line); color: var(--txt); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .ep { display:flex; align-items:center; gap:10px; padding:8px 6px;
+        border-bottom:1px solid var(--line); font-size:14px; }
+  .ep:last-child { border-bottom:none; }
+  .ep input { width:auto; }
+  .ep-list { max-height: 320px; overflow:auto; margin-top: 8px; }
+  .jobs { margin-top: 4px; }
+  .job { padding:12px; border:1px solid var(--line); border-radius:10px; margin-bottom:10px; }
+  .job .name { font-size:14px; margin-bottom:8px; word-break: break-word; }
+  .bar { height:8px; background:#11152a; border-radius:6px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0; background: var(--accent);
+             transition: width .3s; }
+  .meta { font-size:12px; color: var(--muted); margin-top:6px; }
+  .done { color: var(--ok); }  .err { color: var(--err); }
+  a.dl { display:inline-block; margin-top:8px; color:#fff; background:var(--ok);
+         padding:8px 14px; border-radius:8px; text-decoration:none; font-weight:600; }
+  .hidden { display:none; }
+  .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 Скачать видео</h1>
+  <p class="sub">Вставь ссылку на страницу с видео — выбери серию и качество.</p>
+
+  <!-- Пароль -->
+  <div class="card hidden" id="pwCard">
+    <label>Пароль доступа</label>
+    <div class="row">
+      <div><input type="password" id="pw" placeholder="Введите пароль"></div>
+      <button onclick="savePw()">Войти</button>
+    </div>
+  </div>
+
+  <!-- Ссылка -->
+  <div class="card">
+    <label>Ссылка на видео</label>
+    <div class="row">
+      <div><input type="text" id="url" placeholder="https://..."></div>
+      <button id="checkBtn" onclick="check()">Проверить</button>
+    </div>
+    <div class="hint" id="checkHint"></div>
+  </div>
+
+  <!-- Результат разбора -->
+  <div class="card hidden" id="pickCard">
+    <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
+
+    <div id="epBlock" class="hidden">
+      <div class="selbar">
+        <button class="ghost" onclick="selectAll(true)">Выбрать все</button>
+        <button class="ghost" onclick="selectAll(false)">Снять все</button>
+        <span class="hint" id="selCount"></span>
+      </div>
+      <div class="ep-list" id="epList"></div>
+    </div>
+
+    <div class="row" style="margin-top:14px;">
+      <div>
+        <label>Качество</label>
+        <select id="quality">
+          <option value="best">Лучшее доступное</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+          <option value="480">480p</option>
+          <option value="audio">Только звук (mp3)</option>
+        </select>
+      </div>
+      <button id="dlBtn" onclick="startDownload()">Скачать</button>
+    </div>
+  </div>
+
+  <!-- Задачи -->
+  <div class="card hidden" id="jobsCard">
+    <label>Загрузки</label>
+    <div class="jobs" id="jobs"></div>
+  </div>
+</div>
+
+<script>
+let PARSED = null;          // результат /api/info
+let PASSWORD = localStorage.getItem("dl_pw") || "";
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if (PASSWORD) h["X-Access-Password"] = PASSWORD;
+  return h;
+}
+
+async function api(path, opts={}) {
+  const res = await fetch(path, { headers: headers(), ...opts });
+  if (res.status === 401) {
+    document.getElementById("pwCard").classList.remove("hidden");
+    throw new Error("Нужен пароль");
+  }
+  if (!res.ok) {
+    const t = await res.json().catch(() => ({}));
+    throw new Error(t.detail || ("Ошибка " + res.status));
+  }
+  return res.json();
+}
+
+function savePw() {
+  PASSWORD = document.getElementById("pw").value.trim();
+  localStorage.setItem("dl_pw", PASSWORD);
+  document.getElementById("pwCard").classList.add("hidden");
+}
+
+async function init() {
+  try {
+    const cfg = await fetch("/api/config").then(r => r.json());
+    if (cfg.password_required && !PASSWORD)
+      document.getElementById("pwCard").classList.remove("hidden");
+  } catch (e) {}
+}
+
+async function check() {
+  const url = document.getElementById("url").value.trim();
+  const hint = document.getElementById("checkHint");
+  if (!url) { hint.textContent = "Вставьте ссылку"; return; }
+  const btn = document.getElementById("checkBtn");
+  btn.disabled = true; hint.textContent = "Проверяю...";
+  try {
+    PARSED = await api("/api/info", {
+      method: "POST", body: JSON.stringify({ url }) });
+    renderPick();
+    hint.textContent = "";
+  } catch (e) {
+    hint.textContent = "⚠ " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderPick() {
+  document.getElementById("pickCard").classList.remove("hidden");
+  document.getElementById("title").textContent = PARSED.title;
+  const epBlock = document.getElementById("epBlock");
+  const list = document.getElementById("epList");
+  list.innerHTML = "";
+  if (PARSED.type === "playlist") {
+    epBlock.classList.remove("hidden");
+    PARSED.entries.forEach((e, i) => {
+      const row = document.createElement("label");
+      row.className = "ep";
+      row.innerHTML = `<input type="checkbox" data-i="${i}">
+                       <span>${i + 1}. ${escapeHtml(e.title)}</span>`;
+      row.querySelector("input").addEventListener("change", updateSelCount);
+      list.appendChild(row);
+    });
+    updateSelCount();
+  } else {
+    epBlock.classList.add("hidden");
+  }
+}
+
+function selectAll(v) {
+  document.querySelectorAll("#epList input").forEach(c => c.checked = v);
+  updateSelCount();
+}
+function updateSelCount() {
+  const n = document.querySelectorAll("#epList input:checked").length;
+  document.getElementById("selCount").textContent = n ? `выбрано: ${n}` : "";
+}
+
+function startDownload() {
+  const quality = document.getElementById("quality").value;
+  let targets = [];
+  if (PARSED.type === "playlist") {
+    document.querySelectorAll("#epList input:checked").forEach(c => {
+      const e = PARSED.entries[+c.dataset.i];
+      targets.push({ url: e.url, title: e.title });
+    });
+    if (!targets.length) { alert("Выберите хотя бы одну серию"); return; }
+  } else {
+    targets.push({ url: PARSED.url, title: PARSED.title });
+  }
+  document.getElementById("jobsCard").classList.remove("hidden");
+  targets.forEach(t => createJob(t, quality));
+}
+
+async function createJob(target, quality) {
+  const wrap = document.getElementById("jobs");
+  const el = document.createElement("div");
+  el.className = "job";
+  el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
+    <div class="bar"><i></i></div>
+    <div class="meta">в очереди...</div>`;
+  wrap.prepend(el);
+  try {
+    const { job_id } = await api("/api/download", {
+      method: "POST",
+      body: JSON.stringify({ url: target.url, quality }) });
+    poll(job_id, el);
+  } catch (e) {
+    el.querySelector(".meta").innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+  }
+}
+
+async function poll(jobId, el) {
+  const bar = el.querySelector(".bar > i");
+  const meta = el.querySelector(".meta");
+  try {
+    const s = await api("/api/status/" + jobId);
+    if (s.state === "downloading") {
+      if (s.percent != null) bar.style.width = s.percent + "%";
+      const spd = s.speed ? (s.speed / 1048576).toFixed(1) + " МБ/с" : "";
+      const eta = s.eta ? " · осталось ~" + s.eta + "с" : "";
+      meta.textContent = `скачивание ${s.percent ?? ""}% ${spd}${eta}`;
+    } else if (s.state === "processing") {
+      bar.style.width = "100%";
+      meta.textContent = "обработка (склейка видео и звука)...";
+    } else if (s.state === "queued") {
+      meta.textContent = "в очереди...";
+    } else if (s.state === "done") {
+      bar.style.width = "100%";
+      meta.innerHTML = `<span class="done">✓ Готово</span>
+        <br><a class="dl" href="/api/file/${jobId}">⬇ Скачать файл</a>`;
+      return;
+    } else if (s.state === "error") {
+      meta.innerHTML = `<span class="err">⚠ ${escapeHtml(s.error || "ошибка")}</span>`;
+      return;
+    }
+  } catch (e) {
+    meta.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    return;
+  }
+  setTimeout(() => poll(jobId, el), 1200);
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, c => (
+    { "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+init();
+</script>
+</body>
+</html>

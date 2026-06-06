@@ -1,0 +1,233 @@
+"""
+Мини-сайт для скачивания видео по ссылке.
+Бэкенд: FastAPI + yt-dlp. Отдаёт фронтенд и REST API.
+
+Запуск (локально):  uvicorn app:app --host 0.0.0.0 --port 8000
+"""
+import os
+import re
+import uuid
+import threading
+import traceback
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import yt_dlp
+
+# --- Настройки -------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Необязательный пароль. Если переменная окружения DOWNLOADER_PASSWORD задана,
+# то фронтенд должен присылать её в заголовке X-Access-Password.
+ACCESS_PASSWORD = os.environ.get("DOWNLOADER_PASSWORD", "").strip()
+
+app = FastAPI(title="Video Downloader")
+
+# Хранилище задач скачивания в памяти процесса.
+# job_id -> dict(state, percent, speed, eta, title, filename, error)
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+
+
+# --- Защита паролем --------------------------------------------------------
+
+async def check_password(request: Request):
+    if not ACCESS_PASSWORD:
+        return  # пароль не настроен — пускаем всех
+    sent = request.headers.get("x-access-password", "")
+    if sent != ACCESS_PASSWORD:
+        raise HTTPException(status_code=401, detail="Неверный пароль")
+
+
+# --- Вспомогательное -------------------------------------------------------
+
+def safe_name(name: str) -> str:
+    """Убираем из имени файла символы, опасные для файловой системы."""
+    name = re.sub(r'[\\/:*?"<>|]', "_", name or "video")
+    return name.strip()[:150] or "video"
+
+
+def build_format(quality: str) -> dict:
+    """Возвращает кусок ydl_opts под выбранное качество."""
+    if quality == "audio":
+        return {
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                 "preferredquality": "192"}
+            ],
+        }
+    if quality == "best":
+        fmt = "bestvideo+bestaudio/best"
+    else:
+        # quality = "1080" / "720" / "480" ...
+        h = int(quality)
+        fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+    return {"format": fmt, "merge_output_format": "mp4"}
+
+
+# --- API-модели ------------------------------------------------------------
+
+class InfoRequest(BaseModel):
+    url: str
+
+
+class DownloadRequest(BaseModel):
+    url: str
+    quality: str = "best"
+
+
+# --- /api/info: разбор ссылки ---------------------------------------------
+
+@app.post("/api/info", dependencies=[Depends(check_password)])
+def info(req: InfoRequest):
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(400, "Пустая ссылка")
+
+    # extract_flat — быстро узнаём, плейлист это или одно видео,
+    # не скачивая ничего и не разбирая каждый элемент целиком.
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise HTTPException(400, f"Не удалось разобрать ссылку: {e}")
+
+    if data.get("_type") == "playlist" and data.get("entries"):
+        entries = []
+        for i, e in enumerate(data["entries"]):
+            if not e:
+                continue
+            entries.append({
+                "index": i,
+                "title": e.get("title") or f"Серия {i + 1}",
+                "url": e.get("url") or e.get("webpage_url") or e.get("id"),
+            })
+        return {
+            "type": "playlist",
+            "title": data.get("title") or "Плейлист",
+            "count": len(entries),
+            "entries": entries,
+        }
+
+    return {
+        "type": "video",
+        "title": data.get("title") or "Видео",
+        "url": data.get("webpage_url") or url,
+        "thumbnail": data.get("thumbnail"),
+        "duration": data.get("duration"),
+    }
+
+
+# --- Фоновое скачивание ----------------------------------------------------
+
+def _run_download(job_id: str, url: str, quality: str):
+    job_dir = DOWNLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    def hook(d):
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                job["state"] = "downloading"
+                job["percent"] = round(done / total * 100, 1) if total else None
+                job["speed"] = d.get("speed")
+                job["eta"] = d.get("eta")
+            elif d["status"] == "finished":
+                # видео скачано, дальше может идти склейка/конвертация
+                job["state"] = "processing"
+                job["percent"] = 100
+
+    opts = {
+        "outtmpl": str(job_dir / "%(title)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,  # качаем именно это видео, а не весь плейлист
+        "progress_hooks": [hook],
+        "restrictfilenames": False,
+    }
+    opts.update(build_format(quality))
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        files = [p for p in job_dir.iterdir() if p.is_file()]
+        if not files:
+            raise RuntimeError("Файл не найден после скачивания")
+        result = max(files, key=lambda p: p.stat().st_size)
+        with JOBS_LOCK:
+            JOBS[job_id].update(
+                state="done", percent=100, filename=result.name)
+    except Exception as e:
+        traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS[job_id].update(state="error", error=str(e))
+
+
+@app.post("/api/download", dependencies=[Depends(check_password)])
+def download(req: DownloadRequest):
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(400, "Пустая ссылка")
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "state": "queued", "percent": None, "speed": None,
+            "eta": None, "title": None, "filename": None, "error": None,
+        }
+    t = threading.Thread(
+        target=_run_download, args=(job_id, url, req.quality), daemon=True)
+    t.start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/status/{job_id}", dependencies=[Depends(check_password)])
+def status(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Задача не найдена")
+        return dict(job, job_id=job_id)
+
+
+@app.get("/api/file/{job_id}")
+def get_file(job_id: str):
+    # Файл отдаём без пароля в заголовке — браузер скачивает по прямой ссылке.
+    # job_id случайный и неугадываемый, этого достаточно для личного сервера.
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job or job.get("state") != "done" or not job.get("filename"):
+        raise HTTPException(404, "Файл не готов")
+    path = DOWNLOAD_DIR / job_id / job["filename"]
+    if not path.exists():
+        raise HTTPException(404, "Файл не найден")
+    return FileResponse(
+        path, filename=job["filename"], media_type="application/octet-stream")
+
+
+@app.get("/api/config")
+def config():
+    # Фронтенду нужно знать, спрашивать ли пароль.
+    return {"password_required": bool(ACCESS_PASSWORD)}
+
+
+# --- Раздача фронтенда -----------------------------------------------------
+# Должно идти последним, чтобы не перехватывать /api/*
+app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
