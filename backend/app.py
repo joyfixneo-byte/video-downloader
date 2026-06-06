@@ -6,7 +6,9 @@
 """
 import os
 import re
+import time
 import uuid
+import shutil
 import threading
 import traceback
 from pathlib import Path
@@ -27,12 +29,49 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # то фронтенд должен присылать её в заголовке X-Access-Password.
 ACCESS_PASSWORD = os.environ.get("DOWNLOADER_PASSWORD", "").strip()
 
+# Через сколько часов после скачивания удалять файлы (по умолчанию 3 часа).
+RETENTION_SECONDS = int(float(os.environ.get("RETENTION_HOURS", "3")) * 3600)
+CLEANUP_INTERVAL = 600  # как часто проверять папку, секунд (10 минут)
+
 app = FastAPI(title="Video Downloader")
 
 # Хранилище задач скачивания в памяти процесса.
 # job_id -> dict(state, percent, speed, eta, title, filename, error)
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+
+
+# --- Автоудаление старых файлов -------------------------------------------
+
+def _cleanup_loop():
+    """Раз в CLEANUP_INTERVAL удаляет папки задач старше RETENTION_SECONDS.
+
+    Возраст считаем по самому свежему файлу в папке — то есть отсчёт идёт
+    от момента, когда скачивание завершилось. Файл, который ещё качается
+    (mtime обновляется), под удаление не попадёт.
+    """
+    while True:
+        try:
+            now = time.time()
+            if DOWNLOAD_DIR.exists():
+                for d in DOWNLOAD_DIR.iterdir():
+                    if not d.is_dir():
+                        continue
+                    files = [p for p in d.iterdir() if p.is_file()]
+                    newest = (max(p.stat().st_mtime for p in files)
+                              if files else d.stat().st_mtime)
+                    if now - newest > RETENTION_SECONDS:
+                        shutil.rmtree(d, ignore_errors=True)
+                        with JOBS_LOCK:
+                            job = JOBS.get(d.name)
+                            if job:
+                                job.update(state="expired", filename=None)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(CLEANUP_INTERVAL)
+
+
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
 # --- Защита паролем --------------------------------------------------------
