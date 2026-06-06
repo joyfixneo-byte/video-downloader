@@ -41,6 +41,10 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 
+class _Cancelled(Exception):
+    """Бросается из progress-хука, когда пользователь нажал «Остановить»."""
+
+
 # --- Автоудаление старых файлов -------------------------------------------
 
 def _cleanup_loop():
@@ -238,17 +242,24 @@ def _run_download(job_id: str, url: str, quality: str):
             job = JOBS.get(job_id)
             if not job:
                 return
-            if d["status"] == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                done = d.get("downloaded_bytes") or 0
-                job["state"] = "downloading"
-                job["percent"] = round(done / total * 100, 1) if total else None
-                job["speed"] = d.get("speed")
-                job["eta"] = d.get("eta")
-            elif d["status"] == "finished":
-                # видео скачано, дальше может идти склейка/конвертация
-                job["state"] = "processing"
-                job["percent"] = 100
+            cancel = job.get("cancel")
+            if not cancel:
+                if d["status"] == "downloading":
+                    total = (d.get("total_bytes")
+                             or d.get("total_bytes_estimate") or 0)
+                    done = d.get("downloaded_bytes") or 0
+                    job["state"] = "downloading"
+                    job["percent"] = round(done / total * 100, 1) if total else None
+                    job["speed"] = d.get("speed")
+                    job["eta"] = d.get("eta")
+                    job["total"] = total or None
+                elif d["status"] == "finished":
+                    # видео скачано, дальше может идти склейка/конвертация
+                    job["state"] = "processing"
+                    job["percent"] = 100
+        # Прерываем загрузку вне блокировки, чтобы yt-dlp поймал исключение.
+        if cancel:
+            raise _Cancelled()
 
     opts = {
         "outtmpl": str(job_dir / "%(title)s.%(ext)s"),
@@ -266,17 +277,35 @@ def _run_download(job_id: str, url: str, quality: str):
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
 
+        # Отмену могли нажать на этапе склейки, когда хук уже не вызывается.
+        with JOBS_LOCK:
+            cancelled = JOBS.get(job_id, {}).get("cancel")
+        if cancelled:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="cancelled", filename=None)
+            return
+
         files = [p for p in job_dir.iterdir() if p.is_file()]
         if not files:
             raise RuntimeError("Файл не найден после скачивания")
         result = max(files, key=lambda p: p.stat().st_size)
         with JOBS_LOCK:
             JOBS[job_id].update(
-                state="done", percent=100, filename=result.name)
+                state="done", percent=100,
+                filename=result.name, size=result.stat().st_size)
     except Exception as e:
-        traceback.print_exc()
+        # Если это была отмена пользователем — чистим частичные файлы.
         with JOBS_LOCK:
-            JOBS[job_id].update(state="error", error=friendly_error(e))
+            cancelled = JOBS.get(job_id, {}).get("cancel")
+        if cancelled or isinstance(e, _Cancelled):
+            shutil.rmtree(job_dir, ignore_errors=True)
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="cancelled", filename=None)
+        else:
+            traceback.print_exc()
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="error", error=friendly_error(e))
 
 
 @app.post("/api/download", dependencies=[Depends(check_password)])
@@ -289,6 +318,7 @@ def download(req: DownloadRequest):
         JOBS[job_id] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": None, "filename": None, "error": None,
+            "cancel": False, "total": None, "size": None,
         }
     t = threading.Thread(
         target=_run_download, args=(job_id, url, req.quality), daemon=True)
@@ -303,6 +333,33 @@ def status(job_id: str):
         if not job:
             raise HTTPException(404, "Задача не найдена")
         return dict(job, job_id=job_id)
+
+
+@app.post("/api/cancel/{job_id}", dependencies=[Depends(check_password)])
+def cancel(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Задача не найдена")
+        if job.get("state") in ("done", "error", "cancelled", "deleted", "expired"):
+            return {"ok": True, "state": job["state"]}
+        job["cancel"] = True
+    return {"ok": True}
+
+
+@app.post("/api/delete/{job_id}", dependencies=[Depends(check_password)])
+def delete_file(job_id: str):
+    # job_id приходит из адреса — оставляем только буквы/цифры,
+    # чтобы нельзя было выйти за пределы папки загрузок.
+    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
+    target = DOWNLOAD_DIR / safe
+    if target.exists() and target.is_dir():
+        shutil.rmtree(target, ignore_errors=True)
+    with JOBS_LOCK:
+        job = JOBS.get(safe)
+        if job:
+            job.update(state="deleted", filename=None, size=None)
+    return {"ok": True}
 
 
 @app.get("/api/file/{job_id}")

@@ -40,8 +40,10 @@
   .bar > i { display:block; height:100%; width:0; background: var(--accent);
              transition: width .3s; }
   .meta { font-size:12px; color: var(--muted); margin-top:6px; }
-  .done { color: var(--ok); }  .err { color: var(--err); }
-  a.dl { display:inline-block; margin-top:8px; color:#fff; background:var(--ok);
+  .done { color: var(--ok); }  .err { color: var(--err); }  .muted { color: var(--muted); }
+  .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button.small { padding:7px 12px; font-size:13px; }
+  a.dl { display:inline-block; color:#fff; background:var(--ok);
          padding:8px 14px; border-radius:8px; text-decoration:none; font-weight:600; }
   .hidden { display:none; }
   .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
@@ -237,7 +239,8 @@ async function createJob(target, quality) {
   el.className = "job";
   el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
     <div class="bar"><i></i></div>
-    <div class="meta">в очереди...</div>`;
+    <div class="meta">в очереди…</div>
+    <div class="controls"></div>`;
   wrap.prepend(el);
   try {
     const { job_id } = await api("/api/download", {
@@ -249,35 +252,81 @@ async function createJob(target, quality) {
   }
 }
 
+function fmtSize(bytes) {
+  if (!bytes) return "";
+  const mb = bytes / 1048576;
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + " ГБ" : mb.toFixed(1) + " МБ";
+}
+
+const stopBtn = jobId =>
+  `<button class="ghost small" onclick="cancelJob('${jobId}', this)">⛔ Остановить</button>`;
+
 async function poll(jobId, el) {
   const bar = el.querySelector(".bar > i");
   const meta = el.querySelector(".meta");
+  const controls = el.querySelector(".controls");
   try {
     const s = await api("/api/status/" + jobId);
     if (s.state === "downloading") {
       if (s.percent != null) bar.style.width = s.percent + "%";
       const spd = s.speed ? (s.speed / 1048576).toFixed(1) + " МБ/с" : "";
-      const eta = s.eta ? " · осталось ~" + s.eta + "с" : "";
-      meta.textContent = `скачивание ${s.percent ?? ""}% ${spd}${eta}`;
+      const eta = s.eta ? " · осталось ~" + s.eta + " с" : "";
+      const sz = s.total ? " · размер ~" + fmtSize(s.total) : "";
+      meta.textContent = `Скачивание ${s.percent ?? ""}% ${spd}${eta}${sz}`;
+      controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "processing") {
       bar.style.width = "100%";
-      meta.textContent = "обработка (склейка видео и звука)...";
+      meta.textContent = "Обработка (склейка видео и звука)…";
+      controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "queued") {
-      meta.textContent = "в очереди...";
+      meta.textContent = "В очереди…";
+      controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "done") {
       bar.style.width = "100%";
-      meta.innerHTML = `<span class="done">✓ Готово</span>
-        <br><a class="dl" href="/api/file/${jobId}">⬇ Скачать файл</a>`;
+      const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
+      meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
+      controls.innerHTML =
+        `<a class="dl" href="/api/file/${jobId}">⬇ Скачать файл</a>` +
+        `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       return;
+    } else if (s.state === "cancelled") {
+      meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
+      controls.innerHTML = ""; return;
+    } else if (s.state === "deleted") {
+      meta.innerHTML = `<span class="muted">🗑 Удалено с сервера</span>`;
+      controls.innerHTML = ""; return;
+    } else if (s.state === "expired") {
+      meta.innerHTML = `<span class="muted">срок хранения истёк, файл удалён</span>`;
+      controls.innerHTML = ""; return;
     } else if (s.state === "error") {
       meta.innerHTML = `<span class="err">⚠ ${escapeHtml(s.error || "ошибка")}</span>`;
-      return;
+      controls.innerHTML = ""; return;
     }
   } catch (e) {
     meta.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
     return;
   }
   setTimeout(() => poll(jobId, el), 1200);
+}
+
+async function cancelJob(jobId, btn) {
+  btn.disabled = true; btn.textContent = "Останавливаю…";
+  try { await api("/api/cancel/" + jobId, { method: "POST" }); }
+  catch (e) { btn.disabled = false; btn.textContent = "⛔ Остановить"; }
+}
+
+async function deleteJob(jobId, btn) {
+  if (!confirm("Удалить этот файл с сервера?")) return;
+  btn.disabled = true; btn.textContent = "Удаляю…";
+  try {
+    await api("/api/delete/" + jobId, { method: "POST" });
+    const job = btn.closest(".job");
+    job.querySelector(".meta").innerHTML = `<span class="muted">🗑 Удалено с сервера</span>`;
+    job.querySelector(".controls").innerHTML = "";
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "🗑 Удалить с сервера";
+    alert("Не удалось удалить: " + e.message);
+  }
 }
 
 function escapeHtml(s) {
