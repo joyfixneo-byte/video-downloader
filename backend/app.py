@@ -362,6 +362,33 @@ def delete_file(job_id: str):
     return {"ok": True}
 
 
+@app.get("/api/files", dependencies=[Depends(check_password)])
+def list_files():
+    """Список файлов, реально лежащих на сервере (читаем с диска,
+    чтобы видеть их даже после перезапуска сервиса)."""
+    items = []
+    if DOWNLOAD_DIR.exists():
+        now = time.time()
+        for d in DOWNLOAD_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            files = [p for p in d.iterdir() if p.is_file()]
+            if not files:
+                continue
+            result = max(files, key=lambda p: p.stat().st_size)
+            mtime = result.stat().st_mtime
+            remaining = int(RETENTION_SECONDS - (now - mtime))
+            items.append({
+                "job_id": d.name,
+                "filename": result.name,
+                "size": result.stat().st_size,
+                "remaining": max(0, remaining),
+                "mtime": mtime,
+            })
+    items.sort(key=lambda x: x["mtime"], reverse=True)  # новые сверху
+    return {"files": items}
+
+
 @app.get("/api/file/{job_id}")
 def get_file(job_id: str):
     # Файл отдаём без пароля в заголовке — браузер скачивает по прямой ссылке.
