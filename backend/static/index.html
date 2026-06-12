@@ -36,19 +36,20 @@
   .jobs { margin-top: 4px; }
   .job { padding:12px; border:1px solid var(--line); border-radius:10px; margin-bottom:10px; }
   .job .name { font-size:14px; margin-bottom:8px; word-break: break-word; }
-  /* Прогресс «тетрис»: ряд ячеек, новые блоки падают сверху и встают на место */
-  .tetris { display:flex; gap:3px; height:24px; margin-top:4px; }
-  .tetris .cell { flex:1; background:#11152a; border-radius:3px;
-                  border:1px solid #1e2542; }
-  .tetris .cell.on { border-color: transparent;
-                     box-shadow: inset 0 -3px 0 rgba(0,0,0,.25),
-                                 inset 0 1px 0 rgba(255,255,255,.35); }
-  @keyframes drop {
-    0%   { transform: translateY(-24px); opacity: 0; }
-    60%  { transform: translateY(3px);   opacity: 1; }
-    100% { transform: translateY(0); }
-  }
-  .tetris .cell.drop { animation: drop .38s cubic-bezier(.25,.9,.3,1.25); }
+  /* Мини-игра «Тетрис» как экран загрузки */
+  #game { display:flex; flex-direction:column; align-items:center; gap:10px;
+          margin:8px 0 16px; }
+  .game-head { width:220px; display:flex; justify-content:space-between;
+               font-size:12px; color:var(--muted); }
+  #board { background:#0b0e1a; border:1px solid var(--line); border-radius:8px;
+           touch-action:none; }
+  .game-controls { display:flex; gap:8px; }
+  .gbtn { width:60px; height:50px; font-size:20px; background:#222a44;
+          border:1px solid var(--line); color:var(--txt); border-radius:10px;
+          user-select:none; }
+  .gbtn:active { background:#2e3962; }
+  #gameOver { font-size:13px; color:var(--err); display:flex; gap:8px;
+              align-items:center; }
   .meta { font-size:12px; color: var(--muted); margin-top:6px; }
   .done { color: var(--ok); }  .err { color: var(--err); }  .muted { color: var(--muted); }
   .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
@@ -115,6 +116,25 @@
   <!-- Задачи -->
   <div class="card hidden" id="jobsCard">
     <label>Загрузки</label>
+
+    <!-- Игра вместо скучной полосы: играй, пока качается -->
+    <div id="game">
+      <div class="game-head">
+        <span>🎮 Тетрис — пока качается</span>
+        <span id="gameScore">Очки: 0 · Линии: 0</span>
+      </div>
+      <canvas id="board" width="220" height="352"></canvas>
+      <div class="game-controls">
+        <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">◀</button>
+        <button class="gbtn" onmousedown="GAME.rotate()" ontouchstart="event.preventDefault();GAME.rotate()">⟳</button>
+        <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">▼</button>
+        <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">▶</button>
+      </div>
+      <div id="gameOver" class="hidden">
+        Игра окончена · <button class="ghost small" onclick="GAME.restart()">Заново</button>
+      </div>
+    </div>
+
     <div class="jobs" id="jobs"></div>
   </div>
 
@@ -249,6 +269,7 @@ function startDownload() {
     targets.push({ url: PARSED.url, title: PARSED.title });
   }
   document.getElementById("jobsCard").classList.remove("hidden");
+  GAME.start();
   targets.forEach(t => createJob(t, quality));
 }
 
@@ -257,7 +278,6 @@ async function createJob(target, quality) {
   const el = document.createElement("div");
   el.className = "job";
   el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
-    <div class="tetris"></div>
     <div class="meta">в очереди…</div>
     <div class="controls"></div>`;
   wrap.prepend(el);
@@ -287,45 +307,160 @@ function fmtTime(s) {
   return `${sec} с`;
 }
 
-// Прогресс-бар «тетрис»: засвечиваем ячейки по проценту, новые — с падением.
-const TETRIS_CELLS = 24;
-const TETRIS_COLORS = ["#00e5ff", "#ffd400", "#b14cff", "#33c481",
-                       "#ff5d6c", "#5b7cff", "#ff9f1a"];
-function renderTetris(box, percent) {
-  if (!box.dataset.init) {
-    for (let i = 0; i < TETRIS_CELLS; i++) {
-      const c = document.createElement("span");
-      c.className = "cell";
-      box.appendChild(c);
-    }
-    box.dataset.init = "1";
+// --- Мини-игра «Тетрис» (экран загрузки) ---------------------------------
+const GAME = (function () {
+  const COLS = 10, ROWS = 16, B = 22;       // поле 10×16, клетка 22px
+  const SHAPES = {
+    I: [[1, 1, 1, 1]],
+    O: [[1, 1], [1, 1]],
+    T: [[0, 1, 0], [1, 1, 1]],
+    S: [[0, 1, 1], [1, 1, 0]],
+    Z: [[1, 1, 0], [0, 1, 1]],
+    J: [[1, 0, 0], [1, 1, 1]],
+    L: [[0, 0, 1], [1, 1, 1]],
+  };
+  const COLORS = {
+    I: "#00e5ff", O: "#ffd400", T: "#b14cff", S: "#33c481",
+    Z: "#ff5d6c", J: "#5b7cff", L: "#ff9f1a",
+  };
+  let canvas, ctx, board, piece, color, px, py;
+  let score, lines, over, dropMs, acc, last, raf, started;
+
+  function newBoard() {
+    return Array.from({ length: ROWS }, () => Array(COLS).fill(""));
   }
-  const lit = Math.round((percent || 0) / 100 * TETRIS_CELLS);
-  [...box.children].forEach((c, i) => {
-    if (i < lit) {
-      if (!c.classList.contains("on")) {
-        c.classList.add("on", "drop");
-        c.style.background = TETRIS_COLORS[i % TETRIS_COLORS.length];
-        setTimeout(() => c.classList.remove("drop"), 400);
-      }
-    } else {
-      c.classList.remove("on");
-      c.style.background = "";
+  function reset() {
+    board = newBoard(); score = 0; lines = 0; over = false; dropMs = 600;
+    document.getElementById("gameOver").classList.add("hidden");
+    spawn(); hud();
+  }
+  function spawn() {
+    const keys = Object.keys(SHAPES);
+    const k = keys[Math.random() * keys.length | 0];
+    piece = SHAPES[k].map(r => r.slice());
+    color = COLORS[k];
+    px = (COLS >> 1) - (piece[0].length >> 1); py = 0;
+    if (!valid(piece, px, py)) {
+      over = true;
+      document.getElementById("gameOver").classList.remove("hidden");
     }
+  }
+  function valid(m, ox, oy) {
+    for (let r = 0; r < m.length; r++)
+      for (let c = 0; c < m[r].length; c++)
+        if (m[r][c]) {
+          const x = ox + c, y = oy + r;
+          if (x < 0 || x >= COLS || y >= ROWS) return false;
+          if (y >= 0 && board[y][x]) return false;
+        }
+    return true;
+  }
+  function merge() {
+    for (let r = 0; r < piece.length; r++)
+      for (let c = 0; c < piece[r].length; c++)
+        if (piece[r][c] && py + r >= 0) board[py + r][px + c] = color;
+  }
+  function clearLines() {
+    let n = 0;
+    for (let r = ROWS - 1; r >= 0; r--) {
+      if (board[r].every(v => v)) {
+        board.splice(r, 1); board.unshift(Array(COLS).fill("")); n++; r++;
+      }
+    }
+    if (n) {
+      lines += n;
+      score += [0, 40, 100, 300, 1200][n];
+      dropMs = Math.max(120, 600 - lines * 12);   // с каждой линией быстрее
+    }
+  }
+  function lock() { merge(); clearLines(); spawn(); hud(); }
+  function step() { if (valid(piece, px, py + 1)) py++; else lock(); }
+
+  function move(d) {
+    if (over || !started) return;
+    if (valid(piece, px + d, py)) { px += d; draw(); }
+  }
+  function rotate() {
+    if (over || !started) return;
+    const m = piece[0].map((_, c) => piece.map(r => r[c]).reverse());
+    if (valid(m, px, py)) piece = m;
+    else if (valid(m, px - 1, py)) { px--; piece = m; }
+    else if (valid(m, px + 1, py)) { px++; piece = m; }
+    draw();
+  }
+  function soft() {
+    if (over || !started) return;
+    if (valid(piece, px, py + 1)) py++; else lock();
+    draw();
+  }
+
+  function loop(t) {
+    if (over) { draw(); return; }
+    if (!last) last = t;
+    acc += t - last; last = t;
+    while (acc >= dropMs) { step(); acc -= dropMs; }
+    draw();
+    raf = requestAnimationFrame(loop);
+  }
+  function cell(x, y, col) {
+    if (y < 0) return;
+    ctx.fillStyle = col;
+    ctx.fillRect(x * B + 1, y * B + 1, B - 2, B - 2);
+    ctx.fillStyle = "rgba(255,255,255,.28)";
+    ctx.fillRect(x * B + 1, y * B + 1, B - 2, 3);
+  }
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++)
+        if (board[r][c]) cell(c, r, board[r][c]);
+    if (!over)
+      for (let r = 0; r < piece.length; r++)
+        for (let c = 0; c < piece[r].length; c++)
+          if (piece[r][c]) cell(px + c, py + r, color);
+  }
+  function hud() {
+    document.getElementById("gameScore").textContent =
+      `Очки: ${score} · Линии: ${lines}`;
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+    canvas = document.getElementById("board");
+    ctx = canvas.getContext("2d");
+    reset(); last = 0; acc = 0;
+    raf = requestAnimationFrame(loop);
+  }
+  function restart() {
+    cancelAnimationFrame(raf);
+    reset(); last = 0; acc = 0;
+    raf = requestAnimationFrame(loop);
+  }
+
+  // Клавиатура (для компьютера)
+  window.addEventListener("keydown", e => {
+    if (!started) return;
+    if (e.key === "ArrowLeft") move(-1);
+    else if (e.key === "ArrowRight") move(1);
+    else if (e.key === "ArrowUp") rotate();
+    else if (e.key === "ArrowDown") soft();
+    else return;
+    e.preventDefault();
   });
-}
+
+  return { start, restart, move, rotate, soft };
+})();
 
 const stopBtn = jobId =>
   `<button class="ghost small" onclick="cancelJob('${jobId}', this)">⛔ Остановить</button>`;
 
 async function poll(jobId, el) {
-  const bar = el.querySelector(".tetris");
   const meta = el.querySelector(".meta");
   const controls = el.querySelector(".controls");
   try {
     const s = await api("/api/status/" + jobId);
     if (s.state === "downloading") {
-      renderTetris(bar, s.percent);
       const pct = s.percent != null ? Math.round(s.percent) + "%" : "";
       const spd = s.speed ? (s.speed / 1048576).toFixed(1) + " МБ/с" : "";
       const eta = s.eta ? " · осталось ~" + fmtTime(s.eta) : "";
@@ -333,14 +468,12 @@ async function poll(jobId, el) {
       meta.textContent = `Скачивание ${pct} ${spd}${eta}${sz}`;
       controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "processing") {
-      renderTetris(bar, 100);
       meta.textContent = "Обработка (склейка видео и звука)…";
       controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "queued") {
       meta.textContent = "В очереди…";
       controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "done") {
-      renderTetris(bar, 100);
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
       controls.innerHTML =
