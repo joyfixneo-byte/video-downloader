@@ -4,66 +4,117 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Скачать видео</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0f1220; --card:#1a1f33; --line:#2a3150; --txt:#e8ecf5;
-          --muted:#8b93b0; --accent:#5b7cff; --ok:#33c481; --err:#ff5d6c; }
+  :root {
+    --txt:#f4eee9; --muted:#c9bdb6;
+    --accent:#ec8a78; --accent2:#df7261;     /* коралл */
+    --glow:#ff5db1;                            /* маджента-фокус */
+    --ok:#62ab8c; --err:#ff6b6b;
+    --panel:rgba(38,46,46,.40); --panel-2:rgba(20,26,26,.42);
+    --line:rgba(255,255,255,.10); --line-2:rgba(255,255,255,.17);
+    --disp:'Space Grotesk', system-ui, -apple-system, "Segoe UI", sans-serif;
+    --body:'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
   * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-         background: var(--bg); color: var(--txt); }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 28px 18px 80px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 14px; margin: 0 0 22px; }
-  .card { background: var(--card); border:1px solid var(--line);
-          border-radius: 14px; padding: 18px; margin-bottom: 16px; }
-  label { display:block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-  input[type=text], input[type=password], select {
-    width: 100%; padding: 12px 14px; border-radius: 10px;
-    border:1px solid var(--line); background:#11152a; color: var(--txt);
-    font-size: 15px; outline: none; }
-  input:focus, select:focus { border-color: var(--accent); }
-  .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
-  .row > div { flex: 1; min-width: 160px; }
-  button { padding: 12px 18px; border-radius: 10px; border:none; cursor:pointer;
-           background: var(--accent); color:#fff; font-size: 15px; font-weight:600; }
-  button:disabled { opacity:.5; cursor: default; }
-  button.ghost { background: transparent; border:1px solid var(--line); color: var(--txt); }
-  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
-  .ep { display:flex; align-items:center; gap:10px; padding:8px 6px;
+  body {
+    margin:0; min-height:100vh; color:var(--txt); font-family:var(--body);
+    background:
+      radial-gradient(1100px 760px at 12% -5%, #6f9b8d 0%, rgba(111,155,141,0) 55%),
+      radial-gradient(1000px 820px at 105% 108%, #d7a88f 0%, rgba(215,168,143,0) 55%),
+      radial-gradient(820px 680px at 60% 122%, #c98f9c 0%, rgba(201,143,156,0) 60%),
+      linear-gradient(165deg, #46534d 0%, #54504b 55%, #5f534f 100%);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 34px 18px 90px; }
+  h1 { font-family:var(--disp); font-size: 27px; font-weight:700; letter-spacing:.3px;
+       margin: 0 0 6px; color:#f7b0a0; }
+  .sub { color: rgba(244,238,233,.80); font-size: 14px; margin: 0 0 24px; max-width:62ch; line-height:1.5; }
+
+  .card { background:var(--panel); -webkit-backdrop-filter:blur(16px); backdrop-filter:blur(16px);
+          border:1px solid var(--line); border-radius:18px; padding:20px; margin-bottom:16px;
+          box-shadow:0 16px 38px rgba(12,22,22,.30), inset 0 1px 0 rgba(255,255,255,.16); }
+
+  label { display:block; font-size:11px; color:var(--muted); margin-bottom:8px;
+          text-transform:uppercase; letter-spacing:.7px; font-weight:600; }
+
+  input[type=text], input[type=password], select, textarea.ttext {
+    width:100%; padding:12px 14px; border-radius:12px; border:1px solid var(--line);
+    background:rgba(16,22,22,.45); color:var(--txt); font-size:15px; font-family:var(--body);
+    outline:none; box-shadow:inset 0 2px 6px rgba(0,0,0,.28);
+    transition:border-color .14s ease, box-shadow .14s ease; }
+  input:focus, select:focus, textarea.ttext:focus {
+    border-color:var(--glow);
+    box-shadow:inset 0 2px 6px rgba(0,0,0,.28), 0 0 0 3px rgba(255,93,177,.22); }
+
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1; min-width:160px; }
+
+  /* Кнопки — клейморфизм: пухлые, мягкая тень + внутренний хайлайт */
+  button { font-family:var(--disp); padding:12px 18px; border-radius:12px; border:none; cursor:pointer;
+           background:linear-gradient(180deg, var(--accent), var(--accent2)); color:#fff;
+           font-size:15px; font-weight:600; letter-spacing:.2px;
+           box-shadow:0 7px 16px rgba(205,105,90,.34), inset 0 1px 0 rgba(255,255,255,.45),
+                      inset 0 -2px 5px rgba(150,60,50,.26);
+           transition:transform .12s ease, box-shadow .12s ease, filter .12s ease; }
+  button:hover:not(:disabled) { transform:translateY(-1px); filter:brightness(1.05); }
+  button:active:not(:disabled) { transform:translateY(1px);
+           box-shadow:0 3px 9px rgba(205,105,90,.30), inset 0 2px 6px rgba(150,60,50,.30); }
+  button:disabled { opacity:.42; cursor:default; box-shadow:none; filter:grayscale(.35); }
+  button.ghost { background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
+           color:var(--txt); border:1px solid var(--line-2);
+           box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16); }
+  button.small { padding:7px 12px; font-size:13px; border-radius:10px; }
+
+  .hint { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.45; }
+
+  .ep { display:flex; align-items:center; gap:10px; padding:9px 6px;
         border-bottom:1px solid var(--line); font-size:14px; }
   .ep:last-child { border-bottom:none; }
-  .ep input { width:auto; }
-  .ep-list { max-height: 320px; overflow:auto; margin-top: 8px; }
-  .jobs { margin-top: 4px; }
-  .job { padding:12px; border:1px solid var(--line); border-radius:10px; margin-bottom:10px; }
-  .job .name { font-size:14px; margin-bottom:8px; word-break: break-word; }
+  .ep input { width:auto; accent-color:var(--accent); }
+  .ep-list { max-height:320px; overflow:auto; margin-top:8px; }
+
+  .jobs { margin-top:4px; }
+  .job { padding:14px; border:1px solid var(--line); border-radius:14px; margin-bottom:10px;
+         background:var(--panel-2); box-shadow:inset 0 1px 0 rgba(255,255,255,.10); }
+  .job .name { font-size:14px; font-weight:600; margin-bottom:8px; word-break:break-word; }
+
   /* Мини-игра «Тетрис» как экран загрузки */
-  #game { display:flex; flex-direction:column; align-items:center; gap:10px;
-          margin:8px 0 16px; }
-  .game-head { width:220px; display:flex; justify-content:space-between;
-               font-size:12px; color:var(--muted); }
-  #board { background:#0b0e1a; border:1px solid var(--line); border-radius:8px;
-           touch-action:none; }
+  #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:8px 0 16px; }
+  .game-head { width:220px; display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+  #board { background:rgba(12,16,16,.55); border:1px solid var(--line); border-radius:10px;
+           box-shadow:inset 0 2px 9px rgba(0,0,0,.42); touch-action:none; }
   .game-controls { display:flex; gap:8px; }
-  .gbtn { width:60px; height:50px; font-size:20px; background:#222a44;
-          border:1px solid var(--line); color:var(--txt); border-radius:10px;
-          user-select:none; }
-  .gbtn:active { background:#2e3962; }
-  #gameOver { font-size:13px; color:var(--err); display:flex; gap:8px;
-              align-items:center; }
-  .meta { font-size:12px; color: var(--muted); margin-top:6px; }
-  .done { color: var(--ok); }  .err { color: var(--err); }  .muted { color: var(--muted); }
+  .gbtn { width:60px; height:50px; font-size:20px; color:var(--txt); border-radius:12px;
+          background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
+          border:1px solid var(--line-2); user-select:none;
+          box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16);
+          transition:transform .1s ease; }
+  .gbtn:active { transform:translateY(1px); filter:brightness(1.1); }
+  #gameOver { font-size:13px; color:var(--err); display:flex; gap:8px; align-items:center; }
+
+  .meta { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.45; }
+  .done { color:var(--ok); }  .err { color:var(--err); }  .muted { color:var(--muted); }
   .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button.small { padding:7px 12px; font-size:13px; }
-  a.dl { display:inline-block; color:#fff; background:var(--ok);
-         padding:8px 14px; border-radius:8px; text-decoration:none; font-weight:600; }
-  button.copy { background:var(--ok); }
-  textarea.ttext { width:100%; min-height:220px; margin-top:10px; resize:vertical;
-    padding:12px 14px; border-radius:10px; border:1px solid var(--line);
-    background:#11152a; color:var(--txt); font-size:14px; line-height:1.55;
-    font-family:inherit; outline:none; }
-  textarea.ttext:focus { border-color:var(--accent); }
+
+  /* Готовый файл / копирование — мягкий тёплый зелёный из палитры */
+  a.dl, button.copy { background:linear-gradient(180deg,#6fb89a,#4f9a7e);
+         box-shadow:0 7px 16px rgba(55,135,105,.30), inset 0 1px 0 rgba(255,255,255,.40),
+                    inset 0 -2px 5px rgba(40,95,75,.25); }
+  a.dl { display:inline-block; font-family:var(--disp); color:#fff; padding:9px 16px;
+         border-radius:11px; text-decoration:none; font-weight:600; letter-spacing:.2px;
+         transition:transform .12s ease, filter .12s ease; }
+  a.dl:hover { transform:translateY(-1px); filter:brightness(1.05); }
+
+  textarea.ttext { min-height:220px; margin-top:10px; resize:vertical; line-height:1.55; font-size:14px; }
+
+  ::selection { background:rgba(255,93,177,.30); }
   .hidden { display:none; }
   .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
 </head>
 <body>
