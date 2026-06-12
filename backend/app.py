@@ -459,32 +459,42 @@ def _vtt_to_text(raw: str) -> str:
     return "\n".join(out).strip()
 
 
+def _pick_sub(subs: dict, langs):
+    """Из словаря субтитров yt-dlp выбираем (lang, url) для VTT по приоритету
+    языков. Если точных совпадений нет — берём любой доступный язык."""
+    if not subs:
+        return None
+    order = [l for l in langs if l in subs]
+    order += [l for l in subs if l not in order]
+    for lang in order:
+        for fmt in subs.get(lang) or []:
+            if fmt.get("ext") == "vtt" and fmt.get("url"):
+                return lang, fmt["url"]
+    return None
+
+
 def _try_subtitles(url: str, job_dir: Path, lang: str):
-    """Пробуем скачать готовые (в т.ч. авто) субтитры. Возвращает текст или None."""
+    """Берём готовые/авто-субтитры одним запросом и качаем ровно один файл —
+    так не спамим запросами (иначе YouTube отвечает 429) и не падаем на
+    отсутствующем языке. Любая осечка → None, тогда отработает Whisper."""
     langs = ([lang] if lang else []) + ["ru", "en"]
     opts = {
         "quiet": True, "no_warnings": True, "skip_download": True,
-        "writesubtitles": True, "writeautomaticsub": True,
-        "subtitleslangs": langs + [f"{l}.*" for l in langs],
-        "subtitlesformat": "vtt",
-        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
         "noplaylist": True, "socket_timeout": 30, "retries": 2,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-
-    vtts = sorted(job_dir.glob("*.vtt"))
-    if not vtts:
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            # Сначала «ручные» субтитры, потом автоматические.
+            pick = (_pick_sub(info.get("subtitles"), langs)
+                    or _pick_sub(info.get("automatic_captions"), langs))
+            if not pick:
+                return None
+            raw = ydl.urlopen(pick[1]).read().decode("utf-8", "ignore")
+        return _vtt_to_text(raw) or None
+    except Exception:
+        traceback.print_exc()
         return None
-    # Отдаём приоритет выбранному/русскому языку.
-    best = vtts[0]
-    for pref in langs:
-        match = next((v for v in vtts if f".{pref}" in v.name), None)
-        if match:
-            best = match
-            break
-    text = _vtt_to_text(best.read_text(encoding="utf-8", errors="ignore"))
-    return text or None
 
 
 def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
