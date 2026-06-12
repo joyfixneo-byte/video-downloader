@@ -568,9 +568,13 @@ def _try_subtitles(url: str, job_dir: Path, lang: str):
 
 def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
     """Скачиваем аудио и распознаём его локально через Whisper."""
+    # Для распознавания важен только звук, качество видео не нужно. Поэтому
+    # берём отдельную аудио-дорожку, а если её нет — САМЫЙ ЛЁГКИЙ поток со
+    # звуком (worst), а не best: на сайтах без audio-only это превращает
+    # закачку из гигабайтов видео в десятки МБ.
     audio_opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
-        "format": "bestaudio/best",
+        "format": "bestaudio/worstaudio/worst",
         "outtmpl": str(job_dir / "audio.%(ext)s"),
         "socket_timeout": 30, "retries": 3,
     }
