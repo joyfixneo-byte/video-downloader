@@ -489,6 +489,20 @@ TJOBS_LOCK = threading.Lock()
 TRANSCRIBE_SEM = threading.Semaphore(MAX_ACTIVE_TRANSCRIBE)
 
 
+def _tset(job_id: str, **kw):
+    """Короткое обновление полей задачи транскрибации под локом."""
+    with TJOBS_LOCK:
+        j = TJOBS.get(job_id)
+        if j:
+            j.update(**kw)
+
+
+def _tcancelled(job_id: str) -> bool:
+    with TJOBS_LOCK:
+        j = TJOBS.get(job_id)
+        return bool(j and j.get("cancel"))
+
+
 def _get_whisper():
     """Лениво загружаем модель Whisper один раз (на CPU, int8).
     Первый вызов скачает веса модели с HuggingFace (нужен интернет)."""
@@ -578,6 +592,7 @@ def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
         "outtmpl": str(job_dir / "audio.%(ext)s"),
         "socket_timeout": 30, "retries": 3,
     }
+    _tset(job_id, stage="Скачиваю аудио…")
     with yt_dlp.YoutubeDL(audio_opts) as ydl:
         meta = ydl.extract_info(url, download=True)
 
@@ -593,18 +608,24 @@ def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
             f"Видео длиннее {int(WHISPER_MAX_MINUTES)} мин — распознавание речью "
             "для такой длины отключено. Попробуйте видео с готовыми субтитрами.")
 
+    _tset(job_id, stage="Загружаю модель…")
     model = _get_whisper()
-    segments, _ = model.transcribe(str(audio), language=lang or None)
+
+    # beam_size=1 и vad_filter заметно ускоряют распознавание на CPU:
+    # жадный поиск вместо лучевого + пропуск тишины/музыки (для сериалов
+    # с паузами выигрыш большой), почти без потери точности речи.
+    _tset(job_id, stage="Распознаю речь")
+    segments, _ = model.transcribe(
+        str(audio), language=lang or None, beam_size=1, vad_filter=True)
 
     parts = []
     for seg in segments:           # генератор: сам прогон идёт здесь
+        if _tcancelled(job_id):    # пользователь нажал «Остановить»
+            raise _Cancelled()
         parts.append(seg.text.strip())
         if duration:
             pct = min(99, round(seg.end / duration * 100))
-            with TJOBS_LOCK:
-                j = TJOBS.get(job_id)
-                if j:
-                    j["percent"] = pct
+            _tset(job_id, percent=pct)
     return " ".join(p for p in parts if p).strip()
 
 
@@ -631,7 +652,10 @@ def _run_transcribe(job_id: str, url: str, lang: str):
                 TJOBS[job_id].update(state="queued")
             with TRANSCRIBE_SEM:
                 with TJOBS_LOCK:
-                    TJOBS[job_id].update(state="transcribing", percent=0)
+                    if TJOBS[job_id].get("cancel"):
+                        raise _Cancelled()
+                    TJOBS[job_id].update(
+                        state="transcribing", percent=0, stage="Готовлю…")
                 text = _whisper_transcribe(url, job_dir, lang, job_id)
             source = "whisper"
 
@@ -641,6 +665,9 @@ def _run_transcribe(job_id: str, url: str, lang: str):
         with TJOBS_LOCK:
             TJOBS[job_id].update(
                 state="done", percent=100, text=text, source=source)
+    except _Cancelled:
+        with TJOBS_LOCK:
+            TJOBS[job_id].update(state="cancelled", text=None)
     except Exception as e:
         traceback.print_exc()
         with TJOBS_LOCK:
@@ -668,8 +695,8 @@ def transcribe(req: TranscribeRequest):
     job_id = uuid.uuid4().hex[:12]
     with TJOBS_LOCK:
         TJOBS[job_id] = {
-            "state": "queued", "percent": None,
-            "text": None, "source": None, "error": None,
+            "state": "queued", "percent": None, "stage": None,
+            "text": None, "source": None, "error": None, "cancel": False,
         }
     threading.Thread(
         target=_run_transcribe, args=(job_id, url, req.lang.strip()),
@@ -684,6 +711,18 @@ def transcribe_status(job_id: str):
         if not job:
             raise HTTPException(404, "Задача не найдена")
         return dict(job, job_id=job_id)
+
+
+@app.post("/api/transcribe/cancel/{job_id}", dependencies=[Depends(check_password)])
+def transcribe_cancel(job_id: str):
+    with TJOBS_LOCK:
+        job = TJOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Задача не найдена")
+        if job.get("state") in ("done", "error", "cancelled"):
+            return {"ok": True, "state": job["state"]}
+        job["cancel"] = True
+    return {"ok": True}
 
 
 # --- Раздача фронтенда -----------------------------------------------------

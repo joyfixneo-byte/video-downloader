@@ -325,8 +325,10 @@ async function createTranscribeJob(target) {
   const wrap = document.getElementById("transList");
   const el = document.createElement("div");
   el.className = "job";
+  el.dataset.t0 = Date.now();
   el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
     <div class="meta">запуск…</div>
+    <div class="controls tcancel"></div>
     <div class="controls tcontrols hidden">
       <button class="copy small" onclick="copyText(this)">📋 Копировать текст</button>
     </div>
@@ -344,35 +346,61 @@ async function createTranscribeJob(target) {
 
 async function pollTranscribe(jobId, el) {
   const meta = el.querySelector(".meta");
+  const cancelBox = el.querySelector(".tcancel");
+  const elapsed = () => {
+    const t0 = +el.dataset.t0 || Date.now();
+    const s = fmtTime((Date.now() - t0) / 1000);
+    return s ? " · прошло " + s : "";
+  };
+  // Активная стадия: показываем текст + кнопку «Остановить».
+  const active = (txt) => {
+    meta.textContent = txt;
+    if (!cancelBox.querySelector("button"))
+      cancelBox.innerHTML = `<button class="ghost small" `
+        + `onclick="cancelTranscribe('${jobId}', this)">⛔ Остановить</button>`;
+  };
   try {
     const s = await api("/api/transcribe/status/" + jobId);
     if (s.state === "queued") {
-      meta.textContent = "В очереди…";
+      active("⏳ В очереди…" + elapsed());
     } else if (s.state === "subtitles") {
-      meta.textContent = "Ищу готовые субтитры…";
+      active("🔎 Ищу готовые субтитры…");
     } else if (s.state === "transcribing") {
-      const pct = s.percent != null ? " " + Math.round(s.percent) + "%" : "";
-      meta.textContent = "Распознаю речь (Whisper)…" + pct
-        + " — это может занять несколько минут.";
+      const stage = s.stage || "Распознаю речь";
+      const pct = s.percent ? " " + Math.round(s.percent) + "%" : "";
+      active("🎙 " + stage + pct + elapsed());
     } else if (s.state === "done") {
       const src = s.source === "subtitles"
         ? "готовые субтитры" : "распознавание Whisper";
       meta.innerHTML = `<span class="done">✓ Готово</span> `
         + `<span class="muted">· ${src}</span>`;
+      cancelBox.innerHTML = "";
       const ta = el.querySelector(".ttext");
       ta.value = s.text || "";
       ta.classList.remove("hidden");
       el.querySelector(".tcontrols").classList.remove("hidden");
       return;
+    } else if (s.state === "cancelled") {
+      meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
+      cancelBox.innerHTML = "";
+      return;
     } else if (s.state === "error") {
       meta.innerHTML = `<span class="err">⚠ ${escapeHtml(s.error || "ошибка")}</span>`;
+      cancelBox.innerHTML = "";
       return;
     }
   } catch (e) {
     meta.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    cancelBox.innerHTML = "";
     return;
   }
   setTimeout(() => pollTranscribe(jobId, el), 1500);
+}
+
+async function cancelTranscribe(jobId, btn) {
+  btn.disabled = true; btn.textContent = "Останавливаю…";
+  try { await api("/api/transcribe/cancel/" + jobId, { method: "POST" }); }
+  catch (e) { btn.disabled = false; btn.textContent = "⛔ Остановить"; }
 }
 
 function copyText(btn) {
