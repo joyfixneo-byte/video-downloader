@@ -9,6 +9,9 @@ WorkingDirectory=__APP_DIR__/backend
 # Пароль доступа (необязательно). Раскомментируй и задай своё значение:
 # Environment=DOWNLOADER_PASSWORD=измени_меня
 Environment=DOWNLOAD_DIR=__APP_DIR__/backend/downloads
+# Размер модели Whisper для транскрибации: tiny/base/small/medium (по умолч. base).
+# Для русского точнее small, но медленнее на CPU.
+# Environment=WHISPER_MODEL=small
 ExecStart=__APP_DIR__/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=3

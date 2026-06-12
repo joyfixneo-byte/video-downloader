@@ -410,6 +410,184 @@ def config():
     return {"password_required": bool(ACCESS_PASSWORD)}
 
 
+# --- Транскрибация ---------------------------------------------------------
+# Сначала пытаемся взять готовые субтитры (быстро, без нагрузки на сервер).
+# Если их нет — скачиваем аудио и распознаём локально через faster-whisper
+# (модель Whisper на CPU, полностью бесплатно).
+
+# Имя модели Whisper: tiny / base / small / medium. base — компромисс
+# скорость/качество на CPU. small точнее для русского, но медленнее.
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
+
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+# Задачи транскрибации в памяти: job_id -> dict(state, percent, text, source, error)
+TJOBS: dict[str, dict] = {}
+TJOBS_LOCK = threading.Lock()
+
+
+def _get_whisper():
+    """Лениво загружаем модель Whisper один раз (на CPU, int8).
+    Первый вызов скачает веса модели с HuggingFace (нужен интернет)."""
+    global _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+        return _whisper_model
+
+
+def _vtt_to_text(raw: str) -> str:
+    """Превращает VTT/SRT-субтитры в сплошной текст: убираем тайм-коды,
+    служебные строки и теги, схлопываем подряд идущие повторы (авто-субтитры
+    часто дублируют строки от кадра к кадру)."""
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "-->" in line or line.isdigit():
+            continue
+        if line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)        # <c>, <00:00:01.000> и пр.
+        line = line.replace("&nbsp;", " ").strip()
+        if not line:
+            continue
+        if not out or out[-1] != line:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def _try_subtitles(url: str, job_dir: Path, lang: str):
+    """Пробуем скачать готовые (в т.ч. авто) субтитры. Возвращает текст или None."""
+    langs = ([lang] if lang else []) + ["ru", "en"]
+    opts = {
+        "quiet": True, "no_warnings": True, "skip_download": True,
+        "writesubtitles": True, "writeautomaticsub": True,
+        "subtitleslangs": langs + [f"{l}.*" for l in langs],
+        "subtitlesformat": "vtt",
+        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
+        "noplaylist": True, "socket_timeout": 30, "retries": 2,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    vtts = sorted(job_dir.glob("*.vtt"))
+    if not vtts:
+        return None
+    # Отдаём приоритет выбранному/русскому языку.
+    best = vtts[0]
+    for pref in langs:
+        match = next((v for v in vtts if f".{pref}" in v.name), None)
+        if match:
+            best = match
+            break
+    text = _vtt_to_text(best.read_text(encoding="utf-8", errors="ignore"))
+    return text or None
+
+
+def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
+    """Скачиваем аудио и распознаём его локально через Whisper."""
+    audio_opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "format": "bestaudio/best",
+        "outtmpl": str(job_dir / "audio.%(ext)s"),
+        "socket_timeout": 30, "retries": 3,
+    }
+    with yt_dlp.YoutubeDL(audio_opts) as ydl:
+        meta = ydl.extract_info(url, download=True)
+
+    audios = [p for p in job_dir.iterdir()
+              if p.is_file() and p.name.startswith("audio.")]
+    if not audios:
+        raise RuntimeError("Не удалось скачать аудио для распознавания")
+    audio = max(audios, key=lambda p: p.stat().st_size)
+    duration = meta.get("duration") or 0
+
+    model = _get_whisper()
+    segments, _ = model.transcribe(str(audio), language=lang or None)
+
+    parts = []
+    for seg in segments:           # генератор: сам прогон идёт здесь
+        parts.append(seg.text.strip())
+        if duration:
+            pct = min(99, round(seg.end / duration * 100))
+            with TJOBS_LOCK:
+                j = TJOBS.get(job_id)
+                if j:
+                    j["percent"] = pct
+    return " ".join(p for p in parts if p).strip()
+
+
+def _transcribe_error(e) -> str:
+    if isinstance(e, ModuleNotFoundError) and "faster_whisper" in str(e):
+        return ("Для распознавания видео без субтитров нужно установить "
+                "faster-whisper на сервере: pip install faster-whisper")
+    return friendly_error(e)
+
+
+def _run_transcribe(job_id: str, url: str, lang: str):
+    job_dir = DOWNLOAD_DIR / ("t_" + job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with TJOBS_LOCK:
+            TJOBS[job_id].update(state="subtitles")
+        text = _try_subtitles(url, job_dir, lang)
+        source = "subtitles"
+
+        if not text:
+            with TJOBS_LOCK:
+                TJOBS[job_id].update(state="transcribing", percent=0)
+            text = _whisper_transcribe(url, job_dir, lang, job_id)
+            source = "whisper"
+
+        if not text:
+            raise RuntimeError("Не удалось получить текст из этого видео")
+
+        with TJOBS_LOCK:
+            TJOBS[job_id].update(
+                state="done", percent=100, text=text, source=source)
+    except Exception as e:
+        traceback.print_exc()
+        with TJOBS_LOCK:
+            TJOBS[job_id].update(state="error", error=_transcribe_error(e))
+    finally:
+        # Аудио и субтитры — временные, текст уже в памяти задачи.
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+class TranscribeRequest(BaseModel):
+    url: str
+    lang: str = ""   # пусто = автоопределение языка
+
+
+@app.post("/api/transcribe", dependencies=[Depends(check_password)])
+def transcribe(req: TranscribeRequest):
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(400, "Пустая ссылка")
+    job_id = uuid.uuid4().hex[:12]
+    with TJOBS_LOCK:
+        TJOBS[job_id] = {
+            "state": "queued", "percent": None,
+            "text": None, "source": None, "error": None,
+        }
+    threading.Thread(
+        target=_run_transcribe, args=(job_id, url, req.lang.strip()),
+        daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/transcribe/status/{job_id}", dependencies=[Depends(check_password)])
+def transcribe_status(job_id: str):
+    with TJOBS_LOCK:
+        job = TJOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Задача не найдена")
+        return dict(job, job_id=job_id)
+
+
 # --- Раздача фронтенда -----------------------------------------------------
 # Должно идти последним, чтобы не перехватывать /api/*
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
