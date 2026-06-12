@@ -9,9 +9,12 @@ import re
 import time
 import uuid
 import shutil
+import socket
+import ipaddress
 import threading
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse
@@ -32,6 +35,20 @@ ACCESS_PASSWORD = os.environ.get("DOWNLOADER_PASSWORD", "").strip()
 # Через сколько часов после скачивания удалять файлы (по умолчанию 3 часа).
 RETENTION_SECONDS = int(float(os.environ.get("RETENTION_HOURS", "3")) * 3600)
 CLEANUP_INTERVAL = 600  # как часто проверять папку, секунд (10 минут)
+
+# --- Лимиты безопасности (чтобы чужой не уронил сервер) --------------------
+# Потолок одновременных/ожидающих задач: больше — отклоняем с 429, чтобы поток
+# запросов не плодил бесконечно потоки и не съел память.
+JOB_CEILING = int(os.environ.get("JOB_CEILING", "25"))        # скачивания
+TJOB_CEILING = int(os.environ.get("TJOB_CEILING", "15"))      # транскрибации
+# Сколько распознаваний Whisper крутить одновременно. Whisper грузит CPU,
+# поэтому по умолчанию строго одно — остальные ждут в очереди.
+MAX_ACTIVE_TRANSCRIBE = int(os.environ.get("MAX_ACTIVE_TRANSCRIBE", "1"))
+# Не распознаём слишком длинные ролики (Whisper на CPU считал бы их вечно).
+WHISPER_MAX_MINUTES = float(os.environ.get("WHISPER_MAX_MINUTES", "90"))
+# Лимит размера одного файла, ГБ (0 = без лимита). Имеет смысл задать, если
+# сайт открыт без пароля, чтобы не забили диск.
+DOWNLOAD_MAX_GB = float(os.environ.get("DOWNLOAD_MAX_GB", "0"))
 
 app = FastAPI(title="Video Downloader")
 
@@ -94,6 +111,40 @@ def safe_name(name: str) -> str:
     """Убираем из имени файла символы, опасные для файловой системы."""
     name = re.sub(r'[\\/:*?"<>|]', "_", name or "video")
     return name.strip()[:150] or "video"
+
+
+def check_url_safe(url: str):
+    """Защита от SSRF: разрешаем только http/https на публичные адреса.
+    Блокируем localhost, приватные/служебные сети и облачные метаданные
+    (169.254.169.254 и т.п.), чтобы через ссылку нельзя было ходить во
+    внутреннюю сеть сервера."""
+    url = (url or "").strip()
+    if len(url) > 2000:
+        raise HTTPException(400, "Слишком длинная ссылка")
+    try:
+        p = urlparse(url)
+    except Exception:
+        raise HTTPException(400, "Некорректная ссылка")
+    if p.scheme not in ("http", "https"):
+        raise HTTPException(400, "Поддерживаются только http/https ссылки")
+    host = p.hostname
+    if not host:
+        raise HTTPException(400, "В ссылке не указан адрес сайта")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        raise HTTPException(400, "Не удалось определить адрес сайта")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise HTTPException(400, "Этот адрес недоступен для скачивания")
+
+
+def _count_active(jobs: dict, lock, states) -> int:
+    """Сколько задач сейчас в работе/очереди (для потолка одновременных задач)."""
+    with lock:
+        return sum(1 for j in jobs.values() if j.get("state") in states)
 
 
 def build_format(quality: str) -> dict:
@@ -184,6 +235,7 @@ def info(req: InfoRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(400, "Пустая ссылка")
+    check_url_safe(url)
 
     # extract_flat — быстро узнаём, плейлист это или одно видео,
     # не скачивая ничего и не разбирая каждый элемент целиком.
@@ -272,6 +324,8 @@ def _run_download(job_id: str, url: str, quality: str):
         "retries": 3,
     }
     opts.update(build_format(quality))
+    if DOWNLOAD_MAX_GB > 0:
+        opts["max_filesize"] = int(DOWNLOAD_MAX_GB * 1024 ** 3)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -313,6 +367,10 @@ def download(req: DownloadRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(400, "Пустая ссылка")
+    check_url_safe(url)
+    if _count_active(JOBS, JOBS_LOCK,
+                     ("queued", "downloading", "processing")) >= JOB_CEILING:
+        raise HTTPException(429, "Сейчас слишком много загрузок — попробуйте позже.")
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -426,6 +484,10 @@ _whisper_lock = threading.Lock()
 TJOBS: dict[str, dict] = {}
 TJOBS_LOCK = threading.Lock()
 
+# Ограничиваем число одновременных распознаваний Whisper — оно тяжёлое для CPU.
+# Лишние задачи ждут своей очереди на этом семафоре (а не валят сервер).
+TRANSCRIBE_SEM = threading.Semaphore(MAX_ACTIVE_TRANSCRIBE)
+
 
 def _get_whisper():
     """Лениво загружаем модель Whisper один раз (на CPU, int8).
@@ -522,6 +584,11 @@ def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
     audio = max(audios, key=lambda p: p.stat().st_size)
     duration = meta.get("duration") or 0
 
+    if WHISPER_MAX_MINUTES and duration > WHISPER_MAX_MINUTES * 60:
+        raise RuntimeError(
+            f"Видео длиннее {int(WHISPER_MAX_MINUTES)} мин — распознавание речью "
+            "для такой длины отключено. Попробуйте видео с готовыми субтитрами.")
+
     model = _get_whisper()
     segments, _ = model.transcribe(str(audio), language=lang or None)
 
@@ -554,9 +621,14 @@ def _run_transcribe(job_id: str, url: str, lang: str):
         source = "subtitles"
 
         if not text:
+            # Whisper тяжёлый — ждём своей очереди на семафоре,
+            # пока показываем «в очереди».
             with TJOBS_LOCK:
-                TJOBS[job_id].update(state="transcribing", percent=0)
-            text = _whisper_transcribe(url, job_dir, lang, job_id)
+                TJOBS[job_id].update(state="queued")
+            with TRANSCRIBE_SEM:
+                with TJOBS_LOCK:
+                    TJOBS[job_id].update(state="transcribing", percent=0)
+                text = _whisper_transcribe(url, job_dir, lang, job_id)
             source = "whisper"
 
         if not text:
@@ -584,6 +656,11 @@ def transcribe(req: TranscribeRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(400, "Пустая ссылка")
+    check_url_safe(url)
+    if _count_active(TJOBS, TJOBS_LOCK,
+                     ("queued", "subtitles", "transcribing")) >= TJOB_CEILING:
+        raise HTTPException(429, "Сейчас слишком много задач распознавания — "
+                                 "попробуйте позже.")
     job_id = uuid.uuid4().hex[:12]
     with TJOBS_LOCK:
         TJOBS[job_id] = {
