@@ -477,7 +477,6 @@ def _try_subtitles(url: str, job_dir: Path, lang: str):
     """Берём готовые/авто-субтитры одним запросом и качаем ровно один файл —
     так не спамим запросами (иначе YouTube отвечает 429) и не падаем на
     отсутствующем языке. Любая осечка → None, тогда отработает Whisper."""
-    langs = ([lang] if lang else []) + ["ru", "en"]
     opts = {
         "quiet": True, "no_warnings": True, "skip_download": True,
         "noplaylist": True, "socket_timeout": 30, "retries": 2,
@@ -485,6 +484,14 @@ def _try_subtitles(url: str, job_dir: Path, lang: str):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            # Приоритет языков: явно заданный → оригинальный язык видео →
+            # ru → en → любой доступный (фолбэк внутри _pick_sub).
+            # info["language"] — оригинальный язык ролика, чтобы не хватать
+            # авто-перевод вместо родной дорожки.
+            langs = []
+            for l in ([lang] if lang else []) + [info.get("language"), "ru", "en"]:
+                if l and l not in langs:
+                    langs.append(l)
             # Сначала «ручные» субтитры, потом автоматические.
             pick = (_pick_sub(info.get("subtitles"), langs)
                     or _pick_sub(info.get("automatic_captions"), langs))
