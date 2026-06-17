@@ -7,18 +7,22 @@ set -e
 REPO="$HOME/video-downloader"
 cd "$REPO"
 
-# GitHub через VPN рвёт HTTP/2 — принудительно HTTP/1.1 + увеличенный буфер
+# GitHub через VPN рвёт HTTP/2 — принудительно HTTP/1.1 + увеличенный буфер.
+# lowSpeed* заставляет git оборвать застрявшую передачу (а не висеть вечно).
 git config http.version HTTP/1.1
 git config http.postBuffer 524288000
+git config http.lowSpeedLimit 1000
+git config http.lowSpeedTime 15
 
 echo "→ git pull"
 BEFORE=$(git rev-parse HEAD)
 
-# VPN-туннель иногда сбрасывает соединение (Recv failure) — повторяем
+# VPN-туннель то сбрасывает соединение (Recv failure), то подвисает.
+# timeout убивает зависшую попытку через 60с, цикл повторяет до 8 раз.
 ok=0
 for i in $(seq 8); do
-  if git pull --ff-only; then ok=1; break; fi
-  echo "↻ попытка $i не прошла (VPN сбросил соединение), повтор через 3с..."
+  if timeout 60 git pull --ff-only; then ok=1; break; fi
+  echo "↻ попытка $i не прошла (VPN), повтор через 3с..."
   sleep 3
 done
 if [ "$ok" != "1" ]; then
