@@ -7,12 +7,25 @@ set -e
 REPO="$HOME/video-downloader"
 cd "$REPO"
 
-# GitHub через VPN рвёт HTTP/2 — принудительно HTTP/1.1 (на всякий случай)
+# GitHub через VPN рвёт HTTP/2 — принудительно HTTP/1.1 + увеличенный буфер
 git config http.version HTTP/1.1
+git config http.postBuffer 524288000
 
 echo "→ git pull"
 BEFORE=$(git rev-parse HEAD)
-git pull --ff-only
+
+# VPN-туннель иногда сбрасывает соединение (Recv failure) — повторяем
+ok=0
+for i in $(seq 8); do
+  if git pull --ff-only; then ok=1; break; fi
+  echo "↻ попытка $i не прошла (VPN сбросил соединение), повтор через 3с..."
+  sleep 3
+done
+if [ "$ok" != "1" ]; then
+  echo "✗ Не удалось подтянуть код за 8 попыток. Попробуй ещё раз чуть позже."
+  exit 1
+fi
+
 AFTER=$(git rev-parse HEAD)
 
 if [ "$BEFORE" = "$AFTER" ]; then
