@@ -85,6 +85,8 @@
   #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:8px 0 16px; }
   .game-head { width:220px; display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
   .game-bar { width:220px; display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--muted); }
+  .game-next { width:220px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+  #next { background:rgba(12,16,16,.4); border:1px solid var(--line); border-radius:6px; }
   #board { background:rgba(12,16,16,.55); border:1px solid var(--line); border-radius:10px;
            box-shadow:inset 0 2px 9px rgba(0,0,0,.42); touch-action:none; }
   .game-controls { display:flex; gap:8px; }
@@ -192,6 +194,10 @@
         <span id="gameBest">Рекорд: 0</span>
         <button class="ghost small" onclick="GAME.restart()">↻ Начать заново</button>
       </div>
+      <div class="game-next">
+        <span>Дальше:</span>
+        <canvas id="next" width="60" height="32"></canvas>
+      </div>
       <canvas id="board" width="220" height="352"></canvas>
       <div class="game-controls">
         <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">◀</button>
@@ -199,9 +205,7 @@
         <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">▼</button>
         <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">▶</button>
       </div>
-      <div id="gameOver" class="hidden">
-        Игра окончена · <button class="ghost small" onclick="GAME.restart()">Заново</button>
-      </div>
+      <div id="gameOver" class="hidden">Игра окончена</div>
     </div>
 
     <div class="jobs" id="jobs"></div>
@@ -507,7 +511,7 @@ const GAME = (function () {
     I: "#00e5ff", O: "#ffd400", T: "#b14cff", S: "#33c481",
     Z: "#ff5d6c", J: "#5b7cff", L: "#ff9f1a",
   };
-  let canvas, ctx, board, piece, color, px, py;
+  let canvas, ctx, board, piece, color, px, py, nextKey;
   let score, lines, over, dropMs, acc, last, raf, started;
   let best = +(localStorage.getItem("tetris_best") || 0);
 
@@ -516,19 +520,38 @@ const GAME = (function () {
   }
   function reset() {
     board = newBoard(); score = 0; lines = 0; over = false; dropMs = 600;
+    nextKey = "";
     document.getElementById("gameOver").classList.add("hidden");
     spawn(); hud();
   }
   function spawn() {
     const keys = Object.keys(SHAPES);
-    const k = keys[Math.random() * keys.length | 0];
+    if (!nextKey) nextKey = keys[Math.random() * keys.length | 0];
+    const k = nextKey;
+    nextKey = keys[Math.random() * keys.length | 0];
     piece = SHAPES[k].map(r => r.slice());
     color = COLORS[k];
     px = (COLS >> 1) - (piece[0].length >> 1); py = 0;
+    drawNext();
     if (!valid(piece, px, py)) {
       over = true;
       document.getElementById("gameOver").classList.remove("hidden");
     }
+  }
+  function drawNext() {
+    const nc = document.getElementById("next"), nx = nc.getContext("2d");
+    nx.clearRect(0, 0, nc.width, nc.height);
+    const sh = SHAPES[nextKey], col = COLORS[nextKey], NB = 14;
+    const w = sh[0].length, h = sh.length;
+    const ox = (nc.width - w * NB) / 2, oy = (nc.height - h * NB) / 2;
+    for (let r = 0; r < h; r++)
+      for (let c = 0; c < w; c++)
+        if (sh[r][c]) {
+          nx.fillStyle = col;
+          nx.fillRect(ox + c * NB + 1, oy + r * NB + 1, NB - 2, NB - 2);
+          nx.fillStyle = "rgba(255,255,255,.28)";
+          nx.fillRect(ox + c * NB + 1, oy + r * NB + 1, NB - 2, 3);
+        }
   }
   function valid(m, ox, oy) {
     for (let r = 0; r < m.length; r++)
