@@ -628,10 +628,37 @@ const GAME = (function () {
           if (piece[r][c]) cell(px + c, py + r, color);
   }
   function hud() {
-    if (score > best) { best = score; localStorage.setItem("tetris_best", best); }
+    if (score > best) {
+      best = score;
+      localStorage.setItem("tetris_best", best);
+      pushBest(best);          // новый личный максимум — пробуем побить общий
+    }
     document.getElementById("gameScore").textContent =
       `Очки: ${score} · Линии: ${lines}`;
     document.getElementById("gameBest").textContent = `Рекорд: ${best}`;
+  }
+  // Глобальный рекорд за всё время — общий для всех, хранится на сервере.
+  async function loadBest() {
+    try {
+      const r = await fetch("/api/tetris/best", { headers: headers() });
+      if (!r.ok) return;
+      const d = await r.json();
+      best = Math.max(best, d.best | 0);
+      document.getElementById("gameBest").textContent = `Рекорд: ${best}`;
+    } catch (_) {}
+  }
+  async function pushBest(s) {
+    try {
+      const r = await fetch("/api/tetris/best", {
+        method: "POST", headers: headers(), body: JSON.stringify({ score: s }),
+      });
+      if (!r.ok) return;
+      const d = await r.json();
+      if ((d.best | 0) > best) {
+        best = d.best | 0;
+        document.getElementById("gameBest").textContent = `Рекорд: ${best}`;
+      }
+    } catch (_) {}
   }
 
   function start() {
@@ -640,6 +667,7 @@ const GAME = (function () {
     canvas = document.getElementById("board");
     ctx = canvas.getContext("2d");
     reset(); last = 0; acc = 0;
+    loadBest();          // подтянуть общий рекорд с сервера
     raf = requestAnimationFrame(loop);
   }
   function restart() {

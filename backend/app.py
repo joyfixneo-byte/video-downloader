@@ -6,6 +6,7 @@
 """
 import os
 import re
+import json
 import time
 import uuid
 import shutil
@@ -466,6 +467,44 @@ def get_file(job_id: str):
 def config():
     # Фронтенду нужно знать, спрашивать ли пароль.
     return {"password_required": bool(ACCESS_PASSWORD)}
+
+
+# --- Рекорд тетриса (один глобальный рекорд за всё время) ------------------
+# Минимально, без БД: один int в JSON-файле. Общий для всех, кто заходит.
+BEST_FILE = Path(os.environ.get(
+    "TETRIS_BEST_FILE", BASE_DIR / "data" / "tetris_best.json"))
+BEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+BEST_LOCK = threading.Lock()
+TETRIS_SCORE_CAP = 1_000_000  # выше — считаем мусором/читом и игнорируем
+
+
+def _read_best() -> int:
+    try:
+        return int(json.loads(BEST_FILE.read_text()).get("best", 0))
+    except Exception:
+        return 0
+
+
+class TetrisScore(BaseModel):
+    score: int
+
+
+@app.get("/api/tetris/best", dependencies=[Depends(check_password)])
+def tetris_best():
+    return {"best": _read_best()}
+
+
+@app.post("/api/tetris/best", dependencies=[Depends(check_password)])
+def tetris_best_submit(payload: TetrisScore):
+    s = payload.score
+    if not isinstance(s, int) or s < 0 or s > TETRIS_SCORE_CAP:
+        return {"best": _read_best()}          # мусор — просто отдаём текущий
+    with BEST_LOCK:
+        cur = _read_best()
+        if s > cur:
+            BEST_FILE.write_text(json.dumps({"best": s}))
+            cur = s
+    return {"best": cur}
 
 
 # --- Транскрибация ---------------------------------------------------------
