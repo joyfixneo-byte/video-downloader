@@ -114,6 +114,26 @@ def safe_name(name: str) -> str:
     return name.strip()[:150] or "video"
 
 
+def _is_temp(p: Path) -> bool:
+    """Временный/недокачанный файл yt-dlp: его нельзя показывать как готовый
+    и нельзя отдавать на скачивание (иначе размер «прыгает», а в браузере
+    вместо файла открывается мусор)."""
+    n = p.name.lower()
+    return (n.endswith((".part", ".ytdl", ".tmp", ".temp", ".download"))
+            or ".part-frag" in n)
+
+
+def _result_file(job_dir: Path):
+    """Готовый файл задачи на диске: самый большой, не считая временных.
+    None — если готового файла ещё/уже нет."""
+    if not job_dir.exists() or not job_dir.is_dir():
+        return None
+    files = [p for p in job_dir.iterdir() if p.is_file() and not _is_temp(p)]
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_size)
+
+
 def check_url_safe(url: str):
     """Защита от SSRF: разрешаем только http/https на публичные адреса.
     Блокируем localhost, приватные/служебные сети и облачные метаданные
@@ -341,10 +361,9 @@ def _run_download(job_id: str, url: str, quality: str):
                 JOBS[job_id].update(state="cancelled", filename=None)
             return
 
-        files = [p for p in job_dir.iterdir() if p.is_file()]
-        if not files:
+        result = _result_file(job_dir)
+        if not result:
             raise RuntimeError("Файл не найден после скачивания")
-        result = max(files, key=lambda p: p.stat().st_size)
         with JOBS_LOCK:
             JOBS[job_id].update(
                 state="done", percent=100,
@@ -431,10 +450,17 @@ def list_files():
         for d in DOWNLOAD_DIR.iterdir():
             if not d.is_dir():
                 continue
-            files = [p for p in d.iterdir() if p.is_file()]
-            if not files:
+            # Задачу, которая ещё качается/склеивается, не показываем как
+            # готовый файл — иначе её размер «прыгает» при обновлении и она
+            # скачивается битой.
+            with JOBS_LOCK:
+                job = JOBS.get(d.name)
+                state = job.get("state") if job else None
+            if state in ("queued", "downloading", "processing"):
                 continue
-            result = max(files, key=lambda p: p.stat().st_size)
+            result = _result_file(d)
+            if not result:
+                continue
             mtime = result.stat().st_mtime
             remaining = int(RETENTION_SECONDS - (now - mtime))
             items.append({
@@ -452,15 +478,26 @@ def list_files():
 def get_file(job_id: str):
     # Файл отдаём без пароля в заголовке — браузер скачивает по прямой ссылке.
     # job_id случайный и неугадываемый, этого достаточно для личного сервера.
+    # Чистим job_id так же, как при удалении: только буквы/цифры, чтобы нельзя
+    # было выйти за пределы папки загрузок.
+    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
+    job_dir = DOWNLOAD_DIR / safe
+
+    # Пока задача в работе — отдавать нечего: ранняя выдача давала битый/
+    # недокачанный файл («чёрный экран с кодом» в браузере).
     with JOBS_LOCK:
-        job = JOBS.get(job_id)
-    if not job or job.get("state") != "done" or not job.get("filename"):
-        raise HTTPException(404, "Файл не готов")
-    path = DOWNLOAD_DIR / job_id / job["filename"]
-    if not path.exists():
+        job = JOBS.get(safe)
+        state = job.get("state") if job else None
+    if state in ("queued", "downloading", "processing"):
+        raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
+
+    # Ищем готовый файл на диске, а не в памяти процесса: так файл можно
+    # скачать даже после перезапуска сервиса (когда список задач в памяти пуст).
+    result = _result_file(job_dir)
+    if not result:
         raise HTTPException(404, "Файл не найден")
     return FileResponse(
-        path, filename=job["filename"], media_type="application/octet-stream")
+        result, filename=result.name, media_type="application/octet-stream")
 
 
 @app.get("/api/config")

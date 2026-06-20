@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Скачать видео</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -19,8 +19,12 @@
     --body:'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
+  html, body { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
   body {
     margin:0; min-height:100vh; color:var(--txt); font-family:var(--body);
+    /* Запрещаем двойной тап-зум и удержание-выделение — на телефоне
+       случайный промах по кнопке больше не зумит и не ломает игру. */
+    touch-action: manipulation;
     background:
       radial-gradient(1100px 760px at 12% -5%, #6f9b8d 0%, rgba(111,155,141,0) 55%),
       radial-gradient(1000px 820px at 105% 108%, #d7a88f 0%, rgba(215,168,143,0) 55%),
@@ -85,6 +89,7 @@
   #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:8px 0 16px; }
   .game-head { width:220px; display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
   .game-bar { width:220px; display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--muted); }
+  .game-btns { display:flex; gap:8px; }
   .game-next { width:220px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
   #next { background:rgba(12,16,16,.4); border:1px solid var(--line); border-radius:6px; }
   #board { background:rgba(12,16,16,.55); border:1px solid var(--line); border-radius:10px;
@@ -180,19 +185,19 @@
     <div class="jobs" id="transList"></div>
   </div>
 
-  <!-- Задачи -->
-  <div class="card hidden" id="jobsCard">
-    <label>Загрузки</label>
-
-    <!-- Игра вместо скучной полосы: играй, пока качается -->
+  <!-- Игра «Тетрис» — доступна всегда, не только во время загрузки -->
+  <div class="card" id="gameCard">
     <div id="game">
       <div class="game-head">
-        <span>🎮 Тетрис — пока качается</span>
+        <span>🎮 Тетрис</span>
         <span id="gameScore">Очки: 0 · Линии: 0</span>
       </div>
       <div class="game-bar">
         <span id="gameBest">Рекорд: 0</span>
-        <button class="ghost small" onclick="GAME.restart()">↻ Начать заново</button>
+        <div class="game-btns">
+          <button class="ghost small" id="pauseBtn" onclick="GAME.playPause()">▶ Играть</button>
+          <button class="ghost small" onclick="GAME.restart()">↻ Заново</button>
+        </div>
       </div>
       <div class="game-next">
         <span>Дальше:</span>
@@ -207,7 +212,11 @@
       </div>
       <div id="gameOver" class="hidden">Игра окончена</div>
     </div>
+  </div>
 
+  <!-- Задачи -->
+  <div class="card hidden" id="jobsCard">
+    <label>Загрузки</label>
     <div class="jobs" id="jobs"></div>
   </div>
 
@@ -222,6 +231,23 @@
 </div>
 
 <script>
+// --- Полная блокировка зума (особенно iPhone Safari) ----------------------
+// iOS игнорирует user-scalable=no, поэтому глушим жесты вручную: пинч двумя
+// пальцами и двойной тап. Так случайный промах по кнопке во время игры в
+// тетрис больше не зумит страницу и не ломает геймплей.
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("gesturechange", e => e.preventDefault());
+document.addEventListener("gestureend", e => e.preventDefault());
+document.addEventListener("touchmove", e => {
+  if (e.touches.length > 1) e.preventDefault();      // пинч-зум
+}, { passive: false });
+let _lastTouchEnd = 0;
+document.addEventListener("touchend", e => {
+  const now = Date.now();
+  if (now - _lastTouchEnd <= 300) e.preventDefault();  // двойной тап = зум
+  _lastTouchEnd = now;
+}, { passive: false });
+
 let PARSED = null;          // результат /api/info
 let PASSWORD = localStorage.getItem("dl_pw") || "";
 
@@ -512,17 +538,17 @@ const GAME = (function () {
     Z: "#ff5d6c", J: "#5b7cff", L: "#ff9f1a",
   };
   let canvas, ctx, board, piece, color, px, py, nextKey;
-  let score, lines, over, dropMs, acc, last, raf, started;
+  let score, lines, over, dropMs, acc, last, raf, started, paused;
   let best = +(localStorage.getItem("tetris_best") || 0);
 
   function newBoard() {
     return Array.from({ length: ROWS }, () => Array(COLS).fill(""));
   }
   function reset() {
-    board = newBoard(); score = 0; lines = 0; over = false; dropMs = 600;
-    nextKey = "";
+    board = newBoard(); score = 0; lines = 0; over = false; paused = false;
+    dropMs = 600; nextKey = "";
     document.getElementById("gameOver").classList.add("hidden");
-    spawn(); hud();
+    spawn(); hud(); updatePauseBtn();
   }
   function spawn() {
     const keys = Object.keys(SHAPES);
@@ -536,6 +562,7 @@ const GAME = (function () {
     if (!valid(piece, px, py)) {
       over = true;
       document.getElementById("gameOver").classList.remove("hidden");
+      updatePauseBtn();
     }
   }
   function drawNext() {
@@ -585,11 +612,11 @@ const GAME = (function () {
   function step() { if (valid(piece, px, py + 1)) py++; else lock(); }
 
   function move(d) {
-    if (over || !started) return;
+    if (over || !started || paused) return;
     if (valid(piece, px + d, py)) { px += d; draw(); }
   }
   function rotate() {
-    if (over || !started) return;
+    if (over || !started || paused) return;
     const m = piece[0].map((_, c) => piece.map(r => r[c]).reverse());
     if (valid(m, px, py)) piece = m;
     else if (valid(m, px - 1, py)) { px--; piece = m; }
@@ -597,7 +624,7 @@ const GAME = (function () {
     draw();
   }
   function soft() {
-    if (over || !started) return;
+    if (over || !started || paused) return;
     if (valid(piece, px, py + 1)) py++; else lock();
     draw();
   }
@@ -661,9 +688,25 @@ const GAME = (function () {
     } catch (_) {}
   }
 
+  function drawPaused() {
+    ctx.fillStyle = "rgba(8,12,12,.62)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#f4eee9";
+    ctx.font = "600 22px 'Space Grotesk', system-ui, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("ПАУЗА", canvas.width / 2, canvas.height / 2);
+    ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+  }
+  function updatePauseBtn() {
+    const b = document.getElementById("pauseBtn");
+    if (!b) return;
+    b.textContent = (!started || over) ? "▶ Играть"
+                  : paused ? "▶ Продолжить" : "⏸ Пауза";
+  }
+
   function start() {
     if (started) return;
-    started = true;
+    started = true; paused = false;
     canvas = document.getElementById("board");
     ctx = canvas.getContext("2d");
     reset(); last = 0; acc = 0;
@@ -672,13 +715,25 @@ const GAME = (function () {
   }
   function restart() {
     cancelAnimationFrame(raf);
+    started = true;
     reset(); last = 0; acc = 0;
     raf = requestAnimationFrame(loop);
+  }
+  // Одна кнопка «Играть/Пауза/Продолжить»: запускает игру, ставит на паузу
+  // и снимает с неё. После проигрыша — начинает заново.
+  function playPause() {
+    if (!started) { start(); return; }
+    if (over) { restart(); return; }
+    paused = !paused;
+    if (paused) { cancelAnimationFrame(raf); draw(); drawPaused(); }
+    else { last = 0; acc = 0; raf = requestAnimationFrame(loop); }
+    updatePauseBtn();
   }
 
   // Клавиатура (для компьютера)
   window.addEventListener("keydown", e => {
-    if (!started) return;
+    if (e.key === "p" || e.key === "P") { playPause(); e.preventDefault(); return; }
+    if (!started || paused) return;
     if (e.key === "ArrowLeft") move(-1);
     else if (e.key === "ArrowRight") move(1);
     else if (e.key === "ArrowUp") rotate();
@@ -687,7 +742,14 @@ const GAME = (function () {
     e.preventDefault();
   });
 
-  return { start, restart, move, rotate, soft };
+  // При загрузке страницы рисуем пустое поле и подтягиваем общий рекорд —
+  // игра ждёт нажатия «Играть».
+  canvas = document.getElementById("board");
+  ctx = canvas.getContext("2d");
+  board = newBoard(); over = true; started = false; paused = false;
+  draw(); loadBest();
+
+  return { start, restart, move, rotate, soft, playPause };
 })();
 
 const stopBtn = jobId =>
@@ -715,7 +777,7 @@ async function poll(jobId, el) {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
       controls.innerHTML =
-        `<a class="dl" href="/api/file/${jobId}">⬇ Скачать файл</a>` +
+        `<a class="dl" href="/api/file/${jobId}" download>⬇ Скачать файл</a>` +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       loadFiles();
       return;
@@ -782,7 +844,7 @@ async function loadFiles() {
         `<div class="name">${escapeHtml(f.filename)}</div>
          <div class="meta">${fmtSize(f.size)} · ${rem}</div>
          <div class="controls">
-           <a class="dl" href="/api/file/${f.job_id}">⬇ Скачать</a>
+           <a class="dl" href="/api/file/${f.job_id}" download>⬇ Скачать</a>
            <button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>
          </div>`;
       list.appendChild(el);
