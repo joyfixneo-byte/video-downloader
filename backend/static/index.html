@@ -135,23 +135,27 @@
   <div class="card hidden" id="pwCard">
     <label>Пароль доступа</label>
     <div class="row">
-      <div><input type="password" id="pw" placeholder="Введите пароль"></div>
-      <button onclick="savePw()">Войти</button>
+      <div><input type="password" id="pw" placeholder="Введите пароль"
+                  onkeydown="if(event.key==='Enter'){event.preventDefault();savePw();}"></div>
+      <button id="pwBtn" onclick="savePw()">Войти</button>
     </div>
+    <div class="hint err" id="pwHint"></div>
   </div>
 
   <!-- Ссылка -->
-  <div class="card">
+  <div class="card gated">
     <label>Ссылка на видео</label>
     <div class="row">
-      <div><input type="text" id="url" placeholder="https://..."></div>
+      <div><input type="text" id="url" placeholder="https://..."
+                  onkeydown="if(event.key==='Enter'){event.preventDefault();check();}"></div>
       <button id="checkBtn" onclick="check()">Проверить</button>
+      <button id="clearBtn" class="ghost" onclick="clearUrl()">🧹 Очистить</button>
     </div>
     <div class="hint" id="checkHint"></div>
   </div>
 
   <!-- Результат разбора -->
-  <div class="card hidden" id="pickCard">
+  <div class="card hidden gated cond" id="pickCard">
     <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
 
     <div id="epBlock" class="hidden">
@@ -180,7 +184,7 @@
   </div>
 
   <!-- Транскрибация -->
-  <div class="card hidden" id="transCard">
+  <div class="card hidden gated cond" id="transCard">
     <label>Транскрибация</label>
     <div class="jobs" id="transList"></div>
   </div>
@@ -215,18 +219,27 @@
   </div>
 
   <!-- Задачи -->
-  <div class="card hidden" id="jobsCard">
+  <div class="card hidden gated cond" id="jobsCard">
     <label>Загрузки</label>
     <div class="jobs" id="jobs"></div>
   </div>
 
-  <!-- Файлы на сервере -->
-  <div class="card" id="serverCard">
+  <!-- Файлы на сервере (рабочая папка, чистится через 3 часа) -->
+  <div class="card gated" id="serverCard">
     <div class="selbar">
       <label style="margin:0">Файлы на сервере</label>
       <button class="ghost small" onclick="loadFiles()">⟳ Обновить</button>
     </div>
     <div class="jobs" id="serverList"></div>
+  </div>
+
+  <!-- Библиотека: SMB-витрина (постоянное хранилище для просмотра с ТВ) -->
+  <div class="card gated hidden" id="libraryCard">
+    <div class="selbar">
+      <label style="margin:0">📚 Библиотека (SMB для телевизора)</label>
+      <button class="ghost small" onclick="loadLibrary()">⟳ Обновить</button>
+    </div>
+    <div class="jobs" id="libraryList"></div>
   </div>
 </div>
 
@@ -260,6 +273,7 @@ function headers() {
 async function api(path, opts={}) {
   const res = await fetch(path, { headers: headers(), ...opts });
   if (res.status === 401) {
+    lockApp();                     // нет/неверный пароль — прячем все разделы
     document.getElementById("pwCard").classList.remove("hidden");
     throw new Error("Нужен пароль");
   }
@@ -270,18 +284,59 @@ async function api(path, opts={}) {
   return res.json();
 }
 
-function savePw() {
-  PASSWORD = document.getElementById("pw").value.trim();
-  localStorage.setItem("dl_pw", PASSWORD);
+// --- Доступ к разделам -----------------------------------------------------
+// Пока пароль не введён, открыт только тетрис. Все .gated-разделы скрыты;
+// при разблокировке показываем постоянные разделы, а .cond (появляются по
+// ходу работы — разбор, загрузки, транскрибация) остаются скрытыми до нужды.
+
+function lockApp() {
+  document.querySelectorAll(".gated").forEach(el => el.classList.add("hidden"));
+}
+function unlockApp() {
+  document.querySelectorAll(".gated:not(.cond)").forEach(
+    el => el.classList.remove("hidden"));
   document.getElementById("pwCard").classList.add("hidden");
+  loadFiles();
+  loadLibrary();
+}
+
+// Проверяем пароль обращением к защищённому эндпоинту. true — пароль подходит.
+async function verifyAccess() {
+  try {
+    const res = await fetch("/api/files", { headers: headers() });
+    return res.ok;
+  } catch (e) { return false; }
+}
+
+async function savePw() {
+  PASSWORD = document.getElementById("pw").value.trim();
+  const btn = document.getElementById("pwBtn");
+  const hint = document.getElementById("pwHint");
+  hint.textContent = ""; btn.disabled = true;
+  if (await verifyAccess()) {
+    localStorage.setItem("dl_pw", PASSWORD);
+    unlockApp();
+  } else {
+    PASSWORD = "";
+    hint.textContent = "Неверный пароль";
+  }
+  btn.disabled = false;
 }
 
 async function init() {
-  try {
-    const cfg = await fetch("/api/config").then(r => r.json());
-    if (cfg.password_required && !PASSWORD)
-      document.getElementById("pwCard").classList.remove("hidden");
-  } catch (e) {}
+  let cfg = { password_required: false };
+  try { cfg = await fetch("/api/config").then(r => r.json()); } catch (e) {}
+  if (!cfg.password_required) {        // пароль не настроен — открыто всё
+    unlockApp();
+    return;
+  }
+  if (PASSWORD && await verifyAccess()) {   // сохранённый пароль ещё годен
+    unlockApp();
+  } else {                                  // нужен ввод пароля
+    PASSWORD = "";
+    lockApp();
+    document.getElementById("pwCard").classList.remove("hidden");
+  }
 }
 
 async function check() {
@@ -322,6 +377,15 @@ async function check() {
     clearTimeout(abortTimer);
     btn.disabled = false;
   }
+}
+
+// Очистить поле ссылки и убрать карточку разбора — чтобы вставить новую ссылку.
+function clearUrl() {
+  document.getElementById("url").value = "";
+  document.getElementById("checkHint").textContent = "";
+  document.getElementById("pickCard").classList.add("hidden");
+  PARSED = null;
+  document.getElementById("url").focus();
 }
 
 function renderPick() {
@@ -780,6 +844,7 @@ async function poll(jobId, el) {
         `<a class="dl" href="/api/file/${jobId}" download>⬇ Скачать файл</a>` +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       loadFiles();
+      loadLibrary();          // файл также попал в SMB-витрину
       return;
     } else if (s.state === "cancelled") {
       meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
@@ -866,13 +931,65 @@ async function deleteServerFile(jobId, btn) {
   }
 }
 
+// --- Библиотека: файлы в SMB-витрине (хранятся постоянно) -----------------
+
+async function loadLibrary() {
+  const card = document.getElementById("libraryCard");
+  const list = document.getElementById("libraryList");
+  try {
+    const { enabled, files } = await api("/api/library");
+    if (!enabled) {                 // витрина не настроена — карточку прячем
+      card.classList.add("hidden");
+      return;
+    }
+    card.classList.remove("hidden");
+    if (!files.length) {
+      list.innerHTML = '<div class="muted" style="font-size:13px">'
+        + 'Библиотека пуста.</div>';
+      return;
+    }
+    list.innerHTML = "";
+    files.forEach(f => {
+      const el = document.createElement("div");
+      el.className = "job";
+      const href = "/api/library/file?name=" + encodeURIComponent(f.name);
+      el.innerHTML =
+        `<div class="name">${escapeHtml(f.name)}</div>
+         <div class="meta">${fmtSize(f.size)}</div>
+         <div class="controls">
+           <a class="dl" href="${href}" download>⬇ Скачать</a>
+           <button class="ghost small">🗑 Удалить</button>
+         </div>`;
+      // Имя файла произвольное (кавычки, апострофы) — вешаем обработчик через
+      // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
+      el.querySelector("button").addEventListener(
+        "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
+      list.appendChild(el);
+    });
+  } catch (e) {
+    list.innerHTML = `<div class="err" style="font-size:13px">⚠ ${e.message}</div>`;
+  }
+}
+
+async function deleteLibraryFile(name, btn) {
+  if (!confirm("Удалить этот файл из библиотеки (SMB)? Это навсегда.")) return;
+  btn.disabled = true; btn.textContent = "Удаляю…";
+  try {
+    await api("/api/library/delete", {
+      method: "POST", body: JSON.stringify({ name }) });
+    loadLibrary();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "🗑 Удалить";
+    alert("Не удалось удалить: " + e.message);
+  }
+}
+
 function escapeHtml(s) {
   return (s || "").replace(/[&<>"']/g, c => (
     { "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
 
 init();
-loadFiles();
 </script>
 </body>
 </html>

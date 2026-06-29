@@ -12,7 +12,13 @@ Environment=DOWNLOAD_DIR=__APP_DIR__/backend/downloads
 # Размер модели Whisper для транскрибации: tiny/base/small/medium (по умолч. base).
 # Для русского точнее small, но медленнее на CPU.
 # Environment=WHISPER_MODEL=small
-ExecStart=__APP_DIR__/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+# Папка-витрина (SMB-шара хоста) для просмотра готовых файлов с телевизора/Apple TV.
+# Раскомментируй ТОЛЬКО после того, как смонтировал и проверил шару на запись
+# (см. README, раздел про SMB), иначе копии забьют локальный диск VM:
+# Environment=SHARE_DIR=/mnt/videoshare
+# --host 0.0.0.0: чтобы хост мог пробросить порт с локальной сети (frpc по-прежнему
+# ходит на 127.0.0.1 — наружу ничего лишнего не открывается, VM в изолированном NAT).
+ExecStart=__APP_DIR__/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=3
 

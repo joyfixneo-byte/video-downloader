@@ -29,6 +29,15 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", BASE_DIR / "downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# Папка-витрина для готовых файлов: SMB-шара на хосте (SRV-HOST), которую по
+# локальной сети видит телевизор/Apple TV в VLC. Если переменная задана —
+# готовый файл копируется сюда плоским списком с человекочитаемым именем,
+# и его можно смотреть прямо с сервера, минуя ПК и VPS. Пусто — выключено.
+# ⚠️ Задавать ТОЛЬКО после того, как шара примонтирована и проверена на запись,
+# иначе копия ляжет на локальный диск VM и забьёт его.
+SHARE_DIR = os.environ.get("SHARE_DIR", "").strip()
+SHARE_PATH = Path(SHARE_DIR) if SHARE_DIR else None
+
 # Необязательный пароль. Если переменная окружения DOWNLOADER_PASSWORD задана,
 # то фронтенд должен присылать её в заголовке X-Access-Password.
 ACCESS_PASSWORD = os.environ.get("DOWNLOADER_PASSWORD", "").strip()
@@ -160,6 +169,31 @@ def check_url_safe(url: str):
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             raise HTTPException(400, "Этот адрес недоступен для скачивания")
+
+
+def _publish_to_share(result: Path):
+    """Копирует готовый файл в папку-витрину (SMB-шару) для просмотра с ТВ.
+
+    Ошибки шары глушим: основная выдача через сайт не должна падать, если шара
+    временно недоступна (хост выключен, сеть моргнула). Копируем во временное
+    имя `*.part` и переименовываем — чтобы плеер на ТВ не подхватил
+    полускопированный файл."""
+    if not SHARE_PATH:
+        return
+    try:
+        SHARE_PATH.mkdir(parents=True, exist_ok=True)
+        target = SHARE_PATH / result.name
+        # Такой же файл уже опубликован (то же имя и размер) — не копируем второй раз.
+        if target.exists() and target.stat().st_size == result.stat().st_size:
+            return
+        # Имя занято другим роликом — добавляем короткий суффикс, чтобы не затереть.
+        if target.exists():
+            target = SHARE_PATH / f"{result.stem} ({uuid.uuid4().hex[:6]}){result.suffix}"
+        tmp = SHARE_PATH / (target.name + ".part")
+        shutil.copyfile(result, tmp)
+        tmp.replace(target)
+    except Exception:
+        traceback.print_exc()
 
 
 def _count_active(jobs: dict, lock, states) -> int:
@@ -368,6 +402,8 @@ def _run_download(job_id: str, url: str, quality: str):
             JOBS[job_id].update(
                 state="done", percent=100,
                 filename=result.name, size=result.stat().st_size)
+        # Кладём готовый файл в SMB-витрину для просмотра с телевизора.
+        _publish_to_share(result)
     except Exception as e:
         # Если это была отмена пользователем — чистим частичные файлы.
         with JOBS_LOCK:
@@ -498,6 +534,71 @@ def get_file(job_id: str):
         raise HTTPException(404, "Файл не найден")
     return FileResponse(
         result, filename=result.name, media_type="application/octet-stream")
+
+
+# --- Библиотека: файлы в SMB-витрине (постоянное хранилище для ТВ) ---------
+# В отличие от downloads/ (рабочая папка, чистится через RETENTION_HOURS),
+# витрина не удаляется автоматически — это библиотека. Даём ей управление
+# с сайта: список + скачать + удалить.
+
+def _safe_share_file(name: str) -> Path:
+    """Путь к файлу витрины по имени с защитой от выхода за пределы папки
+    (path traversal). Берём только имя файла и проверяем, что итог внутри
+    SHARE_PATH."""
+    if not SHARE_PATH:
+        raise HTTPException(404, "Витрина (SMB) не настроена")
+    fname = os.path.basename((name or "").strip())
+    if not fname or fname in (".", ".."):
+        raise HTTPException(400, "Некорректное имя файла")
+    base = SHARE_PATH.resolve()
+    target = (base / fname).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "Некорректное имя файла")
+    return target
+
+
+@app.get("/api/library", dependencies=[Depends(check_password)])
+def library_list():
+    """Список файлов в SMB-витрине. enabled=False — витрина не настроена."""
+    if not SHARE_PATH:
+        return {"enabled": False, "files": []}
+    items = []
+    if SHARE_PATH.exists():
+        for p in SHARE_PATH.iterdir():
+            if not p.is_file() or _is_temp(p):
+                continue
+            st = p.stat()
+            items.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)  # новые сверху
+    return {"enabled": True, "files": items}
+
+
+@app.get("/api/library/file")
+def library_file(name: str):
+    # Прямая ссылка для браузера — без пароля в заголовке (как /api/file).
+    # Имена файлов видны только из защищённого паролем списка /api/library.
+    target = _safe_share_file(name)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "Файл не найден")
+    return FileResponse(
+        target, filename=target.name, media_type="application/octet-stream")
+
+
+class LibraryDeleteRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/library/delete", dependencies=[Depends(check_password)])
+def library_delete(req: LibraryDeleteRequest):
+    target = _safe_share_file(req.name)
+    if target.exists() and target.is_file():
+        try:
+            target.unlink()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, "Не удалось удалить файл: " + str(e))
+    return {"ok": True}
 
 
 @app.get("/api/config")
