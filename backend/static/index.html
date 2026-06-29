@@ -585,6 +585,51 @@ function fmtTime(s) {
   return `${sec} с`;
 }
 
+// --- Скачивание файла на устройство --------------------------------------
+// На iPhone сайт открыт как веб-приложение с домашнего экрана (standalone):
+// обычная ссылка с атрибутом download там НЕ скачивает, а iOS открывает файл
+// на весь экран («чёрный экран» с иконкой MP4), и кнопки «назад» в этом режиме
+// нет — вернуться на сайт нельзя. Поэтому в standalone скачиваем файл в память
+// и отдаём его в системное меню «Поделиться» (там есть «Сохранить в Файлы» /
+// «Сохранить видео»), оставаясь внутри приложения. В обычном браузере и на
+// десктопе — штатное скачивание ссылкой (как и было).
+
+const IS_STANDALONE = window.navigator.standalone === true
+  || window.matchMedia("(display-mode: standalone)").matches;
+
+function plainDownload(href, name) {
+  const a = document.createElement("a");
+  a.href = href; a.download = name || "";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function saveFile(href, name, btn) {
+  // Обычный браузер / десктоп — оставляем штатное скачивание ссылкой.
+  if (!IS_STANDALONE || typeof navigator.canShare !== "function") {
+    plainDownload(href, name); return;
+  }
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.style.pointerEvents = "none"; btn.textContent = "Готовлю файл…"; }
+  try {
+    const res = await fetch(href, { headers: headers() });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const blob = await res.blob();
+    const file = new File([blob], name || "video.mp4",
+      { type: blob.type && blob.type !== "application/octet-stream"
+          ? blob.type : "video/mp4" });
+    if (navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+    } else {
+      plainDownload(href, name);          // share с файлами не поддерживается
+    }
+  } catch (e) {
+    // Пользователь закрыл меню «Поделиться» — это не ошибка, ничего не делаем.
+    if (!(e && e.name === "AbortError")) plainDownload(href, name);
+  } finally {
+    if (btn) { btn.style.pointerEvents = ""; btn.textContent = label; }
+  }
+}
+
 // --- Мини-игра «Тетрис» (экран загрузки) ---------------------------------
 const GAME = (function () {
   const COLS = 10, ROWS = 16, B = 22;       // поле 10×16, клетка 22px
@@ -840,9 +885,13 @@ async function poll(jobId, el) {
     } else if (s.state === "done") {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
+      const href = "/api/file/" + jobId;
+      const fname = s.filename || s.title || "video.mp4";
       controls.innerHTML =
-        `<a class="dl" href="/api/file/${jobId}" download>⬇ Скачать файл</a>` +
+        `<a class="dl" href="${href}">⬇ Скачать файл</a>` +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
+      controls.querySelector(".dl").addEventListener("click", ev => {
+        ev.preventDefault(); saveFile(href, fname, ev.currentTarget); });
       loadFiles();
       loadLibrary();          // файл также попал в SMB-витрину
       return;
@@ -905,13 +954,16 @@ async function loadFiles() {
       const rem = f.remaining
         ? "удалится через " + fmtTime(f.remaining)
         : "скоро будет удалён";
+      const href = "/api/file/" + f.job_id;
       el.innerHTML =
         `<div class="name">${escapeHtml(f.filename)}</div>
          <div class="meta">${fmtSize(f.size)} · ${rem}</div>
          <div class="controls">
-           <a class="dl" href="/api/file/${f.job_id}" download>⬇ Скачать</a>
+           <a class="dl" href="${href}">⬇ Скачать</a>
            <button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>
          </div>`;
+      el.querySelector(".dl").addEventListener("click", ev => {
+        ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget); });
       list.appendChild(el);
     });
   } catch (e) {
@@ -957,11 +1009,14 @@ async function loadLibrary() {
         `<div class="name">${escapeHtml(f.name)}</div>
          <div class="meta">${fmtSize(f.size)}</div>
          <div class="controls">
-           <a class="dl" href="${href}" download>⬇ Скачать</a>
+           <a class="dl" href="${href}">⬇ Скачать</a>
            <button class="ghost small">🗑 Удалить</button>
          </div>`;
-      // Имя файла произвольное (кавычки, апострофы) — вешаем обработчик через
+      // Имя файла произвольное (кавычки, апострофы) — вешаем обработчики через
       // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
+      el.querySelector(".dl").addEventListener(
+        "click", ev => { ev.preventDefault();
+          saveFile(href, f.name, ev.currentTarget); });
       el.querySelector("button").addEventListener(
         "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
       list.appendChild(el);
