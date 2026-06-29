@@ -31,8 +31,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Папка-витрина для готовых файлов: SMB-шара на хосте (SRV-HOST), которую по
 # локальной сети видит телевизор/Apple TV в VLC. Если переменная задана —
-# готовый файл копируется сюда плоским списком с человекочитаемым именем,
-# и его можно смотреть прямо с сервера, минуя ПК и VPS. Пусто — выключено.
+# на сайте появляется кнопка «В библиотеку», по которой готовый файл копируется
+# сюда плоским списком с человекочитаемым именем (автоматически при скачивании
+# НЕ копируем — только вручную). Пусто — раздел библиотеки скрыт.
 # ⚠️ Задавать ТОЛЬКО после того, как шара примонтирована и проверена на запись,
 # иначе копия ляжет на локальный диск VM и забьёт его.
 SHARE_DIR = os.environ.get("SHARE_DIR", "").strip()
@@ -171,29 +172,26 @@ def check_url_safe(url: str):
             raise HTTPException(400, "Этот адрес недоступен для скачивания")
 
 
-def _publish_to_share(result: Path):
+def _publish_to_share(result: Path) -> str:
     """Копирует готовый файл в папку-витрину (SMB-шару) для просмотра с ТВ.
 
-    Ошибки шары глушим: основная выдача через сайт не должна падать, если шара
-    временно недоступна (хост выключен, сеть моргнула). Копируем во временное
-    имя `*.part` и переименовываем — чтобы плеер на ТВ не подхватил
-    полускопированный файл."""
-    if not SHARE_PATH:
-        return
-    try:
-        SHARE_PATH.mkdir(parents=True, exist_ok=True)
-        target = SHARE_PATH / result.name
-        # Такой же файл уже опубликован (то же имя и размер) — не копируем второй раз.
-        if target.exists() and target.stat().st_size == result.stat().st_size:
-            return
-        # Имя занято другим роликом — добавляем короткий суффикс, чтобы не затереть.
-        if target.exists():
-            target = SHARE_PATH / f"{result.stem} ({uuid.uuid4().hex[:6]}){result.suffix}"
-        tmp = SHARE_PATH / (target.name + ".part")
-        shutil.copyfile(result, tmp)
-        tmp.replace(target)
-    except Exception:
-        traceback.print_exc()
+    Вызывается вручную по кнопке «В библиотеку» (см. /api/library/add) —
+    автоматически при скачивании больше не копируем. Возвращает имя файла
+    в витрине. Ошибки пробрасываем: кнопке нужно показать результат.
+    Копируем во временное имя `*.part` и переименовываем — чтобы плеер на ТВ
+    не подхватил полускопированный файл."""
+    SHARE_PATH.mkdir(parents=True, exist_ok=True)
+    target = SHARE_PATH / result.name
+    # Такой же файл уже опубликован (то же имя и размер) — не копируем второй раз.
+    if target.exists() and target.stat().st_size == result.stat().st_size:
+        return target.name
+    # Имя занято другим роликом — добавляем короткий суффикс, чтобы не затереть.
+    if target.exists():
+        target = SHARE_PATH / f"{result.stem} ({uuid.uuid4().hex[:6]}){result.suffix}"
+    tmp = SHARE_PATH / (target.name + ".part")
+    shutil.copyfile(result, tmp)
+    tmp.replace(target)
+    return target.name
 
 
 def _count_active(jobs: dict, lock, states) -> int:
@@ -402,8 +400,8 @@ def _run_download(job_id: str, url: str, quality: str):
             JOBS[job_id].update(
                 state="done", percent=100,
                 filename=result.name, size=result.stat().st_size)
-        # Кладём готовый файл в SMB-витрину для просмотра с телевизора.
-        _publish_to_share(result)
+        # В SMB-витрину файл больше не копируется автоматически — только
+        # вручную, кнопкой «В библиотеку» (эндпоинт /api/library/add).
     except Exception as e:
         # Если это была отмена пользователем — чистим частичные файлы.
         with JOBS_LOCK:
@@ -557,6 +555,30 @@ def _safe_share_file(name: str) -> Path:
     except ValueError:
         raise HTTPException(400, "Некорректное имя файла")
     return target
+
+
+class LibraryAddRequest(BaseModel):
+    job_id: str
+
+
+@app.post("/api/library/add", dependencies=[Depends(check_password)])
+def library_add(req: LibraryAddRequest):
+    """Копирует готовый файл задачи в SMB-витрину (постоянное хранилище).
+    Вызывается кнопкой «В библиотеку» на сайте."""
+    if not SHARE_PATH:
+        raise HTTPException(400, "Библиотека (SMB) не настроена")
+    # job_id из тела запроса — оставляем только буквы/цифры, чтобы нельзя
+    # было выйти за пределы папки загрузок.
+    safe = re.sub(r"[^a-zA-Z0-9]", "", req.job_id)
+    result = _result_file(DOWNLOAD_DIR / safe)
+    if not result:
+        raise HTTPException(404, "Файл не найден")
+    try:
+        name = _publish_to_share(result)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(500, "Не удалось добавить в библиотеку: " + str(e))
+    return {"ok": True, "name": name}
 
 
 @app.get("/api/library", dependencies=[Depends(check_password)])

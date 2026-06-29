@@ -263,6 +263,7 @@ document.addEventListener("touchend", e => {
 
 let PARSED = null;          // результат /api/info
 let PASSWORD = localStorage.getItem("dl_pw") || "";
+let LIBRARY_ENABLED = false; // настроена ли SMB-витрина (показывать кнопку «В библиотеку»)
 
 function headers() {
   const h = { "Content-Type": "application/json" };
@@ -864,6 +865,11 @@ const GAME = (function () {
 const stopBtn = jobId =>
   `<button class="ghost small" onclick="cancelJob('${jobId}', this)">⛔ Остановить</button>`;
 
+// Кнопка «В библиотеку» — только если SMB-витрина настроена. Иначе пусто.
+const libBtn = jobId => LIBRARY_ENABLED
+  ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">📚 В библиотеку</button>`
+  : "";
+
 async function poll(jobId, el) {
   const meta = el.querySelector(".meta");
   const controls = el.querySelector(".controls");
@@ -889,11 +895,11 @@ async function poll(jobId, el) {
       const fname = s.filename || s.title || "video.mp4";
       controls.innerHTML =
         `<a class="dl" href="${href}">⬇ Скачать файл</a>` +
+        libBtn(jobId) +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       controls.querySelector(".dl").addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, fname, ev.currentTarget); });
       loadFiles();
-      loadLibrary();          // файл также попал в SMB-витрину
       return;
     } else if (s.state === "cancelled") {
       meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
@@ -960,6 +966,7 @@ async function loadFiles() {
          <div class="meta">${fmtSize(f.size)} · ${rem}</div>
          <div class="controls">
            <a class="dl" href="${href}">⬇ Скачать</a>
+           ${libBtn(f.job_id)}
            <button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>
          </div>`;
       el.querySelector(".dl").addEventListener("click", ev => {
@@ -990,11 +997,16 @@ async function loadLibrary() {
   const list = document.getElementById("libraryList");
   try {
     const { enabled, files } = await api("/api/library");
+    const wasEnabled = LIBRARY_ENABLED;
+    LIBRARY_ENABLED = !!enabled;
     if (!enabled) {                 // витрина не настроена — карточку прячем
       card.classList.add("hidden");
       return;
     }
     card.classList.remove("hidden");
+    // Витрина только что определилась как доступная — перерисуем списки файлов,
+    // чтобы на них появилась кнопка «В библиотеку».
+    if (!wasEnabled) loadFiles();
     if (!files.length) {
       list.innerHTML = '<div class="muted" style="font-size:13px">'
         + 'Библиотека пуста.</div>';
@@ -1023,6 +1035,22 @@ async function loadLibrary() {
     });
   } catch (e) {
     list.innerHTML = `<div class="err" style="font-size:13px">⚠ ${e.message}</div>`;
+  }
+}
+
+// Копирует готовый файл задачи в SMB-витрину (постоянное хранилище для ТВ).
+async function addToLibrary(jobId, btn) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "Добавляю…";
+  try {
+    await api("/api/library/add", {
+      method: "POST", body: JSON.stringify({ job_id: jobId }) });
+    btn.textContent = "✓ В библиотеке";
+    loadLibrary();              // обновим список библиотеки — там появился файл
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    alert("Не удалось добавить в библиотеку: " + e.message);
   }
 }
 
