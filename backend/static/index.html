@@ -117,6 +117,8 @@
   a.dl:hover { transform:translateY(-1px); filter:brightness(1.05); }
 
   textarea.ttext { min-height:220px; margin-top:10px; resize:vertical; line-height:1.55; font-size:16px; }
+  .tc-toggle { font-size:12px; color:var(--muted); display:inline-flex; align-items:center; gap:5px; cursor:pointer; }
+  .tc-toggle input { width:auto; margin:0; }
 
   ::selection { background:rgba(255,93,177,.30); }
   .hidden { display:none; }
@@ -179,7 +181,8 @@
         </select>
       </div>
       <button id="dlBtn" onclick="startDownload()">Скачать</button>
-      <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Транскрибация</button>
+      <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Субтитры</button>
+      <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">🎙 Свои субтитры</button>
     </div>
   </div>
 
@@ -457,7 +460,9 @@ async function createJob(target, quality) {
 
 // --- Транскрибация --------------------------------------------------------
 
-function startTranscribe() {
+// force = true → «Свои субтитры»: игнорируем встроенные и распознаём своей
+// моделью в точном режиме (medium/small + beam search).
+function startTranscribe(force) {
   let targets = [];
   if (PARSED.type === "playlist") {
     document.querySelectorAll("#epList input:checked").forEach(c => {
@@ -469,26 +474,36 @@ function startTranscribe() {
     targets.push({ url: PARSED.url, title: PARSED.title });
   }
   document.getElementById("transCard").classList.remove("hidden");
-  targets.forEach(createTranscribeJob);
+  targets.forEach(t => createTranscribeJob(t, force));
 }
 
-async function createTranscribeJob(target) {
+async function createTranscribeJob(target, force) {
   const wrap = document.getElementById("transList");
   const el = document.createElement("div");
   el.className = "job";
   el.dataset.t0 = Date.now();
+  el.dataset.url = target.url;
+  el.dataset.title = target.title || "субтитры";
   el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
     <div class="meta">запуск…</div>
     <div class="controls tcancel"></div>
     <div class="controls tcontrols hidden">
-      <button class="copy small" onclick="copyText(this)">📋 Копировать текст</button>
+      <button class="copy small" onclick="copyText(this)">📋 Копировать</button>
+      <button class="copy small" onclick="downloadSubs(this,'srt')">⬇ .srt</button>
+      <button class="copy small" onclick="downloadSubs(this,'txt')">⬇ .txt</button>
+      <label class="tc-toggle"><input type="checkbox" checked
+        onchange="renderTranscript(this)"> таймкоды</label>
+      <button class="ghost small tc-redo hidden"
+        onclick="redoWhisper(this)">🎙 Сделать свои субтитры</button>
     </div>
     <textarea class="ttext hidden" readonly
-      placeholder="Здесь появится расшифровка…"></textarea>`;
+      placeholder="Здесь появятся субтитры…"></textarea>`;
   wrap.prepend(el);
   try {
+    const body = { url: target.url };
+    if (force) { body.force_whisper = true; body.quality = "accurate"; }
     const { job_id } = await api("/api/transcribe", {
-      method: "POST", body: JSON.stringify({ url: target.url }) });
+      method: "POST", body: JSON.stringify(body) });
     pollTranscribe(job_id, el);
   } catch (e) {
     el.querySelector(".meta").innerHTML = `<span class="err">⚠ ${e.message}</span>`;
@@ -521,15 +536,21 @@ async function pollTranscribe(jobId, el) {
       const pct = s.percent ? " " + Math.round(s.percent) + "%" : "";
       active("🎙 " + stage + pct + elapsed());
     } else if (s.state === "done") {
-      const src = s.source === "subtitles"
-        ? "готовые субтитры" : "распознавание Whisper";
+      const fromSubs = s.source === "subtitles";
+      const src = fromSubs ? "встроенные субтитры" : "своё распознавание";
       meta.innerHTML = `<span class="done">✓ Готово</span> `
         + `<span class="muted">· ${src}</span>`;
       cancelBox.innerHTML = "";
-      const ta = el.querySelector(".ttext");
-      ta.value = s.text || "";
-      ta.classList.remove("hidden");
+      // Сегменты с таймкодами; фолбэк — единый блок текста без времени.
+      el._segs = (s.segments && s.segments.length)
+        ? s.segments
+        : (s.text ? [{ start: 0, end: 0, text: s.text }] : []);
+      el.querySelector(".ttext").classList.remove("hidden");
       el.querySelector(".tcontrols").classList.remove("hidden");
+      // Кнопку «сделать свои субтитры» показываем, только если сейчас
+      // показаны встроенные — чтобы можно было переспросить своей моделью.
+      el.querySelector(".tc-redo").classList.toggle("hidden", !fromSubs);
+      renderTranscript(el.querySelector(".tc-toggle input"));
       return;
     } else if (s.state === "cancelled") {
       meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
@@ -568,6 +589,64 @@ function copyText(btn) {
   } else {
     ta.select(); document.execCommand("copy"); done();
   }
+}
+
+// Таймкод для показа на странице: mm:ss или h:mm:ss.
+function fmtTc(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+}
+
+// Перерисовываем субтитры в textarea: с таймкодами [mm:ss] или сплошным текстом.
+function renderTranscript(node) {
+  const el = node.closest(".job");
+  const segs = el._segs || [];
+  const withTc = el.querySelector(".tc-toggle input").checked
+    && segs.some(x => x.end);   // если времени нет — нечего показывать
+  const ta = el.querySelector(".ttext");
+  ta.value = withTc
+    ? segs.map(x => `[${fmtTc(x.start)}] ${x.text}`).join("\n")
+    : segs.map(x => x.text).join("\n");
+}
+
+// Точный таймкод для .srt: HH:MM:SS,mmm.
+function srtTime(sec) {
+  sec = Math.max(0, sec || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60),
+        s = Math.floor(sec % 60), ms = Math.round((sec - Math.floor(sec)) * 1000);
+  const p = (n, l = 2) => String(n).padStart(l, "0");
+  return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`;
+}
+
+function buildSrt(segs) {
+  return segs.map((x, i) =>
+    `${i + 1}\n${srtTime(x.start)} --> ${srtTime(x.end || x.start + 2)}\n${x.text}`
+  ).join("\n\n") + "\n";
+}
+
+// Скачиваем субтитры в файл (.srt с таймкодами или .txt сплошным текстом).
+function downloadSubs(btn, fmt) {
+  const el = btn.closest(".job");
+  const segs = el._segs || [];
+  if (!segs.length) return;
+  const base = (el.dataset.title || "субтитры").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 80);
+  const body = fmt === "srt" ? buildSrt(segs) : segs.map(x => x.text).join("\n");
+  const blob = new Blob(["﻿" + body], { type: "text/plain;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${base}.${fmt}`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+// «Сделать свои субтитры» из готовой задачи со встроенными: новая задача Whisper.
+function redoWhisper(btn) {
+  const el = btn.closest(".job");
+  btn.classList.add("hidden");   // одного повтора достаточно
+  createTranscribeJob({ url: el.dataset.url,
+    title: (el.dataset.title || "субтитры") + " (свои)" }, true);
 }
 
 function fmtSize(bytes) {

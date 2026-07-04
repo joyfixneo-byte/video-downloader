@@ -6,6 +6,7 @@
 """
 import os
 import re
+import html
 import json
 import time
 import uuid
@@ -674,9 +675,14 @@ def tetris_best_submit(payload: TetrisScore):
 
 # Имя модели Whisper: tiny / base / small / medium. base — компромисс
 # скорость/качество на CPU. small точнее для русского, но медленнее.
+# Быстрый режим — WHISPER_MODEL (по умолчанию base), точный («свои субтитры»)
+# — WHISPER_MODEL_ACCURATE (по умолчанию small): заметно лучше на русском и
+# на плохом звуке, ценой скорости.
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
+WHISPER_MODEL_ACCURATE = os.environ.get("WHISPER_MODEL_ACCURATE", "small")
 
-_whisper_model = None
+# Кэш загруженных моделей по имени (быстрая и точная живут одновременно).
+_whisper_models: dict[str, object] = {}
 _whisper_lock = threading.Lock()
 
 # Задачи транскрибации в памяти: job_id -> dict(state, percent, text, source, error)
@@ -702,36 +708,74 @@ def _tcancelled(job_id: str) -> bool:
         return bool(j and j.get("cancel"))
 
 
-def _get_whisper():
-    """Лениво загружаем модель Whisper один раз (на CPU, int8).
+def _get_whisper(model_name: str):
+    """Лениво загружаем модель Whisper один раз на имя (на CPU, int8).
     Первый вызов скачает веса модели с HuggingFace (нужен интернет)."""
-    global _whisper_model
     with _whisper_lock:
-        if _whisper_model is None:
+        model = _whisper_models.get(model_name)
+        if model is None:
             from faster_whisper import WhisperModel
-            _whisper_model = WhisperModel(
-                WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
-        return _whisper_model
+            model = WhisperModel(
+                model_name, device="cpu", compute_type="int8")
+            _whisper_models[model_name] = model
+        return model
 
 
-def _vtt_to_text(raw: str) -> str:
-    """Превращает VTT/SRT-субтитры в сплошной текст: убираем тайм-коды,
-    служебные строки и теги, схлопываем подряд идущие повторы (авто-субтитры
-    часто дублируют строки от кадра к кадру)."""
-    out = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or "-->" in line or line.isdigit():
+def _parse_vtt_time(t: str) -> float:
+    """'00:01:02.345' / '01:02.345' / '00:01:02,345' → секунды (float)."""
+    t = t.strip().replace(",", ".")
+    try:
+        parts = [float(p) for p in t.split(":")]
+    except ValueError:
+        return 0.0
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    h, m, s = parts[-3], parts[-2], parts[-1]
+    return h * 3600 + m * 60 + s
+
+
+_VTT_TS = re.compile(
+    r"(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})\s*-->\s*"
+    r"(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})")
+
+
+def _clean_cue(line: str) -> str:
+    """Чистим строку субтитра: убираем теги <c>/<00:..>, декодируем сущности."""
+    line = re.sub(r"<[^>]+>", "", line)
+    line = html.unescape(line.replace("&nbsp;", " "))
+    return line.strip()
+
+
+def _vtt_to_segments(raw: str) -> list[dict]:
+    """VTT/SRT → список сегментов [{start, end, text}] с таймкодами.
+    Схлопываем подряд идущие дубли (авто-субтитры «прокручиваются» и повторяют
+    одну и ту же строку от кадра к кадру): такой повтор просто продлевает
+    предыдущий сегмент, а не плодит новые строки."""
+    segs: list[dict] = []
+    for block in re.split(r"\n[ \t]*\n", raw):
+        lines = block.strip("\n").splitlines()
+        ts_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if ts_idx is None:
             continue
-        if line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+        m = _VTT_TS.search(lines[ts_idx])
+        if not m:
             continue
-        line = re.sub(r"<[^>]+>", "", line)        # <c>, <00:00:01.000> и пр.
-        line = line.replace("&nbsp;", " ").strip()
-        if not line:
+        start, end = _parse_vtt_time(m.group(1)), _parse_vtt_time(m.group(2))
+        text = " ".join(
+            c for c in (_clean_cue(ln) for ln in lines[ts_idx + 1:]) if c
+        ).strip()
+        if not text:
             continue
-        if not out or out[-1] != line:
-            out.append(line)
-    return "\n".join(out).strip()
+        if segs and segs[-1]["text"] == text:
+            segs[-1]["end"] = end        # тот же текст — просто продлеваем
+            continue
+        segs.append({"start": start, "end": end, "text": text})
+    return segs
+
+
+def _segments_to_text(segs: list[dict]) -> str:
+    """Сплошной текст из сегментов (для копирования/поиска)."""
+    return "\n".join(s["text"] for s in segs if s.get("text")).strip()
 
 
 def _pick_sub(subs: dict, langs):
@@ -773,14 +817,16 @@ def _try_subtitles(url: str, job_dir: Path, lang: str):
             if not pick:
                 return None
             raw = ydl.urlopen(pick[1]).read().decode("utf-8", "ignore")
-        return _vtt_to_text(raw) or None
+        return _vtt_to_segments(raw) or None
     except Exception:
         traceback.print_exc()
         return None
 
 
-def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
-    """Скачиваем аудио и распознаём его локально через Whisper."""
+def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str,
+                        quality: str = "fast") -> list[dict]:
+    """Скачиваем аудио и распознаём его локально через Whisper.
+    Возвращаем сегменты [{start, end, text}] с таймкодами."""
     # Для распознавания важен только звук, качество видео не нужно. Поэтому
     # берём отдельную аудио-дорожку, а если её нет — САМЫЙ ЛЁГКИЙ поток со
     # звуком (worst), а не best: на сайтах без audio-only это превращает
@@ -807,25 +853,40 @@ def _whisper_transcribe(url: str, job_dir: Path, lang: str, job_id: str) -> str:
             f"Видео длиннее {int(WHISPER_MAX_MINUTES)} мин — распознавание речью "
             "для такой длины отключено. Попробуйте видео с готовыми субтитрами.")
 
+    accurate = quality == "accurate"
+    model_name = WHISPER_MODEL_ACCURATE if accurate else WHISPER_MODEL_NAME
     _tset(job_id, stage="Загружаю модель…")
-    model = _get_whisper()
+    model = _get_whisper(model_name)
 
-    # beam_size=1 и vad_filter заметно ускоряют распознавание на CPU:
-    # жадный поиск вместо лучевого + пропуск тишины/музыки (для сериалов
-    # с паузами выигрыш большой), почти без потери точности речи.
+    # Два режима:
+    #  • fast — жадный поиск (beam_size=1) на модели base: быстро, чуть грубее.
+    #  • accurate («свои субтитры») — лучевой поиск (beam_size=5) на модели
+    #    small + учёт предыдущего текста и мягкий VAD: точнее на русском и на
+    #    плохом звуке, но ощутимо медленнее. vad_filter в обоих режимах
+    #    пропускает тишину/музыку — на роликах с паузами это большой выигрыш.
+    if accurate:
+        tr_kwargs = dict(
+            beam_size=5, best_of=5, temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            condition_on_previous_text=True, vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500))
+    else:
+        tr_kwargs = dict(beam_size=1, vad_filter=True)
+
     _tset(job_id, stage="Распознаю речь")
     segments, _ = model.transcribe(
-        str(audio), language=lang or None, beam_size=1, vad_filter=True)
+        str(audio), language=lang or None, **tr_kwargs)
 
-    parts = []
+    out = []
     for seg in segments:           # генератор: сам прогон идёт здесь
         if _tcancelled(job_id):    # пользователь нажал «Остановить»
             raise _Cancelled()
-        parts.append(seg.text.strip())
+        text = (seg.text or "").strip()
+        if text:
+            out.append({"start": seg.start, "end": seg.end, "text": text})
         if duration:
             pct = min(99, round(seg.end / duration * 100))
             _tset(job_id, percent=pct)
-    return " ".join(p for p in parts if p).strip()
+    return out
 
 
 def _transcribe_error(e) -> str:
@@ -835,16 +896,24 @@ def _transcribe_error(e) -> str:
     return friendly_error(e)
 
 
-def _run_transcribe(job_id: str, url: str, lang: str):
+def _run_transcribe(job_id: str, url: str, lang: str,
+                    force_whisper: bool = False, quality: str = "fast"):
     job_dir = DOWNLOAD_DIR / ("t_" + job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with TJOBS_LOCK:
-            TJOBS[job_id].update(state="subtitles")
-        text = _try_subtitles(url, job_dir, lang)
-        source = "subtitles"
+        segments = None
+        source = "whisper"
 
-        if not text:
+        # Готовые субтитры пропускаем, если пользователь явно попросил «свои
+        # субтитры» (force_whisper): встроенные авто-субтитры часто плохие.
+        if not force_whisper:
+            with TJOBS_LOCK:
+                TJOBS[job_id].update(state="subtitles")
+            segments = _try_subtitles(url, job_dir, lang)
+            if segments:
+                source = "subtitles"
+
+        if not segments:
             # Whisper тяжёлый — ждём своей очереди на семафоре,
             # пока показываем «в очереди».
             with TJOBS_LOCK:
@@ -855,15 +924,17 @@ def _run_transcribe(job_id: str, url: str, lang: str):
                         raise _Cancelled()
                     TJOBS[job_id].update(
                         state="transcribing", percent=0, stage="Готовлю…")
-                text = _whisper_transcribe(url, job_dir, lang, job_id)
+                segments = _whisper_transcribe(
+                    url, job_dir, lang, job_id, quality)
             source = "whisper"
 
-        if not text:
+        if not segments:
             raise RuntimeError("Не удалось получить текст из этого видео")
 
         with TJOBS_LOCK:
             TJOBS[job_id].update(
-                state="done", percent=100, text=text, source=source)
+                state="done", percent=100, text=_segments_to_text(segments),
+                segments=segments, source=source)
     except _Cancelled:
         with TJOBS_LOCK:
             TJOBS[job_id].update(state="cancelled", text=None)
@@ -878,7 +949,9 @@ def _run_transcribe(job_id: str, url: str, lang: str):
 
 class TranscribeRequest(BaseModel):
     url: str
-    lang: str = ""   # пусто = автоопределение языка
+    lang: str = ""              # пусто = автоопределение языка
+    force_whisper: bool = False  # «свои субтитры»: игнорировать встроенные
+    quality: str = "fast"        # fast | accurate
 
 
 @app.post("/api/transcribe", dependencies=[Depends(check_password)])
@@ -891,14 +964,17 @@ def transcribe(req: TranscribeRequest):
                      ("queued", "subtitles", "transcribing")) >= TJOB_CEILING:
         raise HTTPException(429, "Сейчас слишком много задач распознавания — "
                                  "попробуйте позже.")
+    quality = "accurate" if req.quality == "accurate" else "fast"
     job_id = uuid.uuid4().hex[:12]
     with TJOBS_LOCK:
         TJOBS[job_id] = {
             "state": "queued", "percent": None, "stage": None,
-            "text": None, "source": None, "error": None, "cancel": False,
+            "text": None, "segments": None, "source": None,
+            "error": None, "cancel": False,
         }
     threading.Thread(
-        target=_run_transcribe, args=(job_id, url, req.lang.strip()),
+        target=_run_transcribe,
+        args=(job_id, url, req.lang.strip(), bool(req.force_whisper), quality),
         daemon=True).start()
     return {"job_id": job_id}
 
