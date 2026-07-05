@@ -156,6 +156,26 @@
     <div class="hint" id="checkHint"></div>
   </div>
 
+  <!-- Торренты: поиск по трекеру + ручной magnet -->
+  <div class="card gated" id="torrentCard">
+    <label>🧲 Торренты</label>
+    <div class="row">
+      <div><input type="text" id="tq" placeholder="Название раздачи…"
+                  onkeydown="if(event.key==='Enter'){event.preventDefault();torrentSearch();}"></div>
+      <button onclick="torrentSearch()">Искать</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <div><input type="text" id="tmagnet" placeholder="…или вставьте magnet-ссылку"
+                  onkeydown="if(event.key==='Enter'){event.preventDefault();addTorrentMagnet();}"></div>
+      <button class="ghost" onclick="addTorrentMagnet()">⬇ Скачать magnet</button>
+    </div>
+    <div class="hint" id="tHint"></div>
+    <div class="jobs" id="tResults"></div>
+    <div class="hint" style="margin-top:6px; opacity:.7">
+      Только для личного просмотра легального контента (дистрибутивы и т.п.).
+    </div>
+  </div>
+
   <!-- Результат разбора -->
   <div class="card hidden gated cond" id="pickCard">
     <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
@@ -456,6 +476,80 @@ async function createJob(target, quality) {
   } catch (e) {
     el.querySelector(".meta").innerHTML = `<span class="err">⚠ ${e.message}</span>`;
   }
+}
+
+// --- Торренты -------------------------------------------------------------
+// Поиск по трекеру → список раздач; magnet берётся лениво при добавлении.
+// Скачивание переиспользует общий poll()/список файлов — торрент-задача
+// живёт в тех же JOBS, что и обычные загрузки.
+async function torrentSearch() {
+  const q = document.getElementById("tq").value.trim();
+  const hint = document.getElementById("tHint");
+  const list = document.getElementById("tResults");
+  if (q.length < 2) { hint.textContent = "Введите запрос (от 2 символов)."; return; }
+  hint.textContent = "Ищу…"; list.innerHTML = "";
+  try {
+    const { results } = await api("/api/torrent/search?q=" + encodeURIComponent(q));
+    if (!results.length) { hint.textContent = "Ничего не найдено."; return; }
+    hint.textContent = "";
+    results.forEach(r => {
+      const el = document.createElement("div");
+      el.className = "job";
+      el.innerHTML =
+        `<div class="name">${escapeHtml(r.title)}</div>
+         <div class="meta">💾 ${escapeHtml(r.size)} · 🌱 ${r.seeders} · 🔻 ${r.leechers}</div>
+         <div class="controls">
+           <button class="dl">⬇ Скачать</button>
+         </div>`;
+      el.querySelector(".dl").addEventListener("click", ev =>
+        addTorrent(r.detail, r.title, ev.currentTarget));
+      list.appendChild(el);
+    });
+  } catch (e) {
+    hint.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+  }
+}
+
+async function addTorrent(detail, title, btn) {
+  btn.disabled = true; btn.textContent = "Добавляю…";
+  try {
+    const { job_id } = await api("/api/torrent", {
+      method: "POST", body: JSON.stringify({ detail }) });
+    btn.textContent = "✓ В загрузках";
+    startTorrentJob(job_id, title || "Торрент");
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "⬇ Скачать";
+    alert("Не удалось: " + e.message);
+  }
+}
+
+async function addTorrentMagnet() {
+  const inp = document.getElementById("tmagnet");
+  const magnet = inp.value.trim();
+  if (!magnet.startsWith("magnet:")) {
+    alert("Вставьте корректную magnet-ссылку (magnet:?xt=…)."); return;
+  }
+  try {
+    const { job_id } = await api("/api/torrent", {
+      method: "POST", body: JSON.stringify({ magnet }) });
+    inp.value = "";
+    startTorrentJob(job_id, "Торрент (magnet)");
+  } catch (e) {
+    alert("Не удалось: " + e.message);
+  }
+}
+
+// Создаёт карточку в общем списке загрузок и запускает существующий poll().
+function startTorrentJob(jobId, title) {
+  document.getElementById("jobsCard").classList.remove("hidden");
+  const wrap = document.getElementById("jobs");
+  const el = document.createElement("div");
+  el.className = "job";
+  el.innerHTML = `<div class="name">🧲 ${escapeHtml(title)}</div>
+    <div class="meta">в очереди…</div>
+    <div class="controls"></div>`;
+  wrap.prepend(el);
+  poll(jobId, el);
 }
 
 // --- Транскрибация --------------------------------------------------------

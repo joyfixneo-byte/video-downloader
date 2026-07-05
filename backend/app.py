@@ -15,8 +15,10 @@ import socket
 import ipaddress
 import threading
 import traceback
+import subprocess
+import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse
@@ -130,7 +132,7 @@ def _is_temp(p: Path) -> bool:
     и нельзя отдавать на скачивание (иначе размер «прыгает», а в браузере
     вместо файла открывается мусор)."""
     n = p.name.lower()
-    return (n.endswith((".part", ".ytdl", ".tmp", ".temp", ".download"))
+    return (n.endswith((".part", ".ytdl", ".tmp", ".temp", ".download", ".aria2"))
             or ".part-frag" in n)
 
 
@@ -533,6 +535,238 @@ def get_file(job_id: str):
         raise HTTPException(404, "Файл не найден")
     return FileResponse(
         result, filename=result.name, media_type="application/octet-stream")
+
+
+# --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
+# Фаза 1: нашёл раздачу (или вставил magnet) → aria2c качает её на сервер в ту
+# же папку DOWNLOAD_DIR/<job_id>/. Готовый файл попадает в общий список
+# (/api/files) и отдаётся теми же ручками, что и yt-dlp-загрузки — торрент-
+# задача живёт в тех же JOBS, поэтому /api/status, /api/cancel, /api/delete,
+# /api/file и автоочистка работают для неё без изменений. Просмотр — после
+# докачки (стриминг во время загрузки — отдельный этап).
+# ⚠️ Только личный просмотр легального контента (дистрибутивы и т.п.).
+
+ARIA2_BIN = os.environ.get("ARIA2_BIN", "aria2c")
+# Хост публичного трекера для поиска. Через env — на случай смены зеркала.
+TRACKER_BASE = os.environ.get("TRACKER_BASE", "https://1337x.to").rstrip("/")
+TORRENT_HTTP_TIMEOUT = 20  # секунд на один запрос к трекеру
+MAGNET_RE = re.compile(r"^magnet:\?xt=urn:btih:[a-zA-Z0-9]+", re.I)
+
+
+def _tracker_get(url: str) -> str:
+    """GET страницы трекера с браузерным User-Agent (без него часто 403)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=TORRENT_HTTP_TIMEOUT) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _search_torrents(query: str) -> list:
+    """Скрейпит страницу поиска 1337x. Возвращает список раздач с путём к
+    странице раздачи (detail) — magnet берём лениво при добавлении, чтобы
+    поиск не делал по запросу на каждую строку. ⚠️ Хрупкая часть: трекер
+    может сменить вёрстку/уйти за Cloudflare — тогда падаем в 502, а
+    пользователь вставляет magnet вручную."""
+    page = _tracker_get(f"{TRACKER_BASE}/search/{quote(query)}/1/")
+    out = []
+    for row in re.findall(r"<tr>(.*?)</tr>", page, re.S):
+        m = re.search(r'href="(/torrent/\d+/[^"]+/)"[^>]*>([^<]+)</a>', row)
+        if not m:
+            continue
+        seeds = re.search(r'coll-2 seeds[^>]*>(\d+)', row)
+        leech = re.search(r'coll-3 leeches[^>]*>(\d+)', row)
+        size = re.search(r'coll-4 size[^>]*>([\d.,]+\s*[KMGTP]?i?B)', row)
+        out.append({
+            "title": html.unescape(m.group(2)).strip(),
+            "detail": m.group(1),
+            "size": size.group(1).strip() if size else "?",
+            "seeders": int(seeds.group(1)) if seeds else 0,
+            "leechers": int(leech.group(1)) if leech else 0,
+        })
+        if len(out) >= 30:
+            break
+    out.sort(key=lambda x: x["seeders"], reverse=True)  # больше сидов — выше
+    return out
+
+
+def _resolve_magnet(detail: str) -> str:
+    """Достаёт magnet-ссылку со страницы конкретной раздачи 1337x."""
+    if not detail.startswith("/torrent/"):
+        raise HTTPException(400, "Некорректная ссылка на раздачу")
+    page = _tracker_get(f"{TRACKER_BASE}{detail}")
+    m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', page)
+    if not m:
+        raise HTTPException(502, "Не удалось получить magnet-ссылку раздачи")
+    return html.unescape(m.group(1))
+
+
+def _bytes_from_aria2(s: str):
+    """'5.2MiB' → байты (для speed/размера из вывода aria2c). None если не разобрать."""
+    m = re.match(r"([\d.]+)\s*([KMGTP]?)i?B", s, re.I)
+    if not m:
+        return None
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
+            "T": 1024 ** 4, "P": 1024 ** 5}
+    return int(float(m.group(1)) * mult.get(m.group(2).upper(), 1))
+
+
+def _seconds_from_aria2(s: str):
+    """'3m30s' / '1h2m' / '45s' → секунды. None если пусто."""
+    total = sum(int(n) * {"h": 3600, "m": 60, "s": 1}[u]
+                for n, u in re.findall(r"(\d+)([hms])", s))
+    return total or None
+
+
+def _run_torrent(job_id: str, magnet: str):
+    """Качает magnet через aria2c в папку задачи, обновляя те же поля JOBS,
+    что и _run_download (state/percent/speed/eta/total) — чтобы фронтовый
+    poll() работал без изменений. Уважает job['cancel']."""
+    job_dir = DOWNLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ARIA2_BIN,
+        "--dir", str(job_dir),
+        "--seed-time=0",              # не раздаём после докачки — сразу выходим
+        "--summary-interval=1",       # строка прогресса раз в секунду
+        "--console-log-level=warn",
+        "--file-allocation=none",     # не преаллоцируем весь размер на диск
+        "--bt-stop-timeout=300",      # 5 мин без пиров — прекращаем
+        "--follow-torrent=mem",
+        magnet,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+    except FileNotFoundError:
+        with JOBS_LOCK:
+            JOBS[job_id].update(
+                state="error",
+                error="aria2 не установлен на сервере (нужен apt install aria2).")
+        return
+
+    with JOBS_LOCK:
+        JOBS[job_id]["state"] = "downloading"
+
+    try:
+        for line in proc.stdout:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if not job or job.get("cancel"):
+                    break
+            m = re.search(r"\((\d+)%\)", line)
+            if not m:
+                continue
+            spd = re.search(r"DL:([\d.]+\s*[KMGTP]?i?B)", line)
+            eta = re.search(r"ETA:([0-9hms]+)", line)
+            tot = re.search(r"/([\d.]+\s*[KMGTP]?i?B)\(", line)
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job and not job.get("cancel"):
+                    job.update(
+                        state="downloading",
+                        percent=int(m.group(1)),
+                        speed=_bytes_from_aria2(spd.group(1)) if spd else None,
+                        eta=_seconds_from_aria2(eta.group(1)) if eta else None,
+                        total=_bytes_from_aria2(tot.group(1)) if tot else None)
+
+        with JOBS_LOCK:
+            cancelled = JOBS.get(job_id, {}).get("cancel")
+        if cancelled:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+            shutil.rmtree(job_dir, ignore_errors=True)
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="cancelled", filename=None)
+            return
+
+        proc.wait()
+        result = _result_file(job_dir)
+        if not result:
+            # Многофайловая раздача: aria2 кладёт файлы в подпапку с именем
+            # торрента, а _result_file/api/files смотрят только верхний уровень.
+            # Поднимаем самый большой не-временный файл (видео) наверх.
+            nested = [p for p in job_dir.rglob("*")
+                      if p.is_file() and not _is_temp(p)]
+            if nested:
+                biggest = max(nested, key=lambda p: p.stat().st_size)
+                target = job_dir / biggest.name
+                if biggest != target:
+                    biggest.replace(target)
+                result = target
+        if not result:
+            raise RuntimeError("aria2 не скачал файл (нет пиров или битый magnet)")
+        with JOBS_LOCK:
+            JOBS[job_id].update(
+                state="done", percent=100,
+                filename=result.name, size=result.stat().st_size)
+    except Exception as e:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        with JOBS_LOCK:
+            cancelled = JOBS.get(job_id, {}).get("cancel")
+        if cancelled:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="cancelled", filename=None)
+        else:
+            traceback.print_exc()
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="error", error=str(e)[:200])
+
+
+class TorrentRequest(BaseModel):
+    magnet: str = ""   # прямая magnet-ссылка (ручной ввод)
+    detail: str = ""   # ИЛИ путь к раздаче из результатов поиска
+
+
+@app.get("/api/torrent/search", dependencies=[Depends(check_password)])
+def torrent_search(q: str):
+    q = (q or "").strip()
+    if len(q) < 2:
+        raise HTTPException(400, "Слишком короткий запрос")
+    if len(q) > 200:
+        raise HTTPException(400, "Слишком длинный запрос")
+    try:
+        return {"results": _search_torrents(q)}
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            502, "Поиск сейчас недоступен (трекер не ответил или сменил "
+                 "вёрстку). Можно вставить magnet-ссылку вручную.")
+
+
+@app.post("/api/torrent", dependencies=[Depends(check_password)])
+def torrent_add(req: TorrentRequest):
+    magnet = (req.magnet or "").strip()
+    if not magnet and req.detail:
+        magnet = _resolve_magnet(req.detail.strip())
+    if not MAGNET_RE.match(magnet):
+        raise HTTPException(400, "Нужна корректная magnet-ссылка")
+    if _count_active(JOBS, JOBS_LOCK,
+                     ("queued", "downloading", "processing")) >= JOB_CEILING:
+        raise HTTPException(429, "Сейчас слишком много загрузок — попробуйте позже.")
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "state": "queued", "percent": None, "speed": None,
+            "eta": None, "title": None, "filename": None, "error": None,
+            "cancel": False, "total": None, "size": None,
+        }
+    threading.Thread(
+        target=_run_torrent, args=(job_id, magnet), daemon=True).start()
+    return {"job_id": job_id}
 
 
 # --- Библиотека: файлы в SMB-витрине (постоянное хранилище для ТВ) ---------
