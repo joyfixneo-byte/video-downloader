@@ -84,13 +84,19 @@ def _cleanup_loop():
     Возраст считаем по самому свежему файлу в папке — то есть отсчёт идёт
     от момента, когда скачивание завершилось. Файл, который ещё качается
     (mtime обновляется), под удаление не попадёт.
+
+    Папки торрент-задач (помечены файлом .torrent_job) не трогаем вообще —
+    их удаляют только вручную кнопкой «Удалить». Маркер на диске, а не в
+    JOBS, потому что JOBS — память процесса и теряется при перезапуске.
     """
     while True:
         try:
             now = time.time()
             if DOWNLOAD_DIR.exists():
                 for d in DOWNLOAD_DIR.iterdir():
-                    if not d.is_dir():
+                    if not d.is_dir() or d.name == ".meta":
+                        continue
+                    if (d / ".torrent_job").exists():
                         continue
                     files = [p for p in d.iterdir() if p.is_file()]
                     newest = (max(p.stat().st_mtime for p in files)
@@ -499,12 +505,15 @@ def list_files():
             if not result:
                 continue
             mtime = result.stat().st_mtime
-            remaining = int(RETENTION_SECONDS - (now - mtime))
+            is_torrent = (d / ".torrent_job").exists()
+            remaining = None if is_torrent else max(
+                0, int(RETENTION_SECONDS - (now - mtime)))
             items.append({
                 "job_id": d.name,
                 "filename": result.name,
                 "size": result.stat().st_size,
-                "remaining": max(0, remaining),
+                "remaining": remaining,
+                "torrent": is_torrent,
                 "mtime": mtime,
             })
     items.sort(key=lambda x: x["mtime"], reverse=True)  # новые сверху
@@ -512,7 +521,7 @@ def list_files():
 
 
 @app.get("/api/file/{job_id}")
-def get_file(job_id: str):
+def get_file(job_id: str, path: str = ""):
     # Файл отдаём без пароля в заголовке — браузер скачивает по прямой ссылке.
     # job_id случайный и неугадываемый, этого достаточно для личного сервера.
     # Чистим job_id так же, как при удалении: только буквы/цифры, чтобы нельзя
@@ -527,6 +536,20 @@ def get_file(job_id: str):
         state = job.get("state") if job else None
     if state in ("queued", "downloading", "processing"):
         raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
+
+    # path — конкретный файл многофайловой торрент-раздачи (раскрывающаяся
+    # табличка); проверяем, что итог не выходит за пределы папки задачи.
+    if path:
+        base = job_dir.resolve()
+        target = (job_dir / path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(400, "Некорректный путь")
+        if not target.is_file() or _is_temp(target):
+            raise HTTPException(404, "Файл не найден")
+        return FileResponse(
+            target, filename=target.name, media_type="application/octet-stream")
 
     # Ищем готовый файл на диске, а не в памяти процесса: так файл можно
     # скачать даже после перезапуска сервиса (когда список задач в памяти пуст).
@@ -604,6 +627,17 @@ def _resolve_magnet(detail: str) -> str:
     return html.unescape(m.group(1))
 
 
+def _resolve_torrent_source(magnet: str, detail: str) -> str:
+    """magnet (ручной ввод) или detail (результат поиска) -> проверенный magnet.
+    Общая логика для /api/torrent/files и /api/torrent (путь без token)."""
+    magnet = (magnet or "").strip()
+    if not magnet and detail:
+        magnet = _resolve_magnet(detail.strip())
+    if not MAGNET_RE.match(magnet):
+        raise HTTPException(400, "Нужна корректная magnet-ссылка")
+    return magnet
+
+
 def _bytes_from_aria2(s: str):
     """'5.2MiB' → байты (для speed/размера из вывода aria2c). None если не разобрать."""
     m = re.match(r"([\d.]+)\s*([KMGTP]?)i?B", s, re.I)
@@ -621,12 +655,19 @@ def _seconds_from_aria2(s: str):
     return total or None
 
 
-def _run_torrent(job_id: str, magnet: str):
-    """Качает magnet через aria2c в папку задачи, обновляя те же поля JOBS,
+def _run_torrent(job_id: str, source: str, select=None):
+    """Качает раздачу через aria2c в папку задачи, обновляя те же поля JOBS,
     что и _run_download (state/percent/speed/eta/total) — чтобы фронтовый
-    poll() работал без изменений. Уважает job['cancel']."""
+    poll() работал без изменений. Уважает job['cancel'].
+
+    source — либо magnet-ссылка (старый путь, качаем всё), либо путь к уже
+    скачанному .torrent-файлу (после предпросмотра списка файлов) — тогда
+    select задаёт список 1-based индексов файлов для --select-file."""
     job_dir = DOWNLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    # Маркер: эта папка — торрент-задача, автоочистка (_cleanup_loop) её не трогает.
+    (job_dir / ".torrent_job").touch()
+    is_magnet = source.startswith("magnet:")
     cmd = [
         ARIA2_BIN,
         "--dir", str(job_dir),
@@ -635,9 +676,12 @@ def _run_torrent(job_id: str, magnet: str):
         "--console-log-level=warn",
         "--file-allocation=none",     # не преаллоцируем весь размер на диск
         "--bt-stop-timeout=300",      # 5 мин без пиров — прекращаем
-        "--follow-torrent=mem",
-        magnet,
     ]
+    if is_magnet:
+        cmd.append("--follow-torrent=mem")
+    if select:
+        cmd.append("--select-file=" + ",".join(str(i) for i in select))
+    cmd.append(source)
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -722,11 +766,18 @@ def _run_torrent(job_id: str, magnet: str):
             traceback.print_exc()
             with JOBS_LOCK:
                 JOBS[job_id].update(state="error", error=str(e)[:200])
+    finally:
+        # source — путь к заранее скачанному .torrent (папка .meta/<token>/,
+        # см. /api/torrent/files) — временную папку с ним больше не храним.
+        if not is_magnet:
+            shutil.rmtree(Path(source).parent, ignore_errors=True)
 
 
 class TorrentRequest(BaseModel):
     magnet: str = ""   # прямая magnet-ссылка (ручной ввод)
     detail: str = ""   # ИЛИ путь к раздаче из результатов поиска
+    token: str = ""    # ИЛИ токен предпросмотра файлов (/api/torrent/files)
+    files: list[int] = []  # какие файлы качать (1-based индексы), с token
 
 
 @app.get("/api/torrent/search", dependencies=[Depends(check_password)])
@@ -747,13 +798,126 @@ def torrent_search(q: str):
                  "вёрстку). Можно вставить magnet-ссылку вручную.")
 
 
+def _bdecode(data: bytes, i: int = 0):
+    """Мини-декодер bencode (.torrent) — нужны только int/bytes/list/dict,
+    без внешней зависимости. Возвращает (значение, позиция-после)."""
+    c = data[i:i + 1]
+    if c == b"i":
+        end = data.index(b"e", i)
+        return int(data[i + 1:end]), end + 1
+    if c == b"l":
+        i += 1
+        out = []
+        while data[i:i + 1] != b"e":
+            v, i = _bdecode(data, i)
+            out.append(v)
+        return out, i + 1
+    if c == b"d":
+        i += 1
+        out = {}
+        while data[i:i + 1] != b"e":
+            k, i = _bdecode(data, i)
+            v, i = _bdecode(data, i)
+            out[k] = v
+        return out, i + 1
+    colon = data.index(b":", i)
+    length = int(data[i:colon])
+    start = colon + 1
+    return data[start:start + length], start + length
+
+
+def _torrent_file_list(torrent_path: Path) -> list[dict]:
+    """Список файлов раздачи (path, size) из .torrent-файла, в том порядке,
+    в котором aria2 их нумерует для --select-file (1-based)."""
+    info, _ = _bdecode(torrent_path.read_bytes())
+    info = info[b"info"]
+    if b"files" in info:
+        files = []
+        for f in info[b"files"]:
+            path = "/".join(p.decode("utf-8", "replace") for p in f[b"path"])
+            files.append({"path": path, "size": f[b"length"]})
+    else:
+        files = [{"path": info[b"name"].decode("utf-8", "replace"),
+                  "size": info[b"length"]}]
+    return [dict(f, index=i) for i, f in enumerate(files, start=1)]
+
+
+# Предпросмотр файлов раздачи: magnet -> (только метаданные) -> .torrent на
+# диске -> список файлов. Токен живёт до TORRENT_META_TTL или до фактического
+# скачивания (torrent_add забирает и стирает запись).
+TORRENT_META: dict[str, dict] = {}
+TORRENT_META_LOCK = threading.Lock()
+TORRENT_META_TTL = 1800  # 30 минут — если так и не скачали, чистим за собой
+TORRENT_META_DIR = DOWNLOAD_DIR / ".meta"
+
+
+def _prune_torrent_meta():
+    now = time.time()
+    with TORRENT_META_LOCK:
+        stale = [t for t, v in TORRENT_META.items()
+                 if now - v["created"] > TORRENT_META_TTL]
+        for t in stale:
+            TORRENT_META.pop(t, None)
+    for d in [TORRENT_META_DIR / t for t in stale]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@app.post("/api/torrent/files", dependencies=[Depends(check_password)])
+def torrent_files_preview(req: TorrentRequest):
+    magnet = _resolve_torrent_source(req.magnet, req.detail)
+    _prune_torrent_meta()
+    token = uuid.uuid4().hex[:12]
+    meta_dir = TORRENT_META_DIR / token
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [ARIA2_BIN, "--dir", str(meta_dir),
+           "--bt-metadata-only=true", "--bt-save-metadata=true",
+           "--console-log-level=warn", magnet]
+    try:
+        subprocess.run(cmd, timeout=25, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        raise HTTPException(
+            500, "aria2 не установлен на сервере (нужен apt install aria2).")
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        raise HTTPException(
+            504, "Не удалось получить список файлов (нет пиров/метаданных). "
+                 "Можно скачать раздачу целиком без выбора файлов.")
+    found = list(meta_dir.glob("*.torrent"))
+    if not found:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        raise HTTPException(
+            502, "Не удалось получить метаданные раздачи. "
+                 "Можно скачать раздачу целиком без выбора файлов.")
+    try:
+        files = _torrent_file_list(found[0])
+    except Exception:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        raise HTTPException(502, "Не удалось разобрать метаданные раздачи.")
+    with TORRENT_META_LOCK:
+        TORRENT_META[token] = {"torrent_path": str(found[0]), "created": time.time()}
+    return {"token": token, "files": files,
+            "total_size": sum(f["size"] for f in files)}
+
+
 @app.post("/api/torrent", dependencies=[Depends(check_password)])
 def torrent_add(req: TorrentRequest):
-    magnet = (req.magnet or "").strip()
-    if not magnet and req.detail:
-        magnet = _resolve_magnet(req.detail.strip())
-    if not MAGNET_RE.match(magnet):
-        raise HTTPException(400, "Нужна корректная magnet-ссылка")
+    source = None
+    select = None
+    if req.token:
+        with TORRENT_META_LOCK:
+            meta = TORRENT_META.pop(req.token, None)
+        if not meta:
+            raise HTTPException(
+                400, "Список файлов устарел — обновите его и выберите заново.")
+        if not req.files:
+            shutil.rmtree(Path(meta["torrent_path"]).parent, ignore_errors=True)
+            raise HTTPException(400, "Выберите хотя бы один файл")
+        source = meta["torrent_path"]
+        select = sorted(set(req.files))
+    else:
+        source = _resolve_torrent_source(req.magnet, req.detail)
     if _count_active(JOBS, JOBS_LOCK,
                      ("queued", "downloading", "processing")) >= JOB_CEILING:
         raise HTTPException(429, "Сейчас слишком много загрузок — попробуйте позже.")
@@ -762,11 +926,31 @@ def torrent_add(req: TorrentRequest):
         JOBS[job_id] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": None, "filename": None, "error": None,
-            "cancel": False, "total": None, "size": None,
+            "cancel": False, "total": None, "size": None, "type": "torrent",
         }
     threading.Thread(
-        target=_run_torrent, args=(job_id, magnet), daemon=True).start()
+        target=_run_torrent, args=(job_id, source, select), daemon=True).start()
     return {"job_id": job_id}
+
+
+@app.get("/api/torrent/{job_id}/files", dependencies=[Depends(check_password)])
+def torrent_job_files(job_id: str):
+    """Все файлы торрент-задачи на диске (для раскрывающейся таблички) —
+    читаем с диска, а не из JOBS, чтобы список был виден и после рестарта."""
+    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
+    job_dir = DOWNLOAD_DIR / safe
+    if not job_dir.is_dir():
+        raise HTTPException(404, "Задача не найдена")
+    items = []
+    for p in job_dir.rglob("*"):
+        if not p.is_file() or _is_temp(p):
+            continue
+        if p.name == ".torrent_job" or p.suffix.lower() == ".torrent":
+            continue
+        items.append({"path": str(p.relative_to(job_dir)).replace("\\", "/"),
+                      "size": p.stat().st_size})
+    items.sort(key=lambda x: x["size"], reverse=True)
+    return {"files": items}
 
 
 # --- Библиотека: файлы в SMB-витрине (постоянное хранилище для ТВ) ---------

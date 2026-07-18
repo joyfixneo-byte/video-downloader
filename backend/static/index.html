@@ -74,6 +74,15 @@
 
   .hint { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.45; }
 
+  /* Переключатель вкладок Видео/Торренты */
+  .tabs { display:flex; gap:8px; margin-bottom:16px; }
+  .tab-btn { background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
+         color:var(--txt); border:1px solid var(--line-2);
+         box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16); }
+  .tab-btn.active { background:linear-gradient(180deg, var(--accent), var(--accent2));
+         box-shadow:0 7px 16px rgba(205,105,90,.34), inset 0 1px 0 rgba(255,255,255,.45),
+                    inset 0 -2px 5px rgba(150,60,50,.26); }
+
   .ep { display:flex; align-items:center; gap:10px; padding:9px 6px;
         border-bottom:1px solid var(--line); font-size:14px; }
   .ep:last-child { border-bottom:none; }
@@ -124,6 +133,20 @@
   .hidden { display:none; }
   .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
 
+  /* Раскрывающаяся табличка файлов торрент-раздачи (нативный <details>) */
+  details.tfiles { margin-top:10px; }
+  details.tfiles summary { cursor:pointer; font-size:12px; color:var(--muted);
+         list-style:none; }
+  details.tfiles summary::-webkit-details-marker { display:none; }
+  details.tfiles summary::before { content:"▸ "; }
+  details.tfiles[open] summary::before { content:"▾ "; }
+  .tfile-row { display:flex; align-items:center; gap:8px; padding:6px 2px;
+         border-bottom:1px solid var(--line); font-size:13px; }
+  .tfile-row:last-child { border-bottom:none; }
+  .tfile-name { flex:1; word-break:break-word; }
+  .tfile-size { color:var(--muted); white-space:nowrap; }
+  a.dl.small { padding:5px 10px; font-size:12px; }
+
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
 </head>
@@ -131,7 +154,8 @@
 <div class="wrap">
   <h1>🎬 Скачать видео</h1>
   <p class="sub">Вставь ссылку на страницу с видео — выбери серию и качество.
-     Готовые файлы удаляются с сервера через 3 часа после загрузки.</p>
+     Готовые файлы удаляются с сервера через 3 часа после загрузки
+     (торренты — только вручную).</p>
 
   <!-- Пароль -->
   <div class="card hidden" id="pwCard">
@@ -144,72 +168,100 @@
     <div class="hint err" id="pwHint"></div>
   </div>
 
-  <!-- Ссылка -->
-  <div class="card gated">
-    <label>Ссылка на видео</label>
-    <div class="row">
-      <div><input type="text" id="url" placeholder="https://..."
-                  onkeydown="if(event.key==='Enter'){event.preventDefault();check();}"></div>
-      <button id="checkBtn" onclick="check()">Проверить</button>
-      <button id="clearBtn" class="ghost" onclick="clearUrl()">🧹 Очистить</button>
-    </div>
-    <div class="hint" id="checkHint"></div>
+  <!-- Переключатель вкладок: Видео / Торренты -->
+  <div class="tabs gated" id="tabBar">
+    <button type="button" class="tab-btn active" onclick="showTab('video', this)">🎬 Видео</button>
+    <button type="button" class="tab-btn" onclick="showTab('torrent', this)">🧲 Торренты</button>
   </div>
 
-  <!-- Торренты: поиск по трекеру + ручной magnet -->
-  <div class="card gated" id="torrentCard">
-    <label>🧲 Торренты</label>
-    <div class="row">
-      <div><input type="text" id="tq" placeholder="Название раздачи…"
-                  onkeydown="if(event.key==='Enter'){event.preventDefault();torrentSearch();}"></div>
-      <button onclick="torrentSearch()">Искать</button>
-    </div>
-    <div class="row" style="margin-top:8px;">
-      <div><input type="text" id="tmagnet" placeholder="…или вставьте magnet-ссылку"
-                  onkeydown="if(event.key==='Enter'){event.preventDefault();addTorrentMagnet();}"></div>
-      <button class="ghost" onclick="addTorrentMagnet()">⬇ Скачать magnet</button>
-    </div>
-    <div class="hint" id="tHint"></div>
-    <div class="jobs" id="tResults"></div>
-    <div class="hint" style="margin-top:6px; opacity:.7">
-      Только для личного просмотра легального контента (дистрибутивы и т.п.).
-    </div>
-  </div>
-
-  <!-- Результат разбора -->
-  <div class="card hidden gated cond" id="pickCard">
-    <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
-
-    <div id="epBlock" class="hidden">
-      <div class="selbar">
-        <button class="ghost" onclick="selectAll(true)">Выбрать все</button>
-        <button class="ghost" onclick="selectAll(false)">Снять все</button>
-        <span class="hint" id="selCount"></span>
+  <div id="tabVideo">
+    <!-- Ссылка -->
+    <div class="card gated">
+      <label>Ссылка на видео</label>
+      <div class="row">
+        <div><input type="text" id="url" placeholder="https://..."
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();check();}"></div>
+        <button id="checkBtn" onclick="check()">Проверить</button>
+        <button id="clearBtn" class="ghost" onclick="clearUrl()">🧹 Очистить</button>
       </div>
-      <div class="ep-list" id="epList"></div>
+      <div class="hint" id="checkHint"></div>
     </div>
 
-    <div class="row" style="margin-top:14px;">
-      <div>
-        <label>Качество</label>
-        <select id="quality">
-          <option value="best">Лучшее доступное</option>
-          <option value="1080">1080p</option>
-          <option value="720">720p</option>
-          <option value="480">480p</option>
-          <option value="audio">Только звук (mp3)</option>
-        </select>
+    <!-- Результат разбора -->
+    <div class="card hidden gated cond" id="pickCard">
+      <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
+
+      <div id="epBlock" class="hidden">
+        <div class="selbar">
+          <button class="ghost" onclick="selectAll(true)">Выбрать все</button>
+          <button class="ghost" onclick="selectAll(false)">Снять все</button>
+          <span class="hint" id="selCount"></span>
+        </div>
+        <div class="ep-list" id="epList"></div>
       </div>
-      <button id="dlBtn" onclick="startDownload()">Скачать</button>
-      <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Субтитры</button>
-      <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">🎙 Свои субтитры</button>
+
+      <div class="row" style="margin-top:14px;">
+        <div>
+          <label>Качество</label>
+          <select id="quality">
+            <option value="best">Лучшее доступное</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+            <option value="audio">Только звук (mp3)</option>
+          </select>
+        </div>
+        <button id="dlBtn" onclick="startDownload()">Скачать</button>
+        <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Субтитры</button>
+        <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">🎙 Свои субтитры</button>
+      </div>
+    </div>
+
+    <!-- Транскрибация -->
+    <div class="card hidden gated cond" id="transCard">
+      <label>Транскрибация</label>
+      <div class="jobs" id="transList"></div>
     </div>
   </div>
 
-  <!-- Транскрибация -->
-  <div class="card hidden gated cond" id="transCard">
-    <label>Транскрибация</label>
-    <div class="jobs" id="transList"></div>
+  <div class="hidden" id="tabTorrent">
+    <!-- Торренты: поиск по трекеру + ручной magnet -->
+    <div class="card gated" id="torrentCard">
+      <label>🧲 Торренты</label>
+      <div class="row">
+        <div><input type="text" id="tq" placeholder="Название раздачи…"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();torrentSearch();}"></div>
+        <button onclick="torrentSearch()">Искать</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><input type="text" id="tmagnet" placeholder="…или вставьте magnet-ссылку"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();addTorrentMagnet();}"></div>
+        <button class="ghost" onclick="addTorrentMagnet(this)">⬇ Скачать magnet</button>
+      </div>
+      <div class="hint" id="tHint"></div>
+      <div class="jobs" id="tResults"></div>
+
+      <!-- Предпросмотр файлов раздачи: выбираем, что качать, до старта загрузки -->
+      <div class="hidden" id="tFilePick" style="margin-top:12px;">
+        <div style="font-weight:600; margin-bottom:8px;" id="tFilePickTitle"></div>
+        <div class="hint err hidden" id="tFilePickErr"></div>
+        <div class="selbar hidden" id="tFilePickBar">
+          <button class="ghost small" onclick="selectAllTorrentFiles(true)">Выбрать все</button>
+          <button class="ghost small" onclick="selectAllTorrentFiles(false)">Снять все</button>
+          <span class="hint" id="tFilePickCount"></span>
+        </div>
+        <div class="ep-list" id="tFilePickList"></div>
+        <div class="controls" style="margin-top:10px;">
+          <button class="hidden" id="tFilePickGo" onclick="confirmTorrentFiles()">Скачать выбранное</button>
+          <button class="ghost" onclick="cancelTorrentFiles()">Отмена</button>
+        </div>
+      </div>
+
+      <div class="hint" style="margin-top:6px; opacity:.7">
+        Только для личного просмотра легального контента (дистрибутивы и т.п.).
+        Скачанные раздачи не удаляются автоматически — только вручную.
+      </div>
+    </div>
   </div>
 
   <!-- Игра «Тетрис» — доступна всегда, не только во время загрузки -->
@@ -312,6 +364,13 @@ async function api(path, opts={}) {
 // Пока пароль не введён, открыт только тетрис. Все .gated-разделы скрыты;
 // при разблокировке показываем постоянные разделы, а .cond (появляются по
 // ходу работы — разбор, загрузки, транскрибация) остаются скрытыми до нужды.
+
+function showTab(name, btn) {
+  document.getElementById("tabVideo").classList.toggle("hidden", name !== "video");
+  document.getElementById("tabTorrent").classList.toggle("hidden", name !== "torrent");
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+}
 
 function lockApp() {
   document.querySelectorAll(".gated").forEach(el => el.classList.add("hidden"));
@@ -511,32 +570,116 @@ async function torrentSearch() {
 }
 
 async function addTorrent(detail, title, btn) {
-  btn.disabled = true; btn.textContent = "Добавляю…";
+  btn.disabled = true; btn.textContent = "Получаю файлы…";
   try {
-    const { job_id } = await api("/api/torrent", {
-      method: "POST", body: JSON.stringify({ detail }) });
-    btn.textContent = "✓ В загрузках";
-    startTorrentJob(job_id, title || "Торрент");
+    await previewTorrentFiles({ detail }, title || "Торрент");
   } catch (e) {
-    btn.disabled = false; btn.textContent = "⬇ Скачать";
     alert("Не удалось: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "⬇ Скачать";
   }
 }
 
-async function addTorrentMagnet() {
+async function addTorrentMagnet(btn) {
   const inp = document.getElementById("tmagnet");
   const magnet = inp.value.trim();
   if (!magnet.startsWith("magnet:")) {
     alert("Вставьте корректную magnet-ссылку (magnet:?xt=…)."); return;
   }
+  btn.disabled = true; btn.textContent = "Получаю файлы…";
   try {
-    const { job_id } = await api("/api/torrent", {
-      method: "POST", body: JSON.stringify({ magnet }) });
+    await previewTorrentFiles({ magnet }, "Торрент (magnet)");
     inp.value = "";
-    startTorrentJob(job_id, "Торрент (magnet)");
   } catch (e) {
     alert("Не удалось: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "⬇ Скачать magnet";
   }
+}
+
+// --- Предпросмотр файлов раздачи: выбираем, что качать, до старта загрузки -
+// TPICK хранит либо {token, files, source, title} после успешного получения
+// метаданных, либо {source, title} — запасной путь «скачать всё как есть»,
+// если метаданные получить не удалось (нет пиров/трекер недоступен).
+let TPICK = null;
+
+async function previewTorrentFiles(source, title) {
+  const wrap = document.getElementById("tFilePick");
+  const err = document.getElementById("tFilePickErr");
+  const bar = document.getElementById("tFilePickBar");
+  const list = document.getElementById("tFilePickList");
+  const go = document.getElementById("tFilePickGo");
+  wrap.classList.remove("hidden");
+  err.classList.add("hidden");
+  bar.classList.add("hidden");
+  go.classList.add("hidden");
+  go.textContent = "Скачать выбранное";
+  document.getElementById("tFilePickTitle").textContent = title;
+  list.innerHTML = '<div class="muted" style="font-size:13px">Получаю список файлов раздачи…</div>';
+  try {
+    const { token, files } = await api("/api/torrent/files", {
+      method: "POST", body: JSON.stringify(source) });
+    TPICK = { token, source, title };
+    list.innerHTML = "";
+    files.forEach(f => {
+      const row = document.createElement("label");
+      row.className = "ep";
+      row.innerHTML = `<input type="checkbox" data-i="${f.index}" checked>
+                       <span>${escapeHtml(f.path)} · ${fmtSize(f.size)}</span>`;
+      row.querySelector("input").addEventListener("change", updateTorrentFileCount);
+      list.appendChild(row);
+    });
+    bar.classList.remove("hidden");
+    go.classList.remove("hidden");
+    updateTorrentFileCount();
+  } catch (e) {
+    TPICK = { source, title };
+    list.innerHTML = "";
+    err.classList.remove("hidden");
+    err.textContent = "⚠ " + e.message;
+    go.textContent = "Скачать всё как есть";
+    go.classList.remove("hidden");
+  }
+}
+
+function selectAllTorrentFiles(v) {
+  document.querySelectorAll("#tFilePickList input").forEach(c => c.checked = v);
+  updateTorrentFileCount();
+}
+function updateTorrentFileCount() {
+  const n = document.querySelectorAll("#tFilePickList input:checked").length;
+  document.getElementById("tFilePickCount").textContent = n ? `выбрано: ${n}` : "";
+}
+
+async function confirmTorrentFiles() {
+  if (!TPICK) return;
+  const btn = document.getElementById("tFilePickGo");
+  btn.disabled = true;
+  try {
+    let body;
+    if (TPICK.token) {
+      const files = [...document.querySelectorAll("#tFilePickList input:checked")]
+        .map(c => +c.dataset.i);
+      if (!files.length) { alert("Выберите хотя бы один файл"); btn.disabled = false; return; }
+      body = { token: TPICK.token, files };
+    } else {
+      body = TPICK.source;   // запасной путь: без token — качаем всю раздачу
+    }
+    const { job_id } = await api("/api/torrent", {
+      method: "POST", body: JSON.stringify(body) });
+    const title = TPICK.title;
+    cancelTorrentFiles();
+    startTorrentJob(job_id, title);
+  } catch (e) {
+    alert("Не удалось: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function cancelTorrentFiles() {
+  document.getElementById("tFilePick").classList.add("hidden");
+  TPICK = null;
 }
 
 // Создаёт карточку в общем списке загрузок и запускает существующий poll().
@@ -1043,6 +1186,38 @@ const libBtn = jobId => LIBRARY_ENABLED
   ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">📚 В библиотеку</button>`
   : "";
 
+// Раскрывающаяся табличка файлов торрент-раздачи: список запрашиваем лениво,
+// только при первом раскрытии <details> (родная разметка — без своего JS-тумблера).
+function addTorrentFilesToggle(container, jobId) {
+  if (container.querySelector("details.tfiles")) return;   // уже добавлена
+  const det = document.createElement("details");
+  det.className = "tfiles";
+  det.innerHTML = '<summary>Файлы в раздаче</summary>'
+    + '<div class="tfiles-body muted" style="font-size:13px;padding:6px 2px;">Загрузка…</div>';
+  let loaded = false;
+  det.addEventListener("toggle", async () => {
+    if (!det.open || loaded) return;
+    const body = det.querySelector(".tfiles-body");
+    try {
+      const { files } = await api("/api/torrent/" + jobId + "/files");
+      loaded = true;
+      if (!files.length) { body.textContent = "Файлы не найдены."; return; }
+      body.className = "tfiles-body";
+      body.innerHTML = files.map(f => {
+        const href = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
+        return `<div class="tfile-row">
+          <span class="tfile-name">${escapeHtml(f.path)}</span>
+          <span class="tfile-size">${fmtSize(f.size)}</span>
+          <a class="dl small" href="${href}" download>⬇</a>
+        </div>`;
+      }).join("");
+    } catch (e) {
+      body.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    }
+  });
+  container.appendChild(det);
+}
+
 async function poll(jobId, el) {
   const meta = el.querySelector(".meta");
   const controls = el.querySelector(".controls");
@@ -1072,6 +1247,7 @@ async function poll(jobId, el) {
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       controls.querySelector(".dl").addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, fname, ev.currentTarget); });
+      if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
       loadFiles();
       return;
     } else if (s.state === "cancelled") {
@@ -1130,12 +1306,12 @@ async function loadFiles() {
     files.forEach(f => {
       const el = document.createElement("div");
       el.className = "job";
-      const rem = f.remaining
-        ? "удалится через " + fmtTime(f.remaining)
-        : "скоро будет удалён";
+      const rem = f.torrent
+        ? "не удаляется автоматически — только вручную"
+        : (f.remaining ? "удалится через " + fmtTime(f.remaining) : "скоро будет удалён");
       const href = "/api/file/" + f.job_id;
       el.innerHTML =
-        `<div class="name">${escapeHtml(f.filename)}</div>
+        `<div class="name">${f.torrent ? "🧲 " : ""}${escapeHtml(f.filename)}</div>
          <div class="meta">${fmtSize(f.size)} · ${rem}</div>
          <div class="controls">
            <a class="dl" href="${href}">⬇ Скачать</a>
@@ -1144,6 +1320,7 @@ async function loadFiles() {
          </div>`;
       el.querySelector(".dl").addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget); });
+      if (f.torrent) addTorrentFilesToggle(el, f.job_id);
       list.appendChild(el);
     });
   } catch (e) {
