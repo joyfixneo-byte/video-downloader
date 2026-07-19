@@ -910,9 +910,20 @@ function fmtTime(s) {
 // и отдаём его в системное меню «Поделиться» (там есть «Сохранить в Файлы» /
 // «Сохранить видео»), оставаясь внутри приложения. В обычном браузере и на
 // десктопе — штатное скачивание ссылкой (как и было).
-
+//
+// Загрузка целиком в память (fetch().blob()) работает только для небольших
+// файлов: у WKWebView в standalone-режиме жёсткий потолок памяти, и на файлах
+// в сотни МБ/несколько ГБ fetch зависает или страница молча вылетает — кнопка
+// как будто ничего не делает (без ошибки, без JS-исключения). Поэтому для
+// больших файлов blob-путь не используем вообще — открываем ссылку в новой
+// вкладке: iOS выкидывает из standalone-приложения в обычный Safari, который
+// стримит файл на диск сам, без буферизации в JS-памяти.
 const IS_STANDALONE = window.navigator.standalone === true
   || window.matchMedia("(display-mode: standalone)").matches;
+
+// Выше этого размера в standalone не пытаемся тащить файл в память —
+// слишком велик риск молчаливого зависания/краша WKWebView.
+const STANDALONE_SHARE_LIMIT = 150 * 1024 * 1024; // 150 МБ
 
 function plainDownload(href, name) {
   const a = document.createElement("a");
@@ -920,10 +931,17 @@ function plainDownload(href, name) {
   document.body.appendChild(a); a.click(); a.remove();
 }
 
-async function saveFile(href, name, btn) {
+async function saveFile(href, name, btn, size) {
   // Обычный браузер / десктоп — оставляем штатное скачивание ссылкой.
   if (!IS_STANDALONE || typeof navigator.canShare !== "function") {
     plainDownload(href, name); return;
+  }
+  // Standalone, но файл слишком большой для fetch().blob() в памяти —
+  // обычная ссылка тут тоже не скачивает (см. комментарий выше), поэтому
+  // уводим в системный Safari, где скачивание/сохранение работает штатно.
+  if (size != null && size > STANDALONE_SHARE_LIMIT) {
+    window.open(href, "_blank");
+    return;
   }
   const label = btn ? btn.textContent : "";
   if (btn) { btn.style.pointerEvents = "none"; btn.textContent = "Готовлю файл…"; }
@@ -1246,7 +1264,7 @@ async function poll(jobId, el) {
         libBtn(jobId) +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       controls.querySelector(".dl").addEventListener("click", ev => {
-        ev.preventDefault(); saveFile(href, fname, ev.currentTarget); });
+        ev.preventDefault(); saveFile(href, fname, ev.currentTarget, s.size); });
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
       loadFiles();
       return;
@@ -1319,7 +1337,7 @@ async function loadFiles() {
            <button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>
          </div>`;
       el.querySelector(".dl").addEventListener("click", ev => {
-        ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget); });
+        ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget, f.size); });
       if (f.torrent) addTorrentFilesToggle(el, f.job_id);
       list.appendChild(el);
     });
@@ -1378,7 +1396,7 @@ async function loadLibrary() {
       // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
       el.querySelector(".dl").addEventListener(
         "click", ev => { ev.preventDefault();
-          saveFile(href, f.name, ev.currentTarget); });
+          saveFile(href, f.name, ev.currentTarget, f.size); });
       el.querySelector("button").addEventListener(
         "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
       list.appendChild(el);
