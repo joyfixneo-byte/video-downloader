@@ -145,6 +145,8 @@
   .tfile-row:last-child { border-bottom:none; }
   .tfile-name { flex:1; word-break:break-word; }
   .tfile-size { color:var(--muted); white-space:nowrap; }
+  .tfile-status { white-space:nowrap; }
+  .tfile-actions { white-space:nowrap; display:flex; gap:4px; align-items:center; }
   a.dl.small { padding:5px 10px; font-size:12px; }
 
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
@@ -214,6 +216,8 @@
         <button id="dlBtn" onclick="startDownload()">Скачать</button>
         <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Субтитры</button>
         <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">🎙 Свои субтитры</button>
+        <button id="transMBtn" class="ghost" onclick="startTranscribe(false, true)">🔗 С описанием</button>
+        <button id="transMWBtn" class="ghost" onclick="startTranscribe(true, true)">🔗 С описанием (свои)</button>
       </div>
     </div>
 
@@ -381,6 +385,7 @@ function unlockApp() {
   document.getElementById("pwCard").classList.add("hidden");
   loadFiles();
   loadLibrary();
+  resumeJobs();     // вернуть карточки задач, идущих в фоне (после F5)
 }
 
 // Проверяем пароль обращением к защищённому эндпоинту. true — пароль подходит.
@@ -545,6 +550,12 @@ async function torrentSearch() {
   const q = document.getElementById("tq").value.trim();
   const hint = document.getElementById("tHint");
   const list = document.getElementById("tResults");
+  // Вставили magnet прямо в поиск — не ищем (он длиннее лимита), а качаем.
+  if (q.startsWith("magnet:")) {
+    document.getElementById("tmagnet").value = q;
+    document.getElementById("tq").value = "";
+    return addTorrentMagnet();
+  }
   if (q.length < 2) { hint.textContent = "Введите запрос (от 2 символов)."; return; }
   hint.textContent = "Ищу…"; list.innerHTML = "";
   try {
@@ -586,14 +597,14 @@ async function addTorrentMagnet(btn) {
   if (!magnet.startsWith("magnet:")) {
     alert("Вставьте корректную magnet-ссылку (magnet:?xt=…)."); return;
   }
-  btn.disabled = true; btn.textContent = "Получаю файлы…";
+  if (btn) { btn.disabled = true; btn.textContent = "Получаю файлы…"; }
   try {
     await previewTorrentFiles({ magnet }, "Торрент (magnet)");
     inp.value = "";
   } catch (e) {
     alert("Не удалось: " + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = "⬇ Скачать magnet";
+    if (btn) { btn.disabled = false; btn.textContent = "⬇ Скачать magnet"; }
   }
 }
 
@@ -682,24 +693,43 @@ function cancelTorrentFiles() {
   TPICK = null;
 }
 
-// Создаёт карточку в общем списке загрузок и запускает существующий poll().
-function startTorrentJob(jobId, title) {
+function startTorrentJob(jobId, title) { startJobCard(jobId, title, "torrent"); }
+
+// Создаёт карточку в списке загрузок и запускает poll(). Используется и при
+// старте, и при восстановлении карточек после перезагрузки страницы (resumeJobs).
+function startJobCard(jobId, title, type) {
   document.getElementById("jobsCard").classList.remove("hidden");
   const wrap = document.getElementById("jobs");
+  if (wrap.querySelector(`[data-job-id="${jobId}"]`)) return;   // уже есть
+  const icon = type === "torrent" ? "🧲 " : "";
   const el = document.createElement("div");
   el.className = "job";
-  el.innerHTML = `<div class="name">🧲 ${escapeHtml(title)}</div>
+  el.dataset.jobId = jobId;
+  el.innerHTML = `<div class="name">${icon}${escapeHtml(title)}</div>
     <div class="meta">в очереди…</div>
     <div class="controls"></div>`;
   wrap.prepend(el);
   poll(jobId, el);
 }
 
+// После перезагрузки страницы фронт теряет job_id активных задач (карточка
+// живёт в памяти вкладки), но сама загрузка идёт в фоне на сервере. Спрашиваем
+// список активных задач и возвращаем карточки с прогрессом.
+async function resumeJobs() {
+  try {
+    const { jobs } = await api("/api/jobs");
+    jobs.forEach(j => startJobCard(
+      j.job_id,
+      j.title || (j.type === "torrent" ? "Торрент" : "Загрузка"),
+      j.type));
+  } catch (e) { /* нет доступа/задач — молча */ }
+}
+
 // --- Транскрибация --------------------------------------------------------
 
 // force = true → «Свои субтитры»: игнорируем встроенные и распознаём своей
 // моделью в точном режиме (medium/small + beam search).
-function startTranscribe(force) {
+function startTranscribe(force, meta) {
   let targets = [];
   if (PARSED.type === "playlist") {
     document.querySelectorAll("#epList input:checked").forEach(c => {
@@ -711,10 +741,10 @@ function startTranscribe(force) {
     targets.push({ url: PARSED.url, title: PARSED.title });
   }
   document.getElementById("transCard").classList.remove("hidden");
-  targets.forEach(t => createTranscribeJob(t, force));
+  targets.forEach(t => createTranscribeJob(t, force, meta));
 }
 
-async function createTranscribeJob(target, force) {
+async function createTranscribeJob(target, force, meta) {
   const wrap = document.getElementById("transList");
   const el = document.createElement("div");
   el.className = "job";
@@ -739,6 +769,7 @@ async function createTranscribeJob(target, force) {
   try {
     const body = { url: target.url };
     if (force) { body.force_whisper = true; body.quality = "accurate"; }
+    if (meta) body.include_meta = true;
     const { job_id } = await api("/api/transcribe", {
       method: "POST", body: JSON.stringify(body) });
     pollTranscribe(job_id, el);
@@ -782,6 +813,10 @@ async function pollTranscribe(jobId, el) {
       el._segs = (s.segments && s.segments.length)
         ? s.segments
         : (s.text ? [{ start: 0, end: 0, text: s.text }] : []);
+      // Шапка со ссылкой и описанием — только если их запрашивали.
+      el._header = (s.link || s.description)
+        ? `🔗 ${s.link || ""}\n\n📄 Описание:\n${s.description || "—"}\n\n📝 Транскрибация:\n`
+        : "";
       el.querySelector(".ttext").classList.remove("hidden");
       el.querySelector(".tcontrols").classList.remove("hidden");
       // Кнопку «сделать свои субтитры» показываем, только если сейчас
@@ -843,9 +878,10 @@ function renderTranscript(node) {
   const withTc = el.querySelector(".tc-toggle input").checked
     && segs.some(x => x.end);   // если времени нет — нечего показывать
   const ta = el.querySelector(".ttext");
-  ta.value = withTc
+  const body = withTc
     ? segs.map(x => `[${fmtTc(x.start)}] ${x.text}`).join("\n")
     : segs.map(x => x.text).join("\n");
+  ta.value = (el._header || "") + body;
 }
 
 // Точный таймкод для .srt: HH:MM:SS,mmm.
@@ -869,7 +905,10 @@ function downloadSubs(btn, fmt) {
   const segs = el._segs || [];
   if (!segs.length) return;
   const base = (el.dataset.title || "субтитры").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 80);
-  const body = fmt === "srt" ? buildSrt(segs) : segs.map(x => x.text).join("\n");
+  // .srt — чистый субтитровый формат; .txt — с шапкой (ссылка + описание).
+  const body = fmt === "srt"
+    ? buildSrt(segs)
+    : (el._header || "") + segs.map(x => x.text).join("\n");
   const blob = new Blob(["﻿" + body], { type: "text/plain;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -1186,36 +1225,85 @@ const libBtn = jobId => LIBRARY_ENABLED
   ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">📚 В библиотеку</button>`
   : "";
 
-// Раскрывающаяся табличка файлов торрент-раздачи: список запрашиваем лениво,
-// только при первом раскрытии <details> (родная разметка — без своего JS-тумблера).
+// Раскрывающаяся табличка файлов торрент-раздачи: показывает статус каждого
+// файла (готов / качается / не выбран) и обновляется каждые 2с, пока раздача
+// активна и табличка раскрыта — так видно, что уже можно скачать, не дожидаясь
+// остальных файлов. Список запрашиваем лениво, при первом раскрытии <details>.
 function addTorrentFilesToggle(container, jobId) {
   if (container.querySelector("details.tfiles")) return;   // уже добавлена
   const det = document.createElement("details");
   det.className = "tfiles";
   det.innerHTML = '<summary>Файлы в раздаче</summary>'
     + '<div class="tfiles-body muted" style="font-size:13px;padding:6px 2px;">Загрузка…</div>';
-  let loaded = false;
-  det.addEventListener("toggle", async () => {
-    if (!det.open || loaded) return;
+
+  const refresh = async () => {
     const body = det.querySelector(".tfiles-body");
     try {
       const { files } = await api("/api/torrent/" + jobId + "/files");
-      loaded = true;
-      if (!files.length) { body.textContent = "Файлы не найдены."; return; }
-      body.className = "tfiles-body";
-      body.innerHTML = files.map(f => {
-        const href = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
-        return `<div class="tfile-row">
-          <span class="tfile-name">${escapeHtml(f.path)}</span>
-          <span class="tfile-size">${fmtSize(f.size)}</span>
-          <a class="dl small" href="${href}" download>⬇</a>
-        </div>`;
-      }).join("");
+      if (!files.length) {
+        body.className = "tfiles-body muted";
+        body.textContent = "Файлы не найдены.";
+      } else {
+        body.className = "tfiles-body";
+        body.innerHTML = files.map(f => {
+          const dlHref = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
+          let status, actions;
+          if (f.done) {
+            status = '<span class="done">✓ готово</span>';
+            actions = `<a class="dl small" href="${dlHref}" download>⬇</a>`
+              + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">🗑</button>`;
+          } else if (f.selected === false) {
+            status = '<span class="muted">не выбран</span>';
+            actions = `<button class="ghost small" data-act="add" data-index="${f.index}">⬇ докачать</button>`;
+          } else {
+            const pct = f.percent != null ? " " + f.percent + "%" : "";
+            status = `<span class="muted">качается…${pct}</span>`;
+            actions = "";
+          }
+          return `<div class="tfile-row">
+            <span class="tfile-name">${escapeHtml(f.path)}</span>
+            <span class="tfile-size">${fmtSize(f.size)}</span>
+            <span class="tfile-status">${status}</span>
+            <span class="tfile-actions">${actions}</span>
+          </div>`;
+        }).join("");
+      }
     } catch (e) {
       body.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
     }
+    const active = ["queued", "downloading", "processing"].includes(container.dataset.jobState);
+    if (det.open && active) setTimeout(refresh, 2000);
+  };
+
+  det.open = true;   // раскрыта сразу — видно прогресс по каждому файлу
+  det.addEventListener("toggle", () => { if (det.open) refresh(); });
+
+  // Делегируем клики по кнопкам строк (докачать/удалить) — так не нужно
+  // экранировать пути файлов внутри onclick-атрибутов.
+  det.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-act]");
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+      if (btn.dataset.act === "del") {
+        if (!confirm("Удалить этот файл?")) { btn.disabled = false; return; }
+        await api("/api/torrent/" + jobId + "/delete-file", {
+          method: "POST", body: JSON.stringify({ path: btn.dataset.path }) });
+      } else if (btn.dataset.act === "add") {
+        await api("/api/torrent/" + jobId + "/add-files", {
+          method: "POST", body: JSON.stringify({ files: [+btn.dataset.index] }) });
+        container.dataset.jobState = "queued";
+        poll(jobId, container);
+      }
+      refresh();
+    } catch (e) {
+      alert("Не удалось: " + e.message);
+      btn.disabled = false;
+    }
   });
+
   container.appendChild(det);
+  refresh();   // не ждём клика — список файлов виден сразу
 }
 
 async function poll(jobId, el) {
@@ -1223,6 +1311,14 @@ async function poll(jobId, el) {
   const controls = el.querySelector(".controls");
   try {
     const s = await api("/api/status/" + jobId);
+    el.dataset.jobState = s.state;   // читает живая табличка файлов раздачи
+    // Человеческое название вместо «Торрент (magnet)»: сервер отдаёт имя
+    // раздачи (из .torrent или dn= у magnet) в s.title.
+    if (s.type === "torrent" && s.title) {
+      const nm = el.querySelector(".name");
+      const want = "🧲 " + s.title;
+      if (nm.textContent !== want) nm.textContent = want;
+    }
     if (s.state === "downloading") {
       const pct = s.percent != null ? Math.round(s.percent) + "%" : "";
       const spd = s.speed ? (s.speed / 1048576).toFixed(1) + " МБ/с" : "";
@@ -1230,6 +1326,7 @@ async function poll(jobId, el) {
       const sz = s.total ? " · размер ~" + fmtSize(s.total) : "";
       meta.textContent = `Скачивание ${pct} ${spd}${eta}${sz}`;
       controls.innerHTML = stopBtn(jobId);
+      if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "processing") {
       meta.textContent = "Обработка (склейка видео и звука)…";
       controls.innerHTML = stopBtn(jobId);
@@ -1238,6 +1335,16 @@ async function poll(jobId, el) {
       controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "done") {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
+      // Торрент уехал в библиотеку (SMB) и удалён с сервера — дубля нет,
+      // управление файлом теперь в разделе «Библиотека».
+      if (s.in_library) {
+        meta.innerHTML = `<span class="done">✓ Готово${sz} — в разделе «Библиотека» ниже</span>`;
+        controls.innerHTML = "";
+        const det = el.querySelector("details.tfiles");   // файлов на сервере уже нет
+        if (det) det.remove();
+        loadLibrary();
+        return;
+      }
       meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
       const href = "/api/file/" + jobId;
       const fname = s.filename || s.title || "video.mp4";
