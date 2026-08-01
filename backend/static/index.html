@@ -255,6 +255,10 @@
           <span class="hint" id="tFilePickCount"></span>
         </div>
         <div class="ep-list" id="tFilePickList"></div>
+        <label class="hint" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+          <input type="checkbox" id="tFilePickAutoRest" style="width:auto">
+          Докачать остальные файлы раздачи автоматически после выбранных
+        </label>
         <div class="controls" style="margin-top:10px;">
           <button class="hidden" id="tFilePickGo" onclick="confirmTorrentFiles()">Скачать выбранное</button>
           <button class="ghost" onclick="cancelTorrentFiles()">Отмена</button>
@@ -625,6 +629,9 @@ async function previewTorrentFiles(source, title) {
   bar.classList.add("hidden");
   go.classList.add("hidden");
   go.textContent = "Скачать выбранное";
+  const autoRestRow = document.getElementById("tFilePickAutoRest").closest("label");
+  autoRestRow.classList.add("hidden");
+  document.getElementById("tFilePickAutoRest").checked = false;
   document.getElementById("tFilePickTitle").textContent = title;
   list.innerHTML = '<div class="muted" style="font-size:13px">Получаю список файлов раздачи…</div>';
   try {
@@ -642,6 +649,7 @@ async function previewTorrentFiles(source, title) {
     });
     bar.classList.remove("hidden");
     go.classList.remove("hidden");
+    autoRestRow.classList.remove("hidden");
     updateTorrentFileCount();
   } catch (e) {
     TPICK = { source, title };
@@ -672,7 +680,8 @@ async function confirmTorrentFiles() {
       const files = [...document.querySelectorAll("#tFilePickList input:checked")]
         .map(c => +c.dataset.i);
       if (!files.length) { alert("Выберите хотя бы один файл"); btn.disabled = false; return; }
-      body = { token: TPICK.token, files };
+      const autoRest = document.getElementById("tFilePickAutoRest").checked;
+      body = { token: TPICK.token, files, auto_rest: autoRest };
     } else {
       body = TPICK.source;   // запасной путь: без token — качаем всю раздачу
     }
@@ -1229,7 +1238,7 @@ const libBtn = jobId => LIBRARY_ENABLED
 // файла (готов / качается / не выбран) и обновляется каждые 2с, пока раздача
 // активна и табличка раскрыта — так видно, что уже можно скачать, не дожидаясь
 // остальных файлов. Список запрашиваем лениво, при первом раскрытии <details>.
-function addTorrentFilesToggle(container, jobId) {
+function addTorrentFilesToggle(container, jobId, interrupted = false) {
   if (container.querySelector("details.tfiles")) return;   // уже добавлена
   const det = document.createElement("details");
   det.className = "tfiles";
@@ -1257,7 +1266,12 @@ function addTorrentFilesToggle(container, jobId) {
             actions = `<button class="ghost small" data-act="add" data-index="${f.index}">⬇ докачать</button>`;
           } else {
             const pct = f.percent != null ? " " + f.percent + "%" : "";
-            status = `<span class="muted">качается…${pct}</span>`;
+            // interrupted — раздача сейчас не качается (упавший сервис), а не
+            // просто пока не дошла очередь: не показываем «качается», это
+            // вводит в заблуждение, будто прогресс сейчас идёт.
+            status = interrupted
+              ? `<span class="muted">⏸ прервано${pct}</span>`
+              : `<span class="muted">качается…${pct}</span>`;
             actions = "";
           }
           return `<div class="tfile-row">
@@ -1398,6 +1412,21 @@ async function deleteJob(jobId, btn) {
   }
 }
 
+async function resumeTorrent(jobId, btn) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "Возобновляю…";
+  try {
+    await api("/api/torrent/" + jobId + "/resume", { method: "POST" });
+    const job = btn.closest(".job");
+    job.dataset.jobState = "queued";
+    poll(jobId, job);   // карточка переходит в режим живого прогресса
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    alert("Не удалось возобновить: " + e.message);
+  }
+}
+
 // --- Файлы, уже лежащие на сервере ---------------------------------------
 
 async function loadFiles() {
@@ -1413,21 +1442,37 @@ async function loadFiles() {
     files.forEach(f => {
       const el = document.createElement("div");
       el.className = "job";
-      const rem = f.torrent
-        ? "не удаляется автоматически — только вручную"
-        : (f.remaining ? "удалится через " + fmtTime(f.remaining) : "скоро будет удалён");
       const href = "/api/file/" + f.job_id;
+      const name = f.title || f.filename || "Торрент";
+      let metaLine, controls;
+      if (f.interrupted) {
+        // Раздача прервана крашем/рестартом сервиса посреди докачки — раньше
+        // такая карточка просто пропадала из списка, теперь показываем
+        // прогресс и даём кнопку продолжить (см. list_files/_run_torrent).
+        const p = f.progress || {};
+        metaLine = `⏸ прервано — ${p.percent ?? 0}% `
+          + `(готово ${p.done_files ?? 0} из ${p.total_files ?? "?"} файлов)`;
+        controls = `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this)">▶ Возобновить</button>`
+          + (f.filename ? `<a class="dl" href="${href}">⬇ Скачать</a>` : "")
+          + (f.filename ? libBtn(f.job_id) : "")
+          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
+      } else {
+        const rem = f.torrent
+          ? "не удаляется автоматически — только вручную"
+          : (f.remaining ? "удалится через " + fmtTime(f.remaining) : "скоро будет удалён");
+        metaLine = `${fmtSize(f.size)} · ${rem}`;
+        controls = `<a class="dl" href="${href}">⬇ Скачать</a>`
+          + libBtn(f.job_id)
+          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
+      }
       el.innerHTML =
-        `<div class="name">${f.torrent ? "🧲 " : ""}${escapeHtml(f.filename)}</div>
-         <div class="meta">${fmtSize(f.size)} · ${rem}</div>
-         <div class="controls">
-           <a class="dl" href="${href}">⬇ Скачать</a>
-           ${libBtn(f.job_id)}
-           <button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>
-         </div>`;
-      el.querySelector(".dl").addEventListener("click", ev => {
+        `<div class="name">${f.torrent ? "🧲 " : ""}${escapeHtml(name)}</div>
+         <div class="meta">${metaLine}</div>
+         <div class="controls">${controls}</div>`;
+      const dl = el.querySelector(".dl");
+      if (dl) dl.addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget); });
-      if (f.torrent) addTorrentFilesToggle(el, f.job_id);
+      if (f.torrent) addTorrentFilesToggle(el, f.job_id, f.interrupted);
       list.appendChild(el);
     });
   } catch (e) {
