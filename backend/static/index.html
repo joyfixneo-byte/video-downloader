@@ -140,13 +140,17 @@
   details.tfiles summary::-webkit-details-marker { display:none; }
   details.tfiles summary::before { content:"▸ "; }
   details.tfiles[open] summary::before { content:"▾ "; }
-  .tfile-row { display:flex; align-items:center; gap:8px; padding:6px 2px;
+  .tfile-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 2px;
          border-bottom:1px solid var(--line); font-size:13px; }
   .tfile-row:last-child { border-bottom:none; }
   .tfile-name { flex:1; word-break:break-word; }
   .tfile-size { color:var(--muted); white-space:nowrap; }
   .tfile-status { white-space:nowrap; }
   .tfile-actions { white-space:nowrap; display:flex; gap:4px; align-items:center; }
+  .tfile-bar { flex-basis:100%; order:5; height:4px; border-radius:2px;
+         background:var(--line); overflow:hidden; }
+  .tfile-bar-fill { height:100%; border-radius:2px;
+         background:linear-gradient(90deg, var(--accent), var(--accent2)); }
   a.dl.small { padding:5px 10px; font-size:12px; }
 
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
@@ -1256,7 +1260,7 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
         body.className = "tfiles-body";
         body.innerHTML = files.map(f => {
           const dlHref = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
-          let status, actions;
+          let status, actions, bar = "";
           if (f.done) {
             status = '<span class="done">✓ готово</span>';
             actions = `<a class="dl small" href="${dlHref}" download>⬇</a>`
@@ -1265,20 +1269,24 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
             status = '<span class="muted">не выбран</span>';
             actions = `<button class="ghost small" data-act="add" data-index="${f.index}">⬇ докачать</button>`;
           } else {
-            const pct = f.percent != null ? " " + f.percent + "%" : "";
+            const pct = f.percent != null ? f.percent : 0;
             // interrupted — раздача сейчас не качается (упавший сервис), а не
             // просто пока не дошла очередь: не показываем «качается», это
             // вводит в заблуждение, будто прогресс сейчас идёт.
             status = interrupted
-              ? `<span class="muted">⏸ прервано${pct}</span>`
-              : `<span class="muted">качается…${pct}</span>`;
+              ? `<span class="muted">⏸ прервано ${pct}%</span>`
+              : `<span class="muted">качается… ${pct}%</span>`;
             actions = "";
+            if (!interrupted) {
+              bar = `<div class="tfile-bar"><div class="tfile-bar-fill" style="width:${pct}%"></div></div>`;
+            }
           }
           return `<div class="tfile-row">
             <span class="tfile-name">${escapeHtml(f.path)}</span>
             <span class="tfile-size">${fmtSize(f.size)}</span>
             <span class="tfile-status">${status}</span>
             <span class="tfile-actions">${actions}</span>
+            ${bar}
           </div>`;
         }).join("");
       }

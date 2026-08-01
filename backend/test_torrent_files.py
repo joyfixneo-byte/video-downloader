@@ -298,6 +298,44 @@ def main():
         assert "jobinterrupted" in appmod.JOBS
         assert appmod.JOBS["jobinterrupted"]["state"] == "error"  # aria2 нет — это ок
 
+        # --- 15. Реальный баг: для многофайлового BT-торрента aria2 ведёт
+        # ОДИН .aria2-файл на весь торрент (лежит рядом с папкой раздачи, не
+        # по файлу на каждую серию) — обрезанный файл без соседнего .aria2
+        # раньше ложно считался готовым (не хватило пиров на конкретную
+        # серию → торрент завершился, файл остался обрезанным, но его всё
+        # равно публиковали в SMB-библиотеку как «готовый»). Теперь
+        # готовность сверяется с реальным ожидаемым размером из метаданных ---
+        trunc_dir = tmp / "jobtruncated"
+        trunc_meta = trunc_dir / ".meta.torrent"
+        trunc_sub = trunc_dir / "TruncShow"
+        trunc_sub.mkdir(parents=True)
+        trunc_meta.write_bytes(
+            make_torrent("TruncShow", [("A.mkv", 1_000_000), ("B.mkv", 2_000_000)]))
+        (trunc_dir / ".selected").write_text("1,2")
+        (trunc_sub / "A.mkv").write_bytes(b"x" * 1_000_000)   # реально готов
+        (trunc_sub / "B.mkv").write_bytes(b"y" * 2_000)       # обрезан, но БЕЗ .aria2
+        # единственный служебный файл aria2 для всего торрента — снаружи подпапки,
+        # с именем торрента, не серии (так реально ведёт себя aria2 для BT)
+        (trunc_dir / "TruncShow.aria2").write_bytes(b"ctrl")
+
+        status = {f["path"]: f for f in appmod._torrent_status_files(trunc_dir)}
+        assert status["TruncShow/A.mkv"]["done"] is True, status
+        assert status["TruncShow/B.mkv"]["done"] is False, status   # раньше было бы True
+
+        real = {p.name for p in appmod._real_job_files(trunc_dir)}
+        assert real == {"A.mkv"}, real   # B.mkv обрезан — не должен считаться готовым
+
+        result = appmod._result_file(trunc_dir)
+        assert result is not None and result.name == "A.mkv", result
+
+        appmod.JOBS["jobtruncated"] = {
+            "state": "done", "percent": 100, "speed": None, "eta": None,
+            "title": None, "filename": "A.mkv", "error": None, "cancel": False,
+            "total": None, "size": 1_000_000, "type": "torrent",
+        }
+        r = client.get("/api/file/jobtruncated", params={"path": "TruncShow/B.mkv"})
+        assert r.status_code == 409, r.text   # обрезанный файл не отдаём
+
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

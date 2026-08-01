@@ -150,13 +150,40 @@ def _is_temp(p: Path) -> bool:
             or ".part-frag" in n)
 
 
-def _file_done(p: Path) -> bool:
-    """Конкретный файл раздачи полностью докачан: пока aria2 качает файл,
-    рядом лежит служебный `<имя>.aria2` — он исчезает ровно в момент, когда
-    файл готов. Так можно узнать статус одного файла внутри ещё качающейся
-    многофайловой раздачи, не дожидаясь её целиком."""
-    return (p.is_file() and not _is_temp(p)
-            and not p.with_name(p.name + ".aria2").exists())
+def _file_done(p: Path, expected_size: int = None) -> bool:
+    """Конкретный файл раздачи полностью докачан.
+
+    С известным ожидаемым размером (из .torrent-метаданных, см.
+    _torrent_expected_sizes) сравниваем напрямую с ним — надёжно для любой
+    раздачи. Без него — запасная эвристика по соседнему `<файл>.aria2`
+    (годится только для одиночного файла).
+
+    ⚠️ Раньше эвристика по .aria2 была единственной проверкой везде. Для
+    многофайловой BT-раздачи aria2 ведёт ОДИН служебный `<имя-раздачи>.aria2`
+    на весь торрент (лежит рядом с папкой раздачи, не по файлу на каждую
+    серию) — так что проверка соседнего файла никогда не находила «свой»
+    .aria2 и считала готовым любой файл, едва он появился на диске, даже
+    если реально докачано только несколько мегабайт (не хватило пиров на
+    конкретную серию — торрент завершается, файл остаётся обрезанным). Из-за
+    этого обрезанные файлы уходили в SMB-библиотеку как «готовые»."""
+    if not p.is_file() or _is_temp(p):
+        return False
+    if expected_size is not None:
+        return p.stat().st_size == expected_size
+    return not p.with_name(p.name + ".aria2").exists()
+
+
+def _torrent_expected_sizes(job_dir: Path) -> dict:
+    """path (как в _torrent_file_list) -> ожидаемый размер файла из
+    сохранённых .torrent-метаданных задачи. Пусто, если метаданных нет
+    (старая раздача без .meta.torrent, добавленная до этой проверки)."""
+    meta = job_dir / ".meta.torrent"
+    if not meta.is_file():
+        return {}
+    try:
+        return {f["path"]: f["size"] for f in _torrent_file_list(meta)}
+    except Exception:
+        return {}
 
 
 def _real_job_files(job_dir: Path) -> list[Path]:
@@ -166,10 +193,16 @@ def _real_job_files(job_dir: Path) -> list[Path]:
     (aria2 кладёт многофайловые торренты в подпапку с именем раздачи)."""
     if not job_dir.exists() or not job_dir.is_dir():
         return []
-    return [p for p in job_dir.rglob("*")
-            if _file_done(p)
-            and p.suffix.lower() != ".torrent"
-            and p.name not in (".selected", ".torrent_job")]
+    sizes = _torrent_expected_sizes(job_dir)
+    out = []
+    for p in job_dir.rglob("*"):
+        if p.suffix.lower() == ".torrent" or p.name in (".selected", ".torrent_job"):
+            continue
+        rel = str(p.relative_to(job_dir)).replace("\\", "/")
+        expected = sizes.get(rel, sizes.get(p.name))
+        if _file_done(p, expected):
+            out.append(p)
+    return out
 
 
 def _result_file(job_dir: Path):
@@ -710,7 +743,10 @@ def get_file(job_id: str, path: str = ""):
             target.relative_to(base)
         except ValueError:
             raise HTTPException(400, "Некорректный путь")
-        if not _file_done(target):
+        rel = str(target.relative_to(base)).replace("\\", "/")
+        sizes = _torrent_expected_sizes(job_dir)
+        expected = sizes.get(rel, sizes.get(target.name))
+        if not _file_done(target, expected):
             raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
         return FileResponse(
             target, filename=target.name, media_type="application/octet-stream")
@@ -1127,7 +1163,7 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         if p.name in (".selected",) or p.suffix.lower() == ".torrent" or p.name == ".torrent_job":
             continue
         rel = str(p.relative_to(job_dir)).replace("\\", "/")
-        on_disk[rel] = {"downloaded": p.stat().st_size, "done": _file_done(p)}
+        on_disk[rel] = p.stat().st_size
 
     def _row(path, full, downloaded, done, index=None, selected=True):
         # percent — по объёму на диске от полного размера файла (см. --file-
@@ -1145,28 +1181,29 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
 
     meta = job_dir / ".meta.torrent"
     if not meta.is_file():
-        rows = [_row(rel, e["downloaded"], e["downloaded"], e["done"])
-                for rel, e in on_disk.items()]
+        # Без метаданных не знаем ожидаемый размер файла — запасная эвристика
+        # по соседнему .aria2 (годится только для одиночного файла, см. _file_done).
+        rows = [_row(rel, size, size, _file_done(job_dir / rel))
+                for rel, size in on_disk.items()]
         return sorted(rows, key=lambda x: -x["size"])
 
     try:
         expected = _torrent_file_list(meta)
     except Exception:
-        rows = [_row(rel, e["downloaded"], e["downloaded"], e["done"])
-                for rel, e in on_disk.items()]
+        rows = [_row(rel, size, size, _file_done(job_dir / rel))
+                for rel, size in on_disk.items()]
         return sorted(rows, key=lambda x: -x["size"])
     selected = _selected_indices(job_dir)
     items = []
     for f in expected:
-        entry = on_disk.get(f["path"])
-        if entry is None:
+        downloaded = on_disk.get(f["path"])
+        if downloaded is None:
             # Раздача уже докачана целиком: _run_torrent поднимает самый
             # большой файл в корень job_dir, вложенный путь при этом теряется.
-            entry = on_disk.get(Path(f["path"]).name)
+            downloaded = on_disk.get(Path(f["path"]).name)
         is_selected = selected is None or f["index"] in selected
-        items.append(_row(f["path"], f["size"],
-                          entry["downloaded"] if entry else 0,
-                          bool(entry and entry["done"]),
+        done = downloaded is not None and downloaded == f["size"]
+        items.append(_row(f["path"], f["size"], downloaded or 0, done,
                           index=f["index"], selected=is_selected))
     items.sort(key=lambda x: -x["size"])
     return items
@@ -1306,7 +1343,10 @@ def torrent_delete_file(job_id: str, req: TorrentFileActionRequest):
         raise HTTPException(400, "Некорректный путь")
     if not target.is_file():
         raise HTTPException(404, "Файл не найден")
-    if not _file_done(target):
+    rel = str(target.relative_to(base)).replace("\\", "/")
+    sizes = _torrent_expected_sizes(job_dir)
+    expected = sizes.get(rel, sizes.get(target.name))
+    if not _file_done(target, expected):
         raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
     target.unlink()
     return {"ok": True}
