@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -335,6 +336,145 @@ def main():
         }
         r = client.get("/api/file/jobtruncated", params={"path": "TruncShow/B.mkv"})
         assert r.status_code == 409, r.text   # обрезанный файл не отдаём
+
+        # --- 16. /api/torrent/{id}/pause: гварды и флаг (без реального aria2 —
+        # эндпоинт только помечает job["pause"], сам процесс not involved) ---
+        r = client.post("/api/torrent/nosuchjob/pause")
+        assert r.status_code == 404, r.text
+
+        pause_dir = tmp / "jobpause"
+        pause_dir.mkdir()
+        appmod.JOBS["jobpause"] = {
+            "state": "downloading", "percent": 30, "speed": None, "eta": None,
+            "title": None, "filename": None, "error": None, "cancel": False,
+            "total": None, "size": None, "type": "yt-dlp"}
+        r = client.post("/api/torrent/jobpause/pause")
+        assert r.status_code == 400, r.text   # пауза только для торрентов
+
+        appmod.JOBS["jobpause"]["type"] = "torrent"
+        appmod.JOBS["jobpause"]["state"] = "done"
+        r = client.post("/api/torrent/jobpause/pause")
+        assert r.status_code == 409, r.text   # не качается — паузить нечего
+
+        appmod.JOBS["jobpause"]["state"] = "downloading"
+        r = client.post("/api/torrent/jobpause/pause")
+        assert r.status_code == 200, r.text
+        assert appmod.JOBS["jobpause"]["pause"] is True
+
+        # --- 17. Пауза внутри _run_torrent (в отличие от cancel) не удаляет
+        # папку задачи — с фейковым aria2-процессом (реального в тестах нет,
+        # см. остальные пункты), чтобы дойти до самой ветки job["pause"]
+        # внутри цикла чтения stdout, а не только до "aria2 не установлен" ---
+        class _FakeAria2Proc:
+            def __init__(self):
+                self._n = 0
+                self.stdout = self
+                self.terminated = False
+            def __iter__(self):
+                return self
+            def __next__(self):
+                self._n += 1
+                if self._n > 2000:
+                    raise StopIteration
+                time.sleep(0.01)   # имитация реального времени между строками
+                                    # прогресса — иначе pause не успеет прийти
+                return "[#1 SIZE:1MiB/2MiB(50%) DL:1MiB ETA:1s]\n"
+            def terminate(self):
+                self.terminated = True
+            def wait(self, timeout=None):
+                return 0
+            def kill(self):
+                pass
+
+        run_dir = tmp / "jobrun"
+        run_dir.mkdir()
+        (run_dir / "keep.txt").write_bytes(b"x")   # имитация уже скачанного
+        appmod.JOBS["jobrun"] = {
+            "state": "downloading", "percent": 10, "speed": None, "eta": None,
+            "title": None, "filename": None, "error": None, "cancel": False,
+            "total": None, "size": None, "type": "torrent"}
+        old_popen = appmod.subprocess.Popen
+        appmod.subprocess.Popen = lambda *a, **k: _FakeAria2Proc()
+        try:
+            th = threading.Thread(
+                target=appmod._run_torrent,
+                args=("jobrun", str(run_dir / ".meta.torrent")), daemon=True)
+            th.start()
+            time.sleep(0.2)
+            with appmod.JOBS_LOCK:
+                appmod.JOBS["jobrun"]["pause"] = True
+            th.join(timeout=5)
+            assert not th.is_alive(), "пауза должна была завершить поток"
+        finally:
+            appmod.subprocess.Popen = old_popen
+        assert appmod.JOBS["jobrun"]["state"] == "paused", appmod.JOBS["jobrun"]
+        assert appmod.JOBS["jobrun"]["pause"] is False   # флаг сброшен
+        assert run_dir.is_dir(), "пауза не должна удалять папку задачи"
+        assert (run_dir / "keep.txt").is_file()
+
+        # --- 18. /api/torrent/{id}/resume разрешает возобновление из
+        # state="paused" (не только error/interrupted — тот же guard) ---
+        appmod.JOBS["jobresume"]["state"] = "paused"
+        r = client.post("/api/torrent/jobresume/resume")
+        assert r.status_code == 200, r.text
+        time.sleep(0.3)
+
+        # --- 19. /api/jobs включает paused (карточка не пропадает с F5),
+        # /api/files не дублирует её как "прервана" ---
+        jobs_dir = tmp / "jobpaused2"
+        jobs_dir.mkdir()
+        (jobs_dir / ".torrent_job").touch()
+        appmod.JOBS["jobpaused2"] = {
+            "state": "paused", "percent": 55, "speed": None, "eta": None,
+            "title": "Paused Show", "filename": None, "error": None,
+            "cancel": False, "total": None, "size": None, "type": "torrent"}
+        r = client.get("/api/jobs")
+        ids = {j["job_id"] for j in r.json()["jobs"]}
+        assert "jobpaused2" in ids, ids
+        r = client.get("/api/files")
+        ids2 = {i["job_id"] for i in r.json()["files"]}
+        assert "jobpaused2" not in ids2, ids2   # не дублируем — уже в /api/jobs
+
+        # --- 20. _is_temp исключает remux-кэш плеера (.<имя>.play.mp4) из
+        # списка реальных файлов раздачи и из живой таблички ---
+        cache_dir = tmp / "jobcache"
+        cache_dir.mkdir()
+        (cache_dir / "Episode.mkv").write_bytes(b"x" * 100)
+        (cache_dir / ".Episode.mkv.play.mp4").write_bytes(b"y" * 100)
+        real_names = {p.name for p in appmod._real_job_files(cache_dir)}
+        assert real_names == {"Episode.mkv"}, real_names
+        rows = {f["path"] for f in appmod._torrent_status_files(cache_dir)}
+        assert rows == {"Episode.mkv"}, rows
+
+        # --- 21. /api/play: нативный формат отдаётся сразу inline с верным
+        # Content-Type; не нативный (mkv) без кэша просит подождать (409) и
+        # запускает remux в фоне — если ffmpeg недоступен, следующий запрос
+        # получает понятную 500 (аналогично «aria2 не установлен») ---
+        play_native_dir = tmp / "jobplaynative"
+        play_native_dir.mkdir()
+        (play_native_dir / "movie.mp4").write_bytes(b"x" * 10)
+        r = client.get("/api/play/jobplaynative")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("video/mp4"), r.headers
+        assert "inline" in r.headers.get("content-disposition", ""), r.headers
+
+        play_mkv_dir = tmp / "jobplaymkv"
+        play_mkv_dir.mkdir()
+        (play_mkv_dir / "movie.mkv").write_bytes(b"x" * 10)
+        old_ffmpeg = appmod.FFMPEG_BIN
+        appmod.FFMPEG_BIN = "definitely-not-a-real-ffmpeg-binary"
+        try:
+            r = client.get("/api/play/jobplaymkv")
+            assert r.status_code == 409, r.text   # готовим — попробуйте ещё раз
+            time.sleep(0.5)
+            r = client.get("/api/play/jobplaymkv")
+            assert r.status_code == 500, r.text
+            assert "ffmpeg" in r.json()["detail"].lower(), r.text
+            # кэш не создался — следующая попытка снова стартует конвертацию,
+            # а не залипает в вечной ошибке
+            assert not appmod._play_cache_path(play_mkv_dir / "movie.mkv").exists()
+        finally:
+            appmod.FFMPEG_BIN = old_ffmpeg
 
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:

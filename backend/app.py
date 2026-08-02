@@ -13,6 +13,7 @@ import uuid
 import shutil
 import socket
 import ipaddress
+import mimetypes
 import threading
 import traceback
 import subprocess
@@ -142,12 +143,14 @@ def safe_name(name: str) -> str:
 
 
 def _is_temp(p: Path) -> bool:
-    """Временный/недокачанный файл yt-dlp: его нельзя показывать как готовый
-    и нельзя отдавать на скачивание (иначе размер «прыгает», а в браузере
-    вместо файла открывается мусор)."""
+    """Временный/недокачанный файл yt-dlp, либо служебный кэш remux для
+    плеера (см. _play_cache_path) — не показываем как готовый файл раздачи
+    и не отдаём на скачивание/публикацию в библиотеку (иначе размер
+    «прыгает», а в браузере вместо файла открывается мусор)."""
     n = p.name.lower()
     return (n.endswith((".part", ".ytdl", ".tmp", ".temp", ".download", ".aria2"))
-            or ".part-frag" in n)
+            or ".part-frag" in n
+            or (n.startswith(".") and n.endswith(".play.mp4")))
 
 
 def _file_done(p: Path, expected_size: int = None) -> bool:
@@ -216,6 +219,30 @@ def _result_file(job_dir: Path):
     if not files:
         return None
     return max(files, key=lambda p: p.stat().st_size)
+
+
+def _resolve_ready_file(job_dir: Path, path: str = "") -> Path:
+    """Резолвит готовый файл задачи — либо конкретный файл многофайловой
+    раздачи (path, с защитой от выхода за пределы папки задачи), либо
+    главный результат задачи. Общая логика для /api/file и /api/play —
+    проверка path traversal должна жить в одном месте."""
+    if path:
+        base = job_dir.resolve()
+        target = (job_dir / path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise HTTPException(400, "Некорректный путь")
+        rel = str(target.relative_to(base)).replace("\\", "/")
+        sizes = _torrent_expected_sizes(job_dir)
+        expected = sizes.get(rel, sizes.get(target.name))
+        if not _file_done(target, expected):
+            raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
+        return target
+    result = _result_file(job_dir)
+    if not result:
+        raise HTTPException(404, "Файл не найден")
+    return result
 
 
 def check_url_safe(url: str):
@@ -606,13 +633,14 @@ def status(job_id: str):
 
 @app.get("/api/jobs", dependencies=[Depends(check_password)])
 def list_jobs():
-    """Активные задачи (в очереди/качаются/обрабатываются) — фронт зовёт при
-    загрузке страницы, чтобы вернуть карточки с прогрессом после F5: сама
-    загрузка идёт в фоне на сервере и переживает перезагрузку вкладки."""
+    """Активные задачи (в очереди/качаются/обрабатываются/на паузе) — фронт
+    зовёт при загрузке страницы, чтобы вернуть карточки с прогрессом после
+    F5: сама загрузка идёт в фоне на сервере и переживает перезагрузку
+    вкладки. Паузу включаем сюда же, иначе карточка пропадала бы с F5."""
     out = []
     with JOBS_LOCK:
         for jid, job in JOBS.items():
-            if job.get("state") in ("queued", "downloading", "processing"):
+            if job.get("state") in ("queued", "downloading", "processing", "paused"):
                 out.append({"job_id": jid, "state": job.get("state"),
                             "title": job.get("title"), "type": job.get("type"),
                             "percent": job.get("percent")})
@@ -662,7 +690,9 @@ def list_files():
             with JOBS_LOCK:
                 job = JOBS.get(d.name)
                 state = job.get("state") if job else None
-            if state in ("queued", "downloading", "processing"):
+            # На паузе задача уже показана карточкой из /api/jobs — не дублируем
+            # её здесь ещё раз как «прервана».
+            if state in ("queued", "downloading", "processing", "paused"):
                 continue
             result = _result_file(d)
             is_torrent = (d / ".torrent_job").exists()
@@ -732,38 +762,101 @@ def get_file(job_id: str, path: str = ""):
         state = job.get("state") if job else None
 
     # path — конкретный файл многофайловой торрент-раздачи (раскрывающаяся
-    # табличка); проверяем, что итог не выходит за пределы папки задачи.
-    # В отличие от запроса без path, отдаём его и во время скачивания
-    # раздачи — если конкретно этот файл уже докачан (_file_done), остальные
-    # файлы раздачи при этом могут ещё качаться.
+    # табличка); в отличие от запроса без path, отдаём его и во время
+    # скачивания раздачи — если конкретно этот файл уже докачан (_file_done),
+    # остальные файлы раздачи при этом могут ещё качаться.
     if path:
-        base = job_dir.resolve()
-        target = (job_dir / path).resolve()
-        try:
-            target.relative_to(base)
-        except ValueError:
-            raise HTTPException(400, "Некорректный путь")
-        rel = str(target.relative_to(base)).replace("\\", "/")
-        sizes = _torrent_expected_sizes(job_dir)
-        expected = sizes.get(rel, sizes.get(target.name))
-        if not _file_done(target, expected):
-            raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
+        target = _resolve_ready_file(job_dir, path)
         return FileResponse(
             target, filename=target.name, media_type="application/octet-stream")
 
-    # Без path — весь результат задачи. Пока задача в работе, отдавать
-    # нечего: ранняя выдача давала битый/недокачанный файл («чёрный экран
-    # с кодом» в браузере).
-    if state in ("queued", "downloading", "processing"):
+    # Без path — весь результат задачи. Пока задача в работе или на паузе,
+    # отдавать нечего: ранняя выдача давала битый/недокачанный файл («чёрный
+    # экран с кодом» в браузере). Ищем готовый файл на диске, а не в памяти
+    # процесса: так файл можно скачать даже после перезапуска сервиса.
+    if state in ("queued", "downloading", "processing", "paused"):
         raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
-
-    # Ищем готовый файл на диске, а не в памяти процесса: так файл можно
-    # скачать даже после перезапуска сервиса (когда список задач в памяти пуст).
-    result = _result_file(job_dir)
-    if not result:
-        raise HTTPException(404, "Файл не найден")
+    target = _resolve_ready_file(job_dir)
     return FileResponse(
-        result, filename=result.name, media_type="application/octet-stream")
+        target, filename=target.name, media_type="application/octet-stream")
+
+
+# --- Просмотр в браузере (плеер) --------------------------------------------
+# mp4/webm/mp3 и т.п. браузер проигрывает нативно — отдаём файл как есть, с
+# правильным Content-Type и inline (не download), Range уже умеет FileResponse.
+# Остальное (в первую очередь mkv у торрентов) браузер нативно не проигрывает —
+# делаем remux в mp4-контейнер без перекодирования (ffmpeg -c copy, секунды
+# даже на большой файл) и кэшируем результат рядом с исходником.
+
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+NATIVE_PLAYABLE = {".mp4", ".m4v", ".webm", ".ogv", ".mp3", ".m4a", ".wav", ".ogg"}
+PLAY_JOBS: dict[str, dict] = {}   # cache_path -> {"error": str|None}, пока идёт remux
+PLAY_LOCK = threading.Lock()
+
+
+def _play_cache_path(target: Path) -> Path:
+    """Кэш remux-копии рядом с исходником, скрытый файл (не попадает в
+    список файлов раздачи и не публикуется в библиотеку — см. _is_temp)."""
+    return target.with_name("." + target.name + ".play.mp4")
+
+
+def _run_remux(cache_key: str, src: Path, dest: Path):
+    """Перепаковка (не перекодирование) видео/аудио-дорожек в mp4-контейнер;
+    встроенные субтитры (ass/srt) в mp4 не влезают — намеренно отбрасываются,
+    речь только про воспроизведение."""
+    tmp = dest.with_suffix(".tmp")
+    try:
+        proc = subprocess.run(
+            [FFMPEG_BIN, "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a",
+             "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp)],
+            capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+            raise RuntimeError((proc.stderr or "ffmpeg завершился с ошибкой")[-300:])
+        tmp.replace(dest)
+        with PLAY_LOCK:
+            PLAY_JOBS.pop(cache_key, None)
+    except FileNotFoundError:
+        with PLAY_LOCK:
+            PLAY_JOBS[cache_key] = {"error": "ffmpeg не установлен на сервере."}
+    except Exception as e:  # noqa: BLE001
+        with PLAY_LOCK:
+            PLAY_JOBS[cache_key] = {"error": str(e)[:300]}
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.get("/api/play/{job_id}")
+def play_file(job_id: str, path: str = ""):
+    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
+    job_dir = DOWNLOAD_DIR / safe
+    target = _resolve_ready_file(job_dir, path)
+
+    if target.suffix.lower() in NATIVE_PLAYABLE:
+        media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return FileResponse(target, media_type=media_type, filename=target.name,
+                             content_disposition_type="inline")
+
+    cache = _play_cache_path(target)
+    if cache.is_file():
+        return FileResponse(cache, media_type="video/mp4",
+                             filename=target.stem + ".mp4",
+                             content_disposition_type="inline")
+
+    cache_key = str(cache)
+    with PLAY_LOCK:
+        job = PLAY_JOBS.get(cache_key)
+        if job and job.get("error"):
+            err = job["error"]
+            PLAY_JOBS.pop(cache_key, None)   # следующий клик — новая попытка
+            raise HTTPException(500, f"Не удалось подготовить файл для просмотра: {err}")
+        if not job:
+            PLAY_JOBS[cache_key] = {"error": None}
+            threading.Thread(target=_run_remux, args=(cache_key, target, cache),
+                              daemon=True).start()
+    raise HTTPException(409, "Готовим файл для просмотра — повторите запрос через пару секунд")
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
@@ -903,10 +996,11 @@ def _maybe_continue_unselected(job_id: str, job_dir: Path, meta_target: Path):
     _run_torrent(job_id, str(meta_target), select=select)
 
 
-def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False):
+def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
+                  check_integrity: bool = False):
     """Качает раздачу через aria2c в папку задачи, обновляя те же поля JOBS,
     что и _run_download (state/percent/speed/eta/total) — чтобы фронтовый
-    poll() работал без изменений. Уважает job['cancel'].
+    poll() работал без изменений. Уважает job['cancel'] и job['pause'].
 
     source — либо magnet-ссылка (старый путь, качаем всё), либо путь к уже
     скачанному .torrent-файлу (после предпросмотра списка файлов, или из
@@ -914,7 +1008,11 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
     — тогда select задаёт список 1-based индексов файлов для --select-file.
     auto_rest=True помечает задачу для _maybe_continue_unselected (маркер на
     диске переживает рестарт сервиса, поэтому повторные вызовы — резюм,
-    докачка, авто-резюм при старте — его не передают, он читается с диска)."""
+    докачка, авто-резюм при старте — его не передают, он читается с диска).
+    check_integrity=True добавляет aria2 --check-integrity=true (перечитать
+    хэш уже скачанных кусков) — используется и вручную (кнопка «Перечитать
+    хэш»), и один раз автоматически сразу после обычной докачки (см. ниже),
+    поэтому сам себя не рекурсирует дважды."""
     job_dir = DOWNLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     # Маркер: эта папка — торрент-задача, автоочистка (_cleanup_loop) её не трогает.
@@ -952,6 +1050,8 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
         cmd.append("--bt-save-metadata=true")
     if select:
         cmd.append("--select-file=" + ",".join(str(i) for i in select))
+    if check_integrity:
+        cmd.append("--check-integrity=true")
     cmd.append(source)
     try:
         proc = subprocess.Popen(
@@ -971,7 +1071,7 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
         for line in proc.stdout:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
-                if not job or job.get("cancel"):
+                if not job or job.get("cancel") or job.get("pause"):
                     break
             m = re.search(r"\((\d+)%\)", line)
             if not m:
@@ -981,7 +1081,7 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
             tot = re.search(r"/([\d.]+\s*[KMGTP]?i?B)\(", line)
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
-                if job and not job.get("cancel"):
+                if job and not job.get("cancel") and not job.get("pause"):
                     job.update(
                         state="downloading",
                         percent=int(m.group(1)),
@@ -996,6 +1096,7 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
 
         with JOBS_LOCK:
             cancelled = JOBS.get(job_id, {}).get("cancel")
+            paused = JOBS.get(job_id, {}).get("pause")
         if cancelled:
             proc.terminate()
             try:
@@ -1006,6 +1107,19 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
             with JOBS_LOCK:
                 JOBS[job_id].update(state="cancelled", filename=None)
             return
+        if paused:
+            # В отличие от отмены — файлы на диске не трогаем, aria2
+            # корректно допишет свой .aria2-контрольный файл при terminate()
+            # (SIGTERM), поэтому «Продолжить» (/resume) докачает с этого места.
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="paused", speed=None, eta=None,
+                                     pause=False)
+            return
 
         proc.wait()
         _publish_newly_done(job_id, job_dir)  # публикуем всё, что докачалось
@@ -1015,6 +1129,13 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
                 and p.name not in (".selected", ".torrent_job")]
         if not real:
             raise RuntimeError("aria2 не скачал файл (нет пиров или битый magnet)")
+        if not check_integrity:
+            # Один доп. проход с перепроверкой хэша уже скачанных кусков
+            # перед тем, как считать раздачу окончательно готовой и
+            # публиковать в библиотеку — размер уже проверен _file_done, но
+            # это не защищает от тихой порчи данных на диске. check_integrity
+            # не False у самого себя, поэтому рекурсия ровно на один уровень.
+            return _run_torrent(job_id, source, select, check_integrity=True)
         total_size = sum(p.stat().st_size for p in real)
         if _drain_torrent_to_library(job_id, job_dir):
             # Файлы уехали в SMB-библиотеку и удалены с сервера — торрент живёт
@@ -1049,10 +1170,15 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False)
             pass
         with JOBS_LOCK:
             cancelled = JOBS.get(job_id, {}).get("cancel")
+            paused = JOBS.get(job_id, {}).get("pause")
         if cancelled:
             shutil.rmtree(job_dir, ignore_errors=True)
             with JOBS_LOCK:
                 JOBS[job_id].update(state="cancelled", filename=None)
+        elif paused:
+            with JOBS_LOCK:
+                JOBS[job_id].update(state="paused", speed=None, eta=None,
+                                     pause=False)
         else:
             traceback.print_exc()
             with JOBS_LOCK:
@@ -1349,6 +1475,7 @@ def torrent_delete_file(job_id: str, req: TorrentFileActionRequest):
     if not _file_done(target, expected):
         raise HTTPException(409, "Файл ещё скачивается — дождитесь завершения")
     target.unlink()
+    _play_cache_path(target).unlink(missing_ok=True)   # remux-кэш плеера, если был
     return {"ok": True}
 
 
@@ -1386,12 +1513,14 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
 
 
 @app.post("/api/torrent/{job_id}/resume", dependencies=[Depends(check_password)])
-def torrent_resume(job_id: str):
-    """Возобновляет прерванную раздачу (краш/рестарт сервиса посреди
-    закачки) — перезапускает aria2c с тем же .meta.torrent и тем же набором
-    выбранных файлов, что и раньше (aria2 сам продолжит с того места, где
-    остановился, по уже скачанным на диске кускам). В отличие от «докачать»
-    (add-files) не расширяет список файлов, просто продолжает текущий."""
+def torrent_resume(job_id: str, check_integrity: bool = False):
+    """Возобновляет прерванную/приостановленную раздачу — перезапускает
+    aria2c с тем же .meta.torrent и тем же набором выбранных файлов, что и
+    раньше (aria2 сам продолжит с того места, где остановился, по уже
+    скачанным на диске кускам). В отличие от «докачать» (add-files) не
+    расширяет список файлов, просто продолжает текущий.
+    check_integrity=True — это же «▶ Продолжить», но с --check-integrity=true
+    (кнопка «🔁 Перечитать хэш»)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
     job_dir = DOWNLOAD_DIR / safe
     meta = job_dir / ".meta.torrent"
@@ -1415,12 +1544,31 @@ def torrent_resume(job_id: str):
         JOBS[safe] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": title, "filename": None, "error": None,
-            "cancel": False, "total": None, "size": None, "type": "torrent",
+            "cancel": False, "pause": False, "total": None, "size": None,
+            "type": "torrent",
         }
     threading.Thread(
         target=_run_torrent,
         args=(safe, str(meta), sorted(select) if select else None),
+        kwargs={"check_integrity": check_integrity},
         daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/api/torrent/{job_id}/pause", dependencies=[Depends(check_password)])
+def torrent_pause(job_id: str):
+    """Останавливает aria2 для этой раздачи, не удаляя скачанное — в отличие
+    от /api/cancel. «Продолжить» — тот же /api/torrent/{id}/resume, что и
+    восстановление после краша сервиса (это и есть механизм паузы)."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "Задача не найдена")
+        if job.get("type") != "torrent":
+            raise HTTPException(400, "Пауза доступна только для торрентов")
+        if job.get("state") not in ("queued", "downloading"):
+            raise HTTPException(409, "Раздача сейчас не качается")
+        job["pause"] = True
     return {"ok": True}
 
 

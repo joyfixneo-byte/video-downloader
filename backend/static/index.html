@@ -153,6 +153,17 @@
          background:linear-gradient(90deg, var(--accent), var(--accent2)); }
   a.dl.small { padding:5px 10px; font-size:12px; }
 
+  /* Плеер: оверлей поверх страницы с <video> */
+  .player-overlay { position:fixed; inset:0; z-index:50; background:rgba(10,14,14,.72);
+         display:flex; align-items:center; justify-content:center; padding:16px; }
+  .player-box { background:var(--panel-2); border:1px solid var(--line-2); border-radius:16px;
+         padding:14px; max-width:min(920px, 100%); width:100%;
+         box-shadow:0 20px 50px rgba(0,0,0,.45); }
+  .player-head { display:flex; align-items:center; justify-content:space-between; gap:12px;
+         margin-bottom:10px; font-size:14px; font-weight:600; word-break:break-word; }
+  .player-body { min-height:80px; display:flex; align-items:center; justify-content:center; }
+  .player-body video { width:100%; max-height:70vh; border-radius:10px; background:#000; }
+
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
 </head>
@@ -791,6 +802,36 @@ async function createTranscribeJob(target, force, meta) {
   }
 }
 
+// Тихий ретрай при разовых сетевых сбоях опроса статуса (обрыв VPN-туннеля,
+// 502 от frp/nginx на секунду) — раньше одна такая ошибка красила карточку
+// в "⚠ Ошибка 502" и НАВСЕГДА останавливала опрос (poll()/pollTranscribe()
+// просто делали return без следующего setTimeout), а кнопки на экране
+// оставались от последнего удачного опроса и уже ничего не делали.
+// Теперь: тихо повторяем с нарастающей паузой, ничего не рисуем, пока не
+// пройдёт ~15с — тогда показываем понятное предупреждение с кнопкой ручного
+// обновления. Общая для poll() и pollTranscribe() — один и тот же баг.
+function pollRetry(el, err, resume) {
+  const fails = (+el.dataset.pollFails || 0) + 1;
+  el.dataset.pollFails = fails;
+  if (fails === 1) el.dataset.pollFailStart = Date.now();
+  const elapsed = Date.now() - (+el.dataset.pollFailStart || Date.now());
+  if (elapsed < 15000) {
+    setTimeout(resume, Math.min(1500 * fails, 5000));
+    return;
+  }
+  const meta = el.querySelector(".meta");
+  meta.innerHTML = `<span class="err">⚠ Проблема соединения (${escapeHtml(err.message)})</span> `
+    + `<button class="ghost small" data-retry>🔄 Обновить</button>`;
+  meta.querySelector("[data-retry]").onclick = () => {
+    delete el.dataset.pollFails;
+    delete el.dataset.pollFailStart;
+    resume();
+  };
+}
+function pollOk(el) {
+  if (el.dataset.pollFails) { delete el.dataset.pollFails; delete el.dataset.pollFailStart; }
+}
+
 async function pollTranscribe(jobId, el) {
   const meta = el.querySelector(".meta");
   const cancelBox = el.querySelector(".tcancel");
@@ -808,6 +849,7 @@ async function pollTranscribe(jobId, el) {
   };
   try {
     const s = await api("/api/transcribe/status/" + jobId);
+    pollOk(el);
     if (s.state === "queued") {
       active("⏳ В очереди…" + elapsed());
     } else if (s.state === "subtitles") {
@@ -847,8 +889,7 @@ async function pollTranscribe(jobId, el) {
       return;
     }
   } catch (e) {
-    meta.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
-    cancelBox.innerHTML = "";
+    pollRetry(el, e, () => pollTranscribe(jobId, el));
     return;
   }
   setTimeout(() => pollTranscribe(jobId, el), 1500);
@@ -942,6 +983,13 @@ function fmtSize(bytes) {
   if (!bytes) return "";
   const mb = bytes / 1048576;
   return mb >= 1024 ? (mb / 1024).toFixed(2) + " ГБ" : mb.toFixed(1) + " МБ";
+}
+
+// Дата скачивания — mtime готового файла с сервера (см. /api/files).
+function fmtDate(unixSeconds) {
+  if (!unixSeconds) return "";
+  return new Date(unixSeconds * 1000).toLocaleString("ru-RU",
+    { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 // Человеческое время: "5 мин 51 с", "1 ч 3 мин", "42 с".
@@ -1233,10 +1281,99 @@ const GAME = (function () {
 const stopBtn = jobId =>
   `<button class="ghost small" onclick="cancelJob('${jobId}', this)">⛔ Остановить</button>`;
 
+// Пауза — только для торрентов (у yt-dlp/Whisper останавливать и докачивать
+// с того же места нечем): реальный процесс останавливается, файлы остаются.
+const pauseBtn = jobId =>
+  `<button class="ghost small" onclick="pauseJob('${jobId}', this)">⏸ Пауза</button>`;
+const resumeBtn = jobId =>
+  `<button class="ghost small" onclick="resumeJob('${jobId}', this)">▶ Продолжить</button>`;
+const recheckBtn = jobId =>
+  `<button class="ghost small" onclick="resumeJob('${jobId}', this, true)">🔁 Перечитать хэш</button>`;
+const playBtn = (jobId, path, name) =>
+  `<button class="ghost small" onclick="openPlayer('${jobId}', ${JSON.stringify(path)}, ${JSON.stringify(name)})">▶ Смотреть</button>`;
+
 // Кнопка «В библиотеку» — только если SMB-витрина настроена. Иначе пусто.
 const libBtn = jobId => LIBRARY_ENABLED
   ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">📚 В библиотеку</button>`
   : "";
+
+async function pauseJob(jobId, btn) {
+  btn.disabled = true; btn.textContent = "Ставлю на паузу…";
+  try { await api("/api/torrent/" + jobId + "/pause", { method: "POST" }); }
+  catch (e) { btn.disabled = false; btn.textContent = "⏸ Пауза"; alert("Не удалось: " + e.message); }
+}
+
+// Продолжить (с паузы) — тот же /resume, что и восстановление после краша
+// сервиса (см. resumeTorrent ниже); checkIntegrity=true добавляет
+// ?check_integrity=true (кнопка «Перечитать хэш»). Карточка на паузе уже
+// крутится в своём poll()-цикле — новый статус подхватится сам, повторно
+// его не запускаем (в отличие от resumeTorrent для карточки из /api/files).
+async function resumeJob(jobId, btn, checkIntegrity = false) {
+  btn.disabled = true; btn.textContent = checkIntegrity ? "Проверяю…" : "Продолжаю…";
+  try {
+    const q = checkIntegrity ? "?check_integrity=true" : "";
+    await api("/api/torrent/" + jobId + "/resume" + q, { method: "POST" });
+  } catch (e) {
+    btn.disabled = false;
+    alert("Не удалось: " + e.message);
+  }
+}
+
+// Плеер: простой оверлей с <video>. Если файл нужно сначала перепаковать
+// (mkv → mp4, см. /api/play), сервер отвечает 409, пока идёт remux — тихо
+// опрашиваем, пока не будет готово (или не придёт понятная ошибка).
+function closePlayer() {
+  const ov = document.getElementById("playerOverlay");
+  if (!ov) return;
+  const v = ov.querySelector("video");
+  if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+  ov.remove();
+}
+
+async function openPlayer(jobId, path, name) {
+  closePlayer();
+  const url = "/api/play/" + jobId + (path ? "?path=" + encodeURIComponent(path) : "");
+  const ov = document.createElement("div");
+  ov.id = "playerOverlay";
+  ov.className = "player-overlay";
+  ov.addEventListener("click", ev => { if (ev.target === ov) closePlayer(); });
+  ov.innerHTML = `
+    <div class="player-box">
+      <div class="player-head">
+        <span>${escapeHtml(name)}</span>
+        <button class="ghost small" onclick="closePlayer()">✕ Закрыть</button>
+      </div>
+      <div class="player-body muted">Открываю…</div>
+    </div>`;
+  document.body.appendChild(ov);
+  const body = ov.querySelector(".player-body");
+
+  const tryOpen = async () => {
+    if (!document.getElementById("playerOverlay")) return;   // закрыли, пока ждали
+    let r;
+    try {
+      r = await fetch(url);
+    } catch (e) {
+      body.innerHTML = `<span class="err">⚠ ${escapeHtml(e.message)}</span>`;
+      return;
+    }
+    if (r.ok) {
+      if (r.body) r.body.cancel();   // не грузим весь файл через fetch —
+                                      // <video> сам заберёт его Range-запросами
+      body.innerHTML = `<video controls autoplay src="${url}"></video>`;
+      return;
+    }
+    if (r.status === 409) {
+      body.textContent = "Готовим файл для просмотра — секунда-другая…";
+      setTimeout(tryOpen, 2000);
+      return;
+    }
+    let msg = "Ошибка " + r.status;
+    try { const j = await r.json(); if (j.detail) msg = j.detail; } catch (e) {}
+    body.innerHTML = `<span class="err">⚠ ${escapeHtml(msg)}</span>`;
+  };
+  tryOpen();
+}
 
 // Раскрывающаяся табличка файлов торрент-раздачи: показывает статус каждого
 // файла (готов / качается / не выбран) и обновляется каждые 2с, пока раздача
@@ -1264,6 +1401,8 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
           if (f.done) {
             status = '<span class="done">✓ готово</span>';
             actions = `<a class="dl small" href="${dlHref}" download>⬇</a>`
+              + `<button class="ghost small" onclick='openPlayer(${JSON.stringify(jobId)}, `
+              + `${JSON.stringify(f.path)}, ${JSON.stringify(f.path)})'>▶</button>`
               + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">🗑</button>`;
           } else if (f.selected === false) {
             status = '<span class="muted">не выбран</span>';
@@ -1333,6 +1472,7 @@ async function poll(jobId, el) {
   const controls = el.querySelector(".controls");
   try {
     const s = await api("/api/status/" + jobId);
+    pollOk(el);
     el.dataset.jobState = s.state;   // читает живая табличка файлов раздачи
     // Человеческое название вместо «Торрент (magnet)»: сервер отдаёт имя
     // раздачи (из .torrent или dn= у magnet) в s.title.
@@ -1347,7 +1487,7 @@ async function poll(jobId, el) {
       const eta = s.eta ? " · осталось ~" + fmtTime(s.eta) : "";
       const sz = s.total ? " · размер ~" + fmtSize(s.total) : "";
       meta.textContent = `Скачивание ${pct} ${spd}${eta}${sz}`;
-      controls.innerHTML = stopBtn(jobId);
+      controls.innerHTML = (s.type === "torrent" ? pauseBtn(jobId) : "") + stopBtn(jobId);
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "processing") {
       meta.textContent = "Обработка (склейка видео и звука)…";
@@ -1355,6 +1495,12 @@ async function poll(jobId, el) {
     } else if (s.state === "queued") {
       meta.textContent = "В очереди…";
       controls.innerHTML = stopBtn(jobId);
+    } else if (s.state === "paused") {
+      const pct = s.percent != null ? Math.round(s.percent) + "%" : "";
+      meta.innerHTML = `<span class="muted">⏸ На паузе ${pct}</span>`;
+      controls.innerHTML = resumeBtn(jobId) + recheckBtn(jobId)
+        + `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
+      if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "done") {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       // Торрент уехал в библиотеку (SMB) и удалён с сервера — дубля нет,
@@ -1372,6 +1518,7 @@ async function poll(jobId, el) {
       const fname = s.filename || s.title || "video.mp4";
       controls.innerHTML =
         `<a class="dl" href="${href}">⬇ Скачать файл</a>` +
+        playBtn(jobId, "", fname) +
         libBtn(jobId) +
         `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
       controls.querySelector(".dl").addEventListener("click", ev => {
@@ -1393,7 +1540,7 @@ async function poll(jobId, el) {
       controls.innerHTML = ""; return;
     }
   } catch (e) {
-    meta.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    pollRetry(el, e, () => poll(jobId, el));
     return;
   }
   setTimeout(() => poll(jobId, el), 1200);
@@ -1420,12 +1567,13 @@ async function deleteJob(jobId, btn) {
   }
 }
 
-async function resumeTorrent(jobId, btn) {
+async function resumeTorrent(jobId, btn, checkIntegrity = false) {
   btn.disabled = true;
   const old = btn.textContent;
-  btn.textContent = "Возобновляю…";
+  btn.textContent = checkIntegrity ? "Проверяю…" : "Возобновляю…";
   try {
-    await api("/api/torrent/" + jobId + "/resume", { method: "POST" });
+    const q = checkIntegrity ? "?check_integrity=true" : "";
+    await api("/api/torrent/" + jobId + "/resume" + q, { method: "POST" });
     const job = btn.closest(".job");
     job.dataset.jobState = "queued";
     poll(jobId, job);   // карточка переходит в режим живого прогресса
@@ -1461,6 +1609,7 @@ async function loadFiles() {
         metaLine = `⏸ прервано — ${p.percent ?? 0}% `
           + `(готово ${p.done_files ?? 0} из ${p.total_files ?? "?"} файлов)`;
         controls = `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this)">▶ Возобновить</button>`
+          + `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this, true)">🔁 Перечитать хэш</button>`
           + (f.filename ? `<a class="dl" href="${href}">⬇ Скачать</a>` : "")
           + (f.filename ? libBtn(f.job_id) : "")
           + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
@@ -1468,8 +1617,10 @@ async function loadFiles() {
         const rem = f.torrent
           ? "не удаляется автоматически — только вручную"
           : (f.remaining ? "удалится через " + fmtTime(f.remaining) : "скоро будет удалён");
-        metaLine = `${fmtSize(f.size)} · ${rem}`;
+        const when = fmtDate(f.mtime);
+        metaLine = `${fmtSize(f.size)}${when ? " · скачано " + when : ""} · ${rem}`;
         controls = `<a class="dl" href="${href}">⬇ Скачать</a>`
+          + (f.filename ? playBtn(f.job_id, "", f.filename) : "")
           + libBtn(f.job_id)
           + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
       }
