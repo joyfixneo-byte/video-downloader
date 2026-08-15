@@ -48,6 +48,13 @@ def main():
     import app as appmod  # noqa: E402  (после DOWNLOAD_DIR, чтобы модуль его подхватил)
     from fastapi.testclient import TestClient
 
+    # Проверки ниже, где написано «упадёт без aria2 — это ок», раньше молча
+    # опирались на то, что aria2 на машине разработчика не установлен. На
+    # сервере он есть — тест начинал запускать НАСТОЯЩИЕ закачки синтетических
+    # торрентов и падал (state не "error"). Подменяем путь к бинарнику, как в
+    # п.21 с FFMPEG_BIN: результат одинаков и на ноуте, и на VM.
+    appmod.ARIA2_BIN = "definitely-not-a-real-aria2-binary"
+
     client = TestClient(appmod.app)
 
     try:
