@@ -153,6 +153,31 @@ def _is_temp(p: Path) -> bool:
             or (n.startswith(".") and n.endswith(".play.mp4")))
 
 
+def _written_bytes(p: Path) -> int:
+    """Сколько байт файла РЕАЛЬНО записано на диск.
+
+    У качающегося aria2-файла `st_size` врёт: с `--file-allocation=none`
+    куски пишутся вразнобой, и как только записан последний кусок, размер
+    файла сразу становится полным, а середина остаётся дырами (sparse) и
+    читается нулями. Именно так в SMB-библиотеку уезжали «готовые» файлы на
+    8 ГБ, целиком состоящие из нулей (проверка `st_size == expected_size`
+    их пропускала, а ffprobe потом не находил даже заголовка). Считаем по
+    фактически занятым блокам: у докачанного файла blocks*512 >= size, у
+    дырявого — заметно меньше.
+
+    ponytail: `st_blocks` есть только на Unix (на Windows возвращаем
+    st_size — торренты крутятся только на Linux-VM), а ФС со сжатием
+    (btrfs compress) может занизить блоки: тогда файл просто не считается
+    готовым и остаётся на сервере — безопасная сторона ошибки. Точный ответ
+    дал бы только aria2 RPC (aria2.tellStatus → completedLength) — апгрейд,
+    если понадобится."""
+    st = p.stat()
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is None:
+        return st.st_size
+    return min(blocks * 512, st.st_size)
+
+
 def _file_done(p: Path, expected_size: int = None) -> bool:
     """Конкретный файл раздачи полностью докачан.
 
@@ -168,12 +193,17 @@ def _file_done(p: Path, expected_size: int = None) -> bool:
     .aria2 и считала готовым любой файл, едва он появился на диске, даже
     если реально докачано только несколько мегабайт (не хватило пиров на
     конкретную серию — торрент завершается, файл остаётся обрезанным). Из-за
-    этого обрезанные файлы уходили в SMB-библиотеку как «готовые»."""
+    этого обрезанные файлы уходили в SMB-библиотеку как «готовые».
+
+    ⚠️ И размер сверяем не по `st_size`, а по реально записанным байтам
+    (см. _written_bytes) — иначе sparse-файл aria2 «готов» уже через минуту
+    после старта раздачи."""
     if not p.is_file() or _is_temp(p):
         return False
+    written = _written_bytes(p)
     if expected_size is not None:
-        return p.stat().st_size == expected_size
-    return not p.with_name(p.name + ".aria2").exists()
+        return written >= expected_size
+    return written > 0 and not p.with_name(p.name + ".aria2").exists()
 
 
 def _torrent_expected_sizes(job_dir: Path) -> dict:
@@ -1289,13 +1319,13 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         if p.name in (".selected",) or p.suffix.lower() == ".torrent" or p.name == ".torrent_job":
             continue
         rel = str(p.relative_to(job_dir)).replace("\\", "/")
-        on_disk[rel] = p.stat().st_size
+        on_disk[rel] = _written_bytes(p)
 
     def _row(path, full, downloaded, done, index=None, selected=True):
-        # percent — по объёму на диске от полного размера файла (см. --file-
-        # allocation=none: aria2 дописывает файл, размер растёт по мере докачки).
-        # ponytail: приблизительно (aria2 пишет не строго по порядку), но для
-        # индикатора «сколько осталось по файлу» этого достаточно.
+        # percent — по реально записанным на диск байтам от полного размера
+        # файла (не по st_size: у sparse-файла aria2 он полный почти сразу
+        # после старта, из-за чего табличка показывала «качается... 99%» через
+        # секунду после добавления раздачи — см. _written_bytes).
         if done:
             pct = 100
         elif full and downloaded:
@@ -1328,7 +1358,7 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
             # большой файл в корень job_dir, вложенный путь при этом теряется.
             downloaded = on_disk.get(Path(f["path"]).name)
         is_selected = selected is None or f["index"] in selected
-        done = downloaded is not None and downloaded == f["size"]
+        done = downloaded is not None and downloaded >= f["size"]
         items.append(_row(f["path"], f["size"], downloaded or 0, done,
                           index=f["index"], selected=is_selected))
     items.sort(key=lambda x: -x["size"])

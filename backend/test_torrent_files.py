@@ -476,6 +476,39 @@ def main():
         finally:
             appmod.FFMPEG_BIN = old_ffmpeg
 
+        # --- 22. Реальный баг: aria2 (--file-allocation=none) пишет куски
+        # вразнобой, и как только записан ПОСЛЕДНИЙ кусок, st_size файла
+        # становится полным, а середина — дыры (sparse), читаются нулями.
+        # Проверка "st_size == ожидаемый размер" такой файл считала готовым:
+        # он уезжал в SMB-библиотеку (8 ГБ нулей, ffprobe не находит даже
+        # EBML-заголовка), исходник удалялся, а в табличке файл показывал
+        # "качается... 99%" через секунду после добавления раздачи ---
+        sparse_dir = tmp / "jobsparse"
+        sparse_sub = sparse_dir / "SparseShow"
+        sparse_sub.mkdir(parents=True)
+        (sparse_dir / ".meta.torrent").write_bytes(
+            make_torrent("SparseShow", [("S.mkv", 10_000_000)]))
+        sparse_file = sparse_sub / "S.mkv"
+        with open(sparse_file, "wb") as fh:
+            fh.truncate(10_000_000)      # дыра на весь файл, блоки не выделены
+            fh.seek(9_999_999)
+            fh.write(b"x")               # записан только последний кусок
+        assert sparse_file.stat().st_size == 10_000_000   # st_size уже "полный"
+
+        if hasattr(sparse_file.stat(), "st_blocks"):      # Unix; на Windows нет sparse
+            assert appmod._written_bytes(sparse_file) < 1_000_000
+            assert appmod._file_done(sparse_file, 10_000_000) is False
+            assert appmod._real_job_files(sparse_dir) == []
+            row = appmod._torrent_status_files(sparse_dir)[0]
+            assert row["done"] is False, row
+            assert row["percent"] == 0, row
+            # а докачанный целиком (реально записанный) — по-прежнему готов
+            sparse_file.write_bytes(b"x" * 10_000_000)
+            assert appmod._file_done(sparse_file, 10_000_000) is True
+            assert appmod._torrent_status_files(sparse_dir)[0]["percent"] == 100
+        else:
+            print("  (п.22: sparse-проверка пропущена — не Unix)")
+
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
