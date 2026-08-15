@@ -326,6 +326,7 @@
   <div class="card gated" id="serverCard">
     <div class="selbar">
       <label style="margin:0">Файлы на сервере</label>
+      <span class="muted" id="diskFree" style="font-size:12px"></span>
       <button class="ghost small" onclick="loadFiles()">⟳ Обновить</button>
     </div>
     <div class="jobs" id="serverList"></div>
@@ -985,6 +986,17 @@ function fmtSize(bytes) {
   return mb >= 1024 ? (mb / 1024).toFixed(2) + " ГБ" : mb.toFixed(1) + " МБ";
 }
 
+// Свободное место на диске сервера (приходит вместе со списком файлов).
+// Красным — когда осталось меньше запаса, ниже которого сервер уже
+// отказывается стартовать закачки (DISK_MIN_FREE_MB, см. _require_disk_space).
+function showDisk(disk) {
+  const el = document.getElementById("diskFree");
+  if (!el) return;
+  if (!disk || !disk.total) { el.textContent = ""; return; }
+  el.textContent = `💾 свободно ${fmtSize(disk.free)} из ${fmtSize(disk.total)}`;
+  el.style.color = disk.free < (disk.reserve || 0) ? "var(--err, #ff6b6b)" : "";
+}
+
 // Дата скачивания — mtime готового файла с сервера (см. /api/files).
 function fmtDate(unixSeconds) {
   if (!unixSeconds) return "";
@@ -1319,20 +1331,30 @@ async function resumeJob(jobId, btn, checkIntegrity = false) {
   }
 }
 
-// Плеер: простой оверлей с <video>. Если файл нужно сначала перепаковать
-// (mkv → mp4, см. /api/play), сервер отвечает 409, пока идёт remux — тихо
-// опрашиваем, пока не будет готово (или не придёт понятная ошибка).
+// Плеер: оверлей с <video>. Нативные форматы (mp4/webm) браузер играет сам,
+// с обычной перемоткой. Остальное (mkv у торрентов) сервер перепаковывает на
+// лету (см. /api/play): это поток без длительности, поэтому родная перемотка
+// в нём не работает — рисуем свой ползунок и перематываем перезапросом
+// потока с нужной секунды (?t=), а время показываем как «начало потока +
+// сколько проиграно».
 function closePlayer() {
   const ov = document.getElementById("playerOverlay");
   if (!ov) return;
   const v = ov.querySelector("video");
-  if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
-  ov.remove();
+  if (v) { v.pause(); v.removeAttribute("src"); v.load(); }  // обрываем поток —
+  ov.remove();                                                // ffmpeg на сервере умрёт
+}
+
+function fmtClock(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const mm = String(m).padStart(h ? 2 : 1, "0"), ss = String(s).padStart(2, "0");
+  return (h ? h + ":" : "") + mm + ":" + ss;
 }
 
 async function openPlayer(jobId, path, name) {
   closePlayer();
-  const url = "/api/play/" + jobId + (path ? "?path=" + encodeURIComponent(path) : "");
+  const base = "/api/play/" + jobId + (path ? "?path=" + encodeURIComponent(path) + "&" : "?");
   const ov = document.createElement("div");
   ov.id = "playerOverlay";
   ov.className = "player-overlay";
@@ -1348,31 +1370,53 @@ async function openPlayer(jobId, path, name) {
   document.body.appendChild(ov);
   const body = ov.querySelector(".player-body");
 
-  const tryOpen = async () => {
-    if (!document.getElementById("playerOverlay")) return;   // закрыли, пока ждали
-    let r;
-    try {
-      r = await fetch(url);
-    } catch (e) {
-      body.innerHTML = `<span class="err">⚠ ${escapeHtml(e.message)}</span>`;
-      return;
-    }
-    if (r.ok) {
-      if (r.body) r.body.cancel();   // не грузим весь файл через fetch —
-                                      // <video> сам заберёт его Range-запросами
-      body.innerHTML = `<video controls autoplay src="${url}"></video>`;
-      return;
-    }
-    if (r.status === 409) {
-      body.textContent = "Готовим файл для просмотра — секунда-другая…";
-      setTimeout(tryOpen, 2000);
-      return;
-    }
-    let msg = "Ошибка " + r.status;
-    try { const j = await r.json(); if (j.detail) msg = j.detail; } catch (e) {}
-    body.innerHTML = `<span class="err">⚠ ${escapeHtml(msg)}</span>`;
-  };
-  tryOpen();
+  let info;
+  try {
+    info = await (await fetch(base + "probe=1")).json();
+  } catch (e) {
+    body.innerHTML = `<span class="err">⚠ ${escapeHtml(e.message)}</span>`;
+    return;
+  }
+  if (!document.getElementById("playerOverlay")) return;   // закрыли, пока ждали
+  if (info.detail) {                                        // ошибка от сервера
+    body.innerHTML = `<span class="err">⚠ ${escapeHtml(info.detail)}</span>`;
+    return;
+  }
+
+  if (info.native) {   // браузер играет сам, с родной перемоткой
+    body.innerHTML = `<video controls autoplay src="${base}"></video>`;
+    return;
+  }
+
+  // Перепаковка на лету: свой ползунок поверх потока.
+  const dur = info.duration || 0;
+  body.style.display = "block";
+  body.innerHTML = `
+    <video controls autoplay src="${base}t=0"></video>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:12px">
+      <span class="muted" id="playClock">0:00</span>
+      <input type="range" id="playSeek" min="0" max="${Math.floor(dur)}" value="0"
+             step="1" style="flex:1" ${dur ? "" : "disabled"}>
+      <span class="muted">${dur ? fmtClock(dur) : "длительность неизвестна"}</span>
+    </div>`;
+  const video = body.querySelector("video");
+  const seek = body.querySelector("#playSeek");
+  const clock = body.querySelector("#playClock");
+  let offset = 0;              // с какой секунды исходника начат текущий поток
+  let dragging = false;
+
+  video.addEventListener("timeupdate", () => {
+    const pos = offset + video.currentTime;
+    clock.textContent = fmtClock(pos);
+    if (!dragging && dur) seek.value = Math.min(Math.floor(pos), Math.floor(dur));
+  });
+  seek.addEventListener("input", () => { dragging = true; clock.textContent = fmtClock(seek.value); });
+  seek.addEventListener("change", () => {
+    dragging = false;
+    offset = Number(seek.value);
+    video.src = base + "t=" + offset;   // новый поток с этой секунды
+    video.play().catch(() => {});
+  });
 }
 
 // Раскрывающаяся табличка файлов торрент-раздачи: показывает статус каждого
@@ -1588,7 +1632,8 @@ async function resumeTorrent(jobId, btn, checkIntegrity = false) {
 async function loadFiles() {
   const list = document.getElementById("serverList");
   try {
-    const { files } = await api("/api/files");
+    const { files, disk } = await api("/api/files");
+    showDisk(disk);
     if (!files.length) {
       list.innerHTML = '<div class="muted" style="font-size:13px">'
         + 'Пока нет файлов на сервере.</div>';

@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse, quote, unquote_plus
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import yt_dlp
@@ -361,21 +361,43 @@ def _count_active(jobs: dict, lock, states) -> int:
 DISK_MIN_FREE_MB = int(os.environ.get("DISK_MIN_FREE_MB", "1024"))
 
 
-def _require_disk_space():
-    """Понятная ошибка вместо «непонятного» 500, когда на диске кончилось
-    место (ENOSPC при создании папок/файлов задачи). Зовём перед стартом
-    любой загрузки.
-    ponytail: грубый порог DISK_MIN_FREE_MB — большой торрент всё равно может
-    добить диск в процессе, тогда aria2 просто завершится ошибкой; апгрейд —
-    сверять со свободным местом реальный размер раздачи перед стартом."""
+def _gb(n: int) -> str:
+    """Байты человеку: «3.4 ГБ»."""
+    return f"{n / 1024 ** 3:.1f} ГБ"
+
+
+def _disk_free() -> tuple[int, int]:
+    """(свободно, всего) байт на диске с рабочей папкой. (0, 0) — не узнать."""
     try:
-        free = shutil.disk_usage(DOWNLOAD_DIR).free
+        u = shutil.disk_usage(DOWNLOAD_DIR)
     except OSError:
+        return 0, 0
+    return u.free, u.total
+
+
+def _require_disk_space(need_bytes: int = 0):
+    """Понятная ошибка вместо «непонятного» 500, когда на диске не хватит
+    места. Зовём перед стартом любой загрузки.
+
+    need_bytes — известный заранее объём (сумма выбранных файлов раздачи из
+    .torrent-метаданных). Сверх него всегда держим запас DISK_MIN_FREE_MB:
+    диск, забитый под ноль, роняет и сам сервис (логи, временные файлы).
+    Без need_bytes (голый magnet, yt-dlp — размер заранее не известен)
+    проверяем только запас, как раньше."""
+    free, _ = _disk_free()
+    if not free:
         return
-    if free < DISK_MIN_FREE_MB * 1024 * 1024:
+    reserve = DISK_MIN_FREE_MB * 1024 * 1024
+    if free < need_bytes + reserve:
+        if need_bytes:
+            raise HTTPException(
+                507, f"Не хватит места: нужно {_gb(need_bytes)} плюс запас "
+                f"{DISK_MIN_FREE_MB} МБ, а свободно {_gb(free)}. Удалите "
+                "ненужное в разделах «Файлы на сервере» или «Библиотека» "
+                "(либо снимите часть файлов с раздачи) и повторите.")
         raise HTTPException(
-            507, f"На диске сервера почти нет места ({free // (1024 * 1024)} МБ "
-            "свободно). Удалите ненужные файлы в разделах «Файлы на сервере» "
+            507, f"На диске сервера почти нет места (свободно {_gb(free)}). "
+            "Удалите ненужные файлы в разделах «Файлы на сервере» "
             "или «Библиотека» и повторите.")
 
 
@@ -775,7 +797,11 @@ def list_files():
                 "mtime": mtime,
             })
     items.sort(key=lambda x: x["mtime"], reverse=True)  # новые сверху
-    return {"files": items}
+    # Свободное место — в этом же ответе (фронт и так опрашивает список файлов,
+    # отдельная ручка не нужна). Показывается в шапке «Файлы на сервере».
+    free, total = _disk_free()
+    return {"files": items, "disk": {"free": free, "total": total,
+                                     "reserve": DISK_MIN_FREE_MB * 1024 * 1024}}
 
 
 @app.get("/api/file/{job_id}")
@@ -815,78 +841,94 @@ def get_file(job_id: str, path: str = ""):
 # mp4/webm/mp3 и т.п. браузер проигрывает нативно — отдаём файл как есть, с
 # правильным Content-Type и inline (не download), Range уже умеет FileResponse.
 # Остальное (в первую очередь mkv у торрентов) браузер нативно не проигрывает —
-# делаем remux в mp4-контейнер без перекодирования (ffmpeg -c copy, секунды
-# даже на большой файл) и кэшируем результат рядом с исходником.
+# перепаковываем в mp4 НА ЛЕТУ: ffmpeg -c copy пишет фрагментированный mp4
+# прямо в ответ, без временного файла на диске.
+#
+# ⚠️ Раньше remux писался в кэш рядом с исходником (`.<имя>.play.mp4`): один
+# просмотр 8-гигового фильма = ещё 8 ГБ на диске VM плюс ожидание, пока
+# перепакуется весь файл. Теперь диск не тратится вообще, и видео стартует
+# через секунду. Цена: у потока нет длительности, поэтому родная перемотка
+# <video> не работает — фронтенд рисует свой ползунок и перематывает
+# перезапросом с ?t=<секунда> (ffmpeg -ss, тоже мгновенно).
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 NATIVE_PLAYABLE = {".mp4", ".m4v", ".webm", ".ogv", ".mp3", ".m4a", ".wav", ".ogg"}
-PLAY_JOBS: dict[str, dict] = {}   # cache_path -> {"error": str|None}, пока идёт remux
-PLAY_LOCK = threading.Lock()
 
 
 def _play_cache_path(target: Path) -> Path:
-    """Кэш remux-копии рядом с исходником, скрытый файл (не попадает в
-    список файлов раздачи и не публикуется в библиотеку — см. _is_temp)."""
+    """Путь старого remux-кэша (`.<имя>.play.mp4`). Сам кэш больше не
+    создаётся — функция осталась, чтобы подчищать файлы, оставшиеся от
+    прежней версии, при удалении раздачи (см. /api/torrent/{id}/delete-file)."""
     return target.with_name("." + target.name + ".play.mp4")
 
 
-def _run_remux(cache_key: str, src: Path, dest: Path):
-    """Перепаковка (не перекодирование) видео/аудио-дорожек в mp4-контейнер;
-    встроенные субтитры (ass/srt) в mp4 не влезают — намеренно отбрасываются,
-    речь только про воспроизведение."""
-    tmp = dest.with_suffix(".tmp")
+def _media_duration(src: Path) -> float | None:
+    """Длительность файла в секундах (для ползунка перемотки в плеере).
+    None — ffprobe недоступен или не смог разобрать файл."""
     try:
-        proc = subprocess.run(
-            [FFMPEG_BIN, "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a",
-             "-c", "copy", "-movflags", "+faststart", "-f", "mp4", str(tmp)],
-            capture_output=True, text=True, timeout=1800)
-        if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
-            raise RuntimeError((proc.stderr or "ffmpeg завершился с ошибкой")[-300:])
-        tmp.replace(dest)
-        with PLAY_LOCK:
-            PLAY_JOBS.pop(cache_key, None)
-    except FileNotFoundError:
-        with PLAY_LOCK:
-            PLAY_JOBS[cache_key] = {"error": "ffmpeg не установлен на сервере."}
-    except Exception as e:  # noqa: BLE001
-        with PLAY_LOCK:
-            PLAY_JOBS[cache_key] = {"error": str(e)[:300]}
+        out = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(src)],
+            capture_output=True, text=True, timeout=30)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def _remux_stream(src: Path, start: float = 0.0):
+    """Генератор кусков mp4: ffmpeg перепаковывает (не перекодирует) дорожки
+    в фрагментированный mp4 и пишет в pipe. `-ss` ДО `-i` — перемотка по
+    ключевым кадрам без чтения всего файла. Субтитры в mp4 не влезают —
+    намеренно отбрасываются, речь только про воспроизведение."""
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
+    if start > 0:
+        cmd += ["-ss", str(start)]
+    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(64 * 1024)
+            if not chunk:
+                return
+            yield chunk
     finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Закрыли вкладку / перемотали — ffmpeg должен умереть сразу, иначе
+        # каждый клик оставлял бы висеть процесс, читающий гигабайты.
+        proc.kill()
+        proc.stdout.close()
 
 
 @app.get("/api/play/{job_id}")
-def play_file(job_id: str, path: str = ""):
+def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0):
+    """Просмотр в браузере. probe=1 — только справка о файле (нативный ли
+    формат и длительность), чтобы фронт решил, нужен ли свой ползунок.
+    t — с какой секунды начать поток (перемотка для не нативных форматов)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
     job_dir = DOWNLOAD_DIR / safe
     target = _resolve_ready_file(job_dir, path)
+    native = target.suffix.lower() in NATIVE_PLAYABLE
 
-    if target.suffix.lower() in NATIVE_PLAYABLE:
+    if probe:
+        return {"native": native, "duration": _media_duration(target),
+                "name": target.name}
+
+    if native:
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         return FileResponse(target, media_type=media_type, filename=target.name,
                              content_disposition_type="inline")
 
-    cache = _play_cache_path(target)
-    if cache.is_file():
-        return FileResponse(cache, media_type="video/mp4",
-                             filename=target.stem + ".mp4",
-                             content_disposition_type="inline")
-
-    cache_key = str(cache)
-    with PLAY_LOCK:
-        job = PLAY_JOBS.get(cache_key)
-        if job and job.get("error"):
-            err = job["error"]
-            PLAY_JOBS.pop(cache_key, None)   # следующий клик — новая попытка
-            raise HTTPException(500, f"Не удалось подготовить файл для просмотра: {err}")
-        if not job:
-            PLAY_JOBS[cache_key] = {"error": None}
-            threading.Thread(target=_run_remux, args=(cache_key, target, cache),
-                              daemon=True).start()
-    raise HTTPException(409, "Готовим файл для просмотра — повторите запрос через пару секунд")
+    if not shutil.which(FFMPEG_BIN):
+        raise HTTPException(500, "ffmpeg не установлен на сервере — "
+                                 "просмотр в браузере недоступен.")
+    return StreamingResponse(
+        _remux_stream(target, max(0.0, t)), media_type="video/mp4",
+        headers={"Content-Disposition":
+                 f'inline; filename="{_safe_name(target.stem)}.mp4"',
+                 "Cache-Control": "no-store"})
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
@@ -1425,6 +1467,21 @@ def torrent_files_preview(req: TorrentRequest):
             "total_size": sum(f["size"] for f in files)}
 
 
+def _selected_size(torrent_path: str, select=None) -> int:
+    """Сколько байт займут выбранные файлы раздачи (select — 1-based индексы,
+    None — вся раздача). 0, если метаданных нет или они не читаются: для
+    голого magnet размер заранее не известен, тогда проверяем только запас
+    свободного места."""
+    if not torrent_path or torrent_path.startswith("magnet:"):
+        return 0
+    try:
+        files = _torrent_file_list(Path(torrent_path))
+    except Exception:
+        return 0
+    return sum(f["size"] for f in files
+               if select is None or f["index"] in set(select))
+
+
 @app.post("/api/torrent", dependencies=[Depends(check_password)])
 def torrent_add(req: TorrentRequest):
     source = None
@@ -1444,7 +1501,9 @@ def torrent_add(req: TorrentRequest):
     else:
         source = _resolve_torrent_source(req.magnet, req.detail)
         title = _magnet_name(source)
-    _require_disk_space()
+    # Размер выбранных файлов известен заранее (метаданные уже на диске) —
+    # проверяем место сразу, а не ловим забитый диск посреди закачки.
+    _require_disk_space(_selected_size(source, select))
     if _count_active(JOBS, JOBS_LOCK,
                      ("queued", "downloading", "processing")) >= JOB_CEILING:
         raise HTTPException(429, "Сейчас слишком много загрузок — попробуйте позже.")
@@ -1531,6 +1590,8 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
         raise HTTPException(400, "Не выбраны файлы для докачки")
     selected = _selected_indices(job_dir) or set()
     select = sorted(selected | add)
+    # Место нужно только под ДОбавленные файлы — уже скачанные лежат на диске.
+    _require_disk_space(_selected_size(str(meta), sorted(add)))
     with JOBS_LOCK:
         JOBS[safe] = {
             "state": "queued", "percent": None, "speed": None,

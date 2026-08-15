@@ -454,9 +454,11 @@ def main():
         assert rows == {"Episode.mkv"}, rows
 
         # --- 21. /api/play: нативный формат отдаётся сразу inline с верным
-        # Content-Type; не нативный (mkv) без кэша просит подождать (409) и
-        # запускает remux в фоне — если ffmpeg недоступен, следующий запрос
-        # получает понятную 500 (аналогично «aria2 не установлен») ---
+        # Content-Type; не нативный (mkv) перепаковывается на лету, БЕЗ
+        # кэш-файла на диске (раньше один просмотр 8-гигового фильма съедал
+        # ещё 8 ГБ на диске VM и заставлял ждать конца перепаковки). probe=1
+        # отдаёт плееру справку (нативный ли формат + длительность для своего
+        # ползунка), а без ffmpeg приходит понятная 500 ---
         play_native_dir = tmp / "jobplaynative"
         play_native_dir.mkdir()
         (play_native_dir / "movie.mp4").write_bytes(b"x" * 10)
@@ -468,20 +470,25 @@ def main():
         play_mkv_dir = tmp / "jobplaymkv"
         play_mkv_dir.mkdir()
         (play_mkv_dir / "movie.mkv").write_bytes(b"x" * 10)
-        old_ffmpeg = appmod.FFMPEG_BIN
+        old_ffmpeg, old_ffprobe = appmod.FFMPEG_BIN, appmod.FFPROBE_BIN
         appmod.FFMPEG_BIN = "definitely-not-a-real-ffmpeg-binary"
+        appmod.FFPROBE_BIN = "definitely-not-a-real-ffprobe-binary"
         try:
-            r = client.get("/api/play/jobplaymkv")
-            assert r.status_code == 409, r.text   # готовим — попробуйте ещё раз
-            time.sleep(0.5)
+            r = client.get("/api/play/jobplaynative", params={"probe": 1})
+            assert r.status_code == 200 and r.json()["native"] is True, r.text
+
+            r = client.get("/api/play/jobplaymkv", params={"probe": 1})
+            assert r.status_code == 200, r.text
+            assert r.json()["native"] is False, r.text
+            assert r.json()["duration"] is None, r.text   # ffprobe нет — это ок
+
             r = client.get("/api/play/jobplaymkv")
             assert r.status_code == 500, r.text
             assert "ffmpeg" in r.json()["detail"].lower(), r.text
-            # кэш не создался — следующая попытка снова стартует конвертацию,
-            # а не залипает в вечной ошибке
+            # никакого кэша рядом с исходником больше не появляется
             assert not appmod._play_cache_path(play_mkv_dir / "movie.mkv").exists()
         finally:
-            appmod.FFMPEG_BIN = old_ffmpeg
+            appmod.FFMPEG_BIN, appmod.FFPROBE_BIN = old_ffmpeg, old_ffprobe
 
         # --- 22. Реальный баг: aria2 (--file-allocation=none) пишет куски
         # вразнобой, и как только записан ПОСЛЕДНИЙ кусок, st_size файла
@@ -515,6 +522,26 @@ def main():
             assert appmod._torrent_status_files(sparse_dir)[0]["percent"] == 100
         else:
             print("  (п.22: sparse-проверка пропущена — не Unix)")
+
+        # --- 23. Место на диске: /api/files отдаёт свободно/всего (сайт
+        # показывает это в шапке «Файлы на сервере»), а _require_disk_space
+        # умеет проверять не только запас, но и конкретный нужный объём —
+        # чтобы не начинать раздачу, которая заведомо не влезет ---
+        disk = client.get("/api/files").json()["disk"]
+        assert disk["total"] > 0 and disk["free"] > 0, disk
+        appmod._require_disk_space()             # запас есть — не бросает
+        appmod._require_disk_space(1024)         # килобайт тоже влезет
+        try:
+            appmod._require_disk_space(10 ** 18)   # эксабайт — точно нет
+            raise AssertionError("должно было отказать по месту")
+        except Exception as e:
+            assert getattr(e, "status_code", None) == 507, e
+            assert "не хватит места" in str(e.detail).lower(), e.detail
+
+        # сумма выбранных файлов раздачи (meta из п.1: MyShow 100/200/300)
+        assert appmod._selected_size(str(meta), [1, 3]) == 400
+        assert appmod._selected_size(str(meta), None) == 600     # вся раздача
+        assert appmod._selected_size("magnet:?xt=urn:btih:ABC") == 0  # размер не известен
 
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:
