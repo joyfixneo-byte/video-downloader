@@ -902,14 +902,12 @@ def _remux_stream(src: Path, start: float = 0.0):
         proc.stdout.close()
 
 
-@app.get("/api/play/{job_id}")
-def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0):
-    """Просмотр в браузере. probe=1 — только справка о файле (нативный ли
-    формат и длительность), чтобы фронт решил, нужен ли свой ползунок.
-    t — с какой секунды начать поток (перемотка для не нативных форматов)."""
-    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
-    target = _resolve_ready_file(job_dir, path)
+def _play_response(target: Path, t: float = 0.0, probe: int = 0):
+    """Ответ плеера для готового файла. probe=1 — только справка о файле
+    (нативный ли формат и длительность), чтобы фронт решил, нужен ли свой
+    ползунок. t — с какой секунды начать поток (перемотка для не нативных).
+    Общая логика для /api/play (загрузки) и /api/library/play (SMB-витрина):
+    откуда взялся файл — не важно, дальше всё одинаково."""
     native = target.suffix.lower() in NATIVE_PLAYABLE
 
     if probe:
@@ -929,6 +927,13 @@ def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0):
         headers={"Content-Disposition":
                  f'inline; filename="{_safe_name(target.stem)}.mp4"',
                  "Cache-Control": "no-store"})
+
+
+@app.get("/api/play/{job_id}")
+def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0):
+    """Просмотр в браузере файла загрузки/раздачи (см. _play_response)."""
+    safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
+    return _play_response(_resolve_ready_file(DOWNLOAD_DIR / safe, path), t, probe)
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
@@ -1348,6 +1353,12 @@ def _selected_indices(job_dir: Path):
     return {int(x) for x in f.read_text().split(",") if x.strip()}
 
 
+def _natkey(s: str):
+    """Ключ «человеческой» сортировки имён: S01E2 раньше S01E10 (цифры
+    сравниваем как числа, а не как строки)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
 def _torrent_status_files(job_dir: Path) -> list[dict]:
     """Файлы раздачи с признаком done (см. _file_done — уже докачан, а не
     вся раздача целиком) и selected (участвует в текущей загрузке). Если для
@@ -1383,14 +1394,14 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         # по соседнему .aria2 (годится только для одиночного файла, см. _file_done).
         rows = [_row(rel, size, size, _file_done(job_dir / rel))
                 for rel, size in on_disk.items()]
-        return sorted(rows, key=lambda x: -x["size"])
+        return sorted(rows, key=lambda x: _natkey(x["path"]))
 
     try:
         expected = _torrent_file_list(meta)
     except Exception:
         rows = [_row(rel, size, size, _file_done(job_dir / rel))
                 for rel, size in on_disk.items()]
-        return sorted(rows, key=lambda x: -x["size"])
+        return sorted(rows, key=lambda x: _natkey(x["path"]))
     selected = _selected_indices(job_dir)
     items = []
     for f in expected:
@@ -1403,7 +1414,10 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         done = downloaded is not None and downloaded >= f["size"]
         items.append(_row(f["path"], f["size"], downloaded or 0, done,
                           index=f["index"], selected=is_selected))
-    items.sort(key=lambda x: -x["size"])
+    # Порядок как в самой раздаче (index): серии идут подряд 1,2,3… Раньше
+    # сортировали по размеру — порядок серий перемешивался. Другие сортировки
+    # (имя/размер/статус) фронт делает сам по клику на заголовок.
+    items.sort(key=lambda x: x["index"])
     return items
 
 
@@ -1739,6 +1753,18 @@ def library_file(name: str):
         raise HTTPException(404, "Файл не найден")
     return FileResponse(
         target, filename=target.name, media_type="application/octet-stream")
+
+
+@app.get("/api/library/play")
+def library_play(name: str, t: float = 0.0, probe: int = 0):
+    """Просмотр файла витрины в браузере — та же логика, что и для загрузок
+    (см. _play_response): mp4 отдаём как есть, mkv перепаковываем на лету.
+    Без пароля, как /api/library/file: <video> не умеет слать заголовок с
+    паролем, а имя файла видно только из защищённого паролем /api/library."""
+    target = _safe_share_file(name)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "Файл не найден")
+    return _play_response(target, t, probe)
 
 
 class LibraryDeleteRequest(BaseModel):

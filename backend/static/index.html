@@ -143,6 +143,8 @@
   .tfile-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 2px;
          border-bottom:1px solid var(--line); font-size:13px; }
   .tfile-row:last-child { border-bottom:none; }
+  .tfile-head { color:var(--muted); font-size:12px; user-select:none; }
+  .tfile-head span { cursor:pointer; }
   .tfile-name { flex:1; word-break:break-word; }
   .tfile-size { color:var(--muted); white-space:nowrap; }
   .tfile-status { white-space:nowrap; }
@@ -1301,8 +1303,19 @@ const resumeBtn = jobId =>
   `<button class="ghost small" onclick="resumeJob('${jobId}', this)">▶ Продолжить</button>`;
 const recheckBtn = jobId =>
   `<button class="ghost small" onclick="resumeJob('${jobId}', this, true)">🔁 Перечитать хэш</button>`;
+// JS-аргумент внутрь HTML-атрибута onclick: JSON-строка + экранирование
+// кавычек как сущностей. Без этого имя файла с " или ' рвало атрибут и
+// кнопка «Смотреть» переставала работать.
+const attr = v => escapeHtml(JSON.stringify(v));
+
 const playBtn = (jobId, path, name) =>
-  `<button class="ghost small" onclick="openPlayer('${jobId}', ${JSON.stringify(path)}, ${JSON.stringify(name)})">▶ Смотреть</button>`;
+  `<button class="ghost small" onclick="openPlayer(${attr(playUrl(jobId, path))}, ${attr(name)})">▶ Смотреть</button>`;
+
+// Префикс ссылки плеера: заканчивается на ? или &, дальше дописываются
+// probe=1 / t=<секунда>. Два источника — загрузка на сервере и файл витрины.
+const playUrl = (jobId, path) =>
+  "/api/play/" + jobId + (path ? "?path=" + encodeURIComponent(path) + "&" : "?");
+const libPlayUrl = name => "/api/library/play?name=" + encodeURIComponent(name) + "&";
 
 // Кнопка «В библиотеку» — только если SMB-витрина настроена. Иначе пусто.
 const libBtn = jobId => LIBRARY_ENABLED
@@ -1352,9 +1365,8 @@ function fmtClock(sec) {
   return (h ? h + ":" : "") + mm + ":" + ss;
 }
 
-async function openPlayer(jobId, path, name) {
+async function openPlayer(base, name) {
   closePlayer();
-  const base = "/api/play/" + jobId + (path ? "?path=" + encodeURIComponent(path) + "&" : "?");
   const ov = document.createElement("div");
   ov.id = "playerOverlay";
   ov.className = "player-overlay";
@@ -1430,23 +1442,57 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   det.innerHTML = '<summary>Файлы в раздаче</summary>'
     + '<div class="tfiles-body muted" style="font-size:13px;padding:6px 2px;">Загрузка…</div>';
 
-  const refresh = async () => {
+  // Состояние таблички живёт в замыкании — переживает автообновление раз в 2с.
+  // По умолчанию порядок как в раздаче (его отдаёт сервер) и без пропущенных
+  // файлов: их бывает много, и они мешают видеть, что качается.
+  let files = [];
+  let sort = { field: "index", dir: 1 };
+  let showSkipped = false;
+
+  const idx = f => (f.index == null ? 0 : f.index);
+  const rank = f => (f.done ? 0 : (f.selected === false ? 2 : 1));
+  const byName = (a, b) => a.path.localeCompare(b.path, undefined, { numeric: true });
+  const CMP = {
+    name: byName,
+    size: (a, b) => a.size - b.size,
+    status: (a, b) => rank(a) - rank(b) || idx(a) - idx(b),
+    index: (a, b) => idx(a) - idx(b) || byName(a, b),
+  };
+  const arrow = field => (sort.field === field ? (sort.dir > 0 ? " ▲" : " ▼") : "");
+
+  const render = () => {
     const body = det.querySelector(".tfiles-body");
-    try {
-      const { files } = await api("/api/torrent/" + jobId + "/files");
-      if (!files.length) {
-        body.className = "tfiles-body muted";
-        body.textContent = "Файлы не найдены.";
-      } else {
-        body.className = "tfiles-body";
-        body.innerHTML = files.map(f => {
+    if (!files.length) {
+      body.className = "tfiles-body muted";
+      body.textContent = "Файлы не найдены.";
+      return;
+    }
+    body.className = "tfiles-body";
+    const skipped = files.filter(f => f.selected === false).length;
+    const shown = (showSkipped ? files : files.filter(f => f.selected !== false))
+      .slice().sort((a, b) => CMP[sort.field](a, b) * sort.dir);
+    const head = `<div class="tfile-row tfile-head">
+        <span class="tfile-name" data-sort="name">Имя${arrow("name")}</span>
+        <span class="tfile-size" data-sort="size">Размер${arrow("size")}</span>
+        <span class="tfile-status" data-sort="status">Статус${arrow("status")}</span>
+        <span class="tfile-actions" data-sort="index">№${arrow("index")}</span>
+      </div>`;
+    const foot = skipped
+      ? `<div class="tfile-row" style="border-bottom:none">
+           <button class="ghost small" data-act="skipped">${showSkipped
+             ? "▾ Скрыть пропущенные"
+             : "▸ Показать пропущенные (" + skipped + ")"}</button>
+         </div>`
+      : "";
+    const rows = shown.length
+      ? shown.map(f => {
           const dlHref = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
           let status, actions, bar = "";
           if (f.done) {
             status = '<span class="done">✓ готово</span>';
             actions = `<a class="dl small" href="${dlHref}" download>⬇</a>`
-              + `<button class="ghost small" onclick='openPlayer(${JSON.stringify(jobId)}, `
-              + `${JSON.stringify(f.path)}, ${JSON.stringify(f.path)})'>▶</button>`
+              + `<button class="ghost small" onclick="openPlayer(`
+              + `${attr(playUrl(jobId, f.path))}, ${attr(f.path)})">▶</button>`
               + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">🗑</button>`;
           } else if (f.selected === false) {
             status = '<span class="muted">не выбран</span>';
@@ -1471,10 +1517,18 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
             <span class="tfile-actions">${actions}</span>
             ${bar}
           </div>`;
-        }).join("");
-      }
+        }).join("")
+      : '<div class="tfile-row muted">Все файлы раздачи пропущены.</div>';
+    body.innerHTML = head + rows + foot;
+  };
+
+  const refresh = async () => {
+    try {
+      files = (await api("/api/torrent/" + jobId + "/files")).files;
+      render();
     } catch (e) {
-      body.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+      det.querySelector(".tfiles-body").innerHTML =
+        `<span class="err">⚠ ${e.message}</span>`;
     }
     const active = ["queued", "downloading", "processing"].includes(container.dataset.jobState);
     if (det.open && active) setTimeout(refresh, 2000);
@@ -1484,10 +1538,24 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   det.addEventListener("toggle", () => { if (det.open) refresh(); });
 
   // Делегируем клики по кнопкам строк (докачать/удалить) — так не нужно
-  // экранировать пути файлов внутри onclick-атрибутов.
+  // экранировать пути файлов внутри onclick-атрибутов. Заголовки (сортировка)
+  // и «показать пропущенные» перерисовывают табличку из уже полученных
+  // данных, без запроса к серверу.
   det.addEventListener("click", async (ev) => {
+    const th = ev.target.closest("[data-sort]");
+    if (th) {
+      const f = th.dataset.sort;
+      sort = { field: f, dir: sort.field === f ? -sort.dir : 1 };
+      render();
+      return;
+    }
     const btn = ev.target.closest("button[data-act]");
     if (!btn) return;
+    if (btn.dataset.act === "skipped") {
+      showSkipped = !showSkipped;
+      render();
+      return;
+    }
     btn.disabled = true;
     try {
       if (btn.dataset.act === "del") {
@@ -1727,15 +1795,18 @@ async function loadLibrary() {
         `<div class="name">${escapeHtml(f.name)}</div>
          <div class="meta">${fmtSize(f.size)}</div>
          <div class="controls">
+           <button class="ghost small" data-act="play">▶ Смотреть</button>
            <a class="dl" href="${href}">⬇ Скачать</a>
-           <button class="ghost small">🗑 Удалить</button>
+           <button class="ghost small" data-act="del">🗑 Удалить</button>
          </div>`;
       // Имя файла произвольное (кавычки, апострофы) — вешаем обработчики через
       // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
       el.querySelector(".dl").addEventListener(
         "click", ev => { ev.preventDefault();
           saveFile(href, f.name, ev.currentTarget); });
-      el.querySelector("button").addEventListener(
+      el.querySelector('[data-act="play"]').addEventListener(
+        "click", () => openPlayer(libPlayUrl(f.name), f.name));
+      el.querySelector('[data-act="del"]').addEventListener(
         "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
       list.appendChild(el);
     });

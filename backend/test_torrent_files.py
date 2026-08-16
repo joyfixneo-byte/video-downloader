@@ -543,6 +543,54 @@ def main():
         assert appmod._selected_size(str(meta), None) == 600     # вся раздача
         assert appmod._selected_size("magnet:?xt=urn:btih:ABC") == 0  # размер не известен
 
+        # --- 24. Порядок файлов раздачи — как в самом торренте (index), а не
+        # по размеру: иначе серии в табличке шли вперемешку. Без метаданных
+        # (плоский список с диска) — по имени, с числами как числами ---
+        order_dir = tmp / "joborder"
+        order_sub = order_dir / "OrderShow"
+        order_sub.mkdir(parents=True)
+        order_dir.joinpath(".meta.torrent").write_bytes(make_torrent(
+            "OrderShow", [("E01.mkv", 300), ("E02.mkv", 100), ("E03.mkv", 200)]))
+        paths = [f["path"] for f in appmod._torrent_status_files(order_dir)]
+        assert paths == ["OrderShow/E01.mkv", "OrderShow/E02.mkv",
+                         "OrderShow/E03.mkv"], paths
+
+        flat_dir = tmp / "jobflat"
+        flat_dir.mkdir()
+        for n, size in (("E10.mkv", 300), ("E2.mkv", 100), ("E1.mkv", 200)):
+            (flat_dir / n).write_bytes(b"x" * size)
+        flat = [f["path"] for f in appmod._torrent_status_files(flat_dir)]
+        assert flat == ["E1.mkv", "E2.mkv", "E10.mkv"], flat   # E2 раньше E10
+
+        # --- 25. /api/library/play: просмотр файла SMB-витрины тем же плеером
+        # (общая логика с /api/play — см. _play_response), с той же защитой от
+        # выхода за пределы шары, что и у /api/library/file ---
+        share3 = tmp / "share3"
+        share3.mkdir()
+        appmod.SHARE_PATH = share3
+        # ffprobe подменяем, как в п.21: иначе probe=1 зовёт настоящий ffprobe
+        # на 10-байтовом «файле», и тест зависит от того, что стоит на машине.
+        appmod.FFPROBE_BIN = "definitely-not-a-real-ffprobe-binary"
+        try:
+            (share3 / "movie.mp4").write_bytes(b"x" * 10)
+            r = client.get("/api/library/play", params={"name": "movie.mp4"})
+            assert r.status_code == 200, r.text
+            assert r.headers["content-type"].startswith("video/mp4"), r.headers
+            assert "inline" in r.headers.get("content-disposition", ""), r.headers
+
+            r = client.get("/api/library/play",
+                            params={"name": "movie.mp4", "probe": 1})
+            assert r.json()["native"] is True, r.text
+            assert r.json()["name"] == "movie.mp4", r.text
+
+            r = client.get("/api/library/play", params={"name": "../../etc/passwd"})
+            assert r.status_code in (400, 404), r.text   # за пределы шары нельзя
+            r = client.get("/api/library/play", params={"name": "нет-такого.mp4"})
+            assert r.status_code == 404, r.text
+        finally:
+            appmod.SHARE_PATH = None
+            appmod.FFPROBE_BIN = old_ffprobe
+
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
