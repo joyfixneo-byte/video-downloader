@@ -10,4 +10,7 @@ venv/
 # Локальные настройки
 .env
 
-.claude/
+# Локальные настройки Claude (launch.json, settings.local.json) — не в репо,
+# а вот слэш-команды (.claude/commands/) versioned: это общий контекст задач.
+.claude/*
+!.claude/commands/
