@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Скачать видео</title>
+<script>
+  // Тему ставим до отрисовки — иначе при тёмной теме страница успевает
+  // моргнуть светлым. Пусто/нет ключа = «авто» (как в системе).
+  (function () {
+    var t = localStorage.getItem("theme");
+    if (t) document.documentElement.dataset.theme = t;
+  })();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -22,6 +30,7 @@
     --red:#dc2626; --red-hover:#b91c1c; --red-soft:#fef2f2;
 
     /* Семантические токены (светлая тема) */
+    color-scheme: light;
     --bg:var(--g5); --surface:var(--g0); --surface-2:var(--g10);
     --text:var(--g90); --text-2:var(--g50); --text-3:var(--g40);
     --border:var(--g20); --border-strong:var(--g30);
@@ -35,8 +44,13 @@
     --font:"Inter", "Pretendard", system-ui, -apple-system, "Segoe UI",
            Roboto, "Helvetica Neue", Arial, sans-serif;
   }
+  /* Тёмная тема. Два блока с одинаковыми токенами — иначе никак:
+     :not([data-theme=light]) даёт «авто» (как в системе) и позволяет
+     переключателю принудительно включить светлую, а [data-theme=dark] —
+     принудительно тёмную независимо от системной настройки. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
       --bg:var(--g100); --surface:var(--g90); --surface-2:var(--g80);
       --text:var(--g5); --text-2:var(--g40); --text-3:var(--g50);
       --border:var(--g80); --border-strong:var(--g70);
@@ -44,6 +58,15 @@
       --solid:var(--g5); --solid-hover:var(--g20); --on-solid:var(--g90);
       --danger:#f87171;
     }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:var(--g100); --surface:var(--g90); --surface-2:var(--g80);
+    --text:var(--g5); --text-2:var(--g40); --text-3:var(--g50);
+    --border:var(--g80); --border-strong:var(--g70);
+    --accent:#ef4444; --accent-hover:#dc2626;
+    --solid:var(--g5); --solid-hover:var(--g20); --on-solid:var(--g90);
+    --danger:#f87171;
   }
   * { box-sizing: border-box; }
   html, body { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
@@ -56,8 +79,10 @@
     touch-action: manipulation;
   }
   .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 96px; }
+  .head { display:flex; align-items:center; justify-content:space-between;
+          gap:16px; margin-bottom:8px; }
   h1 { font-size:32px; line-height:40px; font-weight:700; letter-spacing:-.02em;
-       margin: 0 0 8px; }
+       margin: 0; }
   .sub { color:var(--text-2); font-size:15px; line-height:22px;
          margin: 0 0 32px; max-width:62ch; }
 
@@ -239,7 +264,11 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Скачать видео</h1>
+  <div class="head">
+    <h1>Скачать видео</h1>
+    <button type="button" class="ghost small" id="themeBtn"
+            onclick="cycleTheme()">Тема: авто</button>
+  </div>
   <p class="sub">Вставь ссылку на страницу с видео — выбери серию и качество.
      Готовые файлы удаляются с сервера через 3 часа после загрузки
      (торренты — только вручную).</p>
@@ -501,7 +530,28 @@ async function savePw() {
   btn.disabled = false;
 }
 
+// --- Переключатель темы ----------------------------------------------------
+// Три состояния по кругу: авто (как в системе) → светлая → тёмная.
+// Выбор хранится в localStorage и применяется до отрисовки (скрипт в <head>).
+const THEMES = ["", "light", "dark"];
+const THEME_NAMES = { "": "авто", light: "светлая", dark: "тёмная" };
+
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+  document.getElementById("themeBtn").textContent = "Тема: " + THEME_NAMES[t];
+}
+
+function cycleTheme() {
+  const cur = localStorage.getItem("theme") || "";
+  const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+  if (next) localStorage.setItem("theme", next);
+  else localStorage.removeItem("theme");
+  applyTheme(next);
+}
+
 async function init() {
+  applyTheme(localStorage.getItem("theme") || "");   // подписать кнопку темы
   let cfg = { password_required: false };
   try { cfg = await fetch("/api/config").then(r => r.json()); } catch (e) {}
   if (!cfg.password_required) {        // пароль не настроен — открыто всё
