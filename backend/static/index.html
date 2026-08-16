@@ -4,217 +4,242 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Скачать видео</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  /* Оформление по Apple Human Interface Guidelines:
-     системный шрифт (SF Pro), системные цвета тёмной темы, материалы,
-     единая сетка размеров и минимальная цель нажатия 44pt для всех
-     интерактивных элементов (кнопки, чекбоксы, поля, строки списков). */
+  /* Оформление по Buzzvil Design System: grayscale — основная палитра,
+     красный — акцент и используется скупо (только главные действия и
+     ошибки). Высокий контраст, никаких декоративных элементов: ни
+     градиентов, ни теней, ни блюра — плоские поверхности и рамка 1px.
+     Шрифт Inter. Тема следует системной (принцип Adaptive). */
   :root {
-    /* Системные цвета iOS/macOS, тёмная тема */
-    --bg:#000; --bg-2:#1c1c1e; --bg-3:#2c2c2e;
-    --label:#fff; --label-2:rgba(235,235,245,.60); --label-3:rgba(235,235,245,.30);
-    --fill:rgba(120,120,128,.36); --fill-2:rgba(120,120,128,.24);
-    --sep:rgba(84,84,88,.65);
-    --tint:#0a84ff;                 /* systemBlue — акцент приложения */
-    --green:#30d158; --red:#ff453a; /* systemGreen / systemRed */
-    /* Единая шкала размеров: всё кратно 4pt, цели нажатия — 44pt */
-    --hit:44px; --hit-sm:34px;
-    --r-card:16px; --r-ctl:12px; --r-sm:9px;
-    --font:-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-           "Segoe UI", system-ui, Roboto, "Helvetica Neue", sans-serif;
+    /* Grayscale Buzzvil */
+    --g0:#fff;    --g5:#fafafa; --g10:#f5f5f5; --g20:#e5e5e5; --g30:#d4d4d4;
+    --g40:#a3a3a3; --g50:#737373; --g60:#525252; --g70:#404040; --g80:#262626;
+    --g90:#171717; --g100:#0a0a0a;
+    /* Accent Red — не больше ~10% интерфейса */
+    --red:#dc2626; --red-hover:#b91c1c; --red-soft:#fef2f2;
+
+    /* Семантические токены (светлая тема) */
+    --bg:var(--g5); --surface:var(--g0); --surface-2:var(--g10);
+    --text:var(--g90); --text-2:var(--g50); --text-3:var(--g40);
+    --border:var(--g20); --border-strong:var(--g30);
+    --accent:var(--red); --accent-hover:var(--red-hover); --on-accent:#fff;
+    --solid:var(--g90); --solid-hover:var(--g70); --on-solid:#fff;
+    --danger:#b91c1c;
+
+    /* Сетка размеров */
+    --hit:44px; --hit-sm:36px;
+    --r:10px; --r-ctl:8px; --r-sm:6px;
+    --font:"Inter", "Pretendard", system-ui, -apple-system, "Segoe UI",
+           Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:var(--g100); --surface:var(--g90); --surface-2:var(--g80);
+      --text:var(--g5); --text-2:var(--g40); --text-3:var(--g50);
+      --border:var(--g80); --border-strong:var(--g70);
+      --accent:#ef4444; --accent-hover:#dc2626;
+      --solid:var(--g5); --solid-hover:var(--g20); --on-solid:var(--g90);
+      --danger:#f87171;
+    }
   }
   * { box-sizing: border-box; }
   html, body { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
   body {
-    margin:0; min-height:100vh; color:var(--label);
-    font:400 17px/22px var(--font);          /* HIG Body */
+    margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+    font:400 16px/24px var(--font);
+    -webkit-font-smoothing:antialiased;
     /* Запрещаем двойной тап-зум и удержание-выделение — на телефоне
        случайный промах по кнопке больше не зумит и не ломает игру. */
     touch-action: manipulation;
-    background:
-      radial-gradient(900px 700px at 15% -10%, rgba(10,132,255,.16) 0%, rgba(10,132,255,0) 60%),
-      radial-gradient(760px 640px at 100% 105%, rgba(94,92,230,.14) 0%, rgba(94,92,230,0) 60%),
-      var(--bg);
-    background-attachment: fixed;
   }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 96px; }
-  h1 { font-size:34px; line-height:41px; font-weight:700; letter-spacing:.37px;
-       margin: 0 0 8px; color:var(--label); }            /* HIG Large Title */
-  .sub { color:var(--label-2); font-size:15px; line-height:20px;
-         margin: 0 0 24px; max-width:62ch; }             /* HIG Subheadline */
+  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 96px; }
+  h1 { font-size:32px; line-height:40px; font-weight:700; letter-spacing:-.02em;
+       margin: 0 0 8px; }
+  .sub { color:var(--text-2); font-size:15px; line-height:22px;
+         margin: 0 0 32px; max-width:62ch; }
 
-  /* Карточка = сгруппированная секция на «толстом материале» */
-  .card { background:rgba(28,28,30,.72);
-          -webkit-backdrop-filter:saturate(180%) blur(20px);
-          backdrop-filter:saturate(180%) blur(20px);
-          border:1px solid var(--sep); border-radius:var(--r-card);
-          padding:16px; margin-bottom:12px; }
+  /* Карточка — плоская поверхность с рамкой, без тени и блюра */
+  .card { background:var(--surface); border:1px solid var(--border);
+          border-radius:var(--r); padding:20px; margin-bottom:12px; }
 
-  /* Заголовок секции — как в сгруппированных списках iOS */
-  label { display:block; font-size:13px; line-height:18px; color:var(--label-2);
-          margin-bottom:8px; text-transform:uppercase; letter-spacing:.5px;
-          font-weight:600; }
+  /* Заголовок секции */
+  label { display:block; font-size:12px; line-height:16px; font-weight:600;
+          text-transform:uppercase; letter-spacing:.06em;
+          color:var(--text-2); margin-bottom:10px; }
   /* Строки-переключатели тоже <label>, но это не заголовки секций */
   label.ep, label.tc-toggle, label.check-row {
           text-transform:none; letter-spacing:normal; margin-bottom:0; }
 
   input[type=text], input[type=password], select, textarea.ttext {
-    width:100%; min-height:var(--hit); padding:11px 14px; border-radius:var(--r-ctl);
-    border:1px solid var(--sep); background:var(--fill-2); color:var(--label);
-    font:400 17px/22px var(--font); outline:none;
-    transition:border-color .15s ease, box-shadow .15s ease; }
-  input::placeholder, textarea::placeholder { color:var(--label-3); }
-  input:focus, select:focus, textarea.ttext:focus {
-    border-color:var(--tint); box-shadow:0 0 0 3px rgba(10,132,255,.30); }
-  :focus-visible { outline:2px solid var(--tint); outline-offset:2px; }
+    width:100%; min-height:var(--hit); padding:10px 12px;
+    border:1px solid var(--border-strong); border-radius:var(--r-ctl);
+    background:var(--surface); color:var(--text);
+    font:400 16px/24px var(--font); outline:none;
+    transition:border-color .12s linear; }
+  input::placeholder, textarea::placeholder { color:var(--text-3); }
+  input:focus, select:focus, textarea.ttext:focus { border-color:var(--text); }
+  :focus-visible { outline:2px solid var(--text); outline-offset:2px; }
 
-  /* Чекбокс — 22pt кружок с галочкой, как в списках iOS: тот же масштаб,
-     что у остального интерфейса (нативный ~13px выглядел крошечным),
-     цель нажатия добирается высотой всей строки .ep. */
+  /* Чекбокс — 22px квадрат в цвет текста: тот же масштаб, что у интерфейса
+     (нативный ~13px терялся). Цель нажатия добирается высотой строки .ep. */
   input[type=checkbox] {
     -webkit-appearance:none; appearance:none; margin:0; flex:0 0 auto;
-    width:22px; height:22px; border-radius:50%; cursor:pointer;
-    border:1.5px solid var(--label-3); background:transparent;
+    width:22px; height:22px; border-radius:var(--r-sm); cursor:pointer;
+    border:1.5px solid var(--border-strong); background:var(--surface);
     display:inline-grid; place-content:center;
-    transition:background-color .15s ease, border-color .15s ease; }
-  input[type=checkbox]:checked { background:var(--tint); border-color:var(--tint); }
+    transition:background-color .12s linear, border-color .12s linear; }
+  input[type=checkbox]:checked { background:var(--solid); border-color:var(--solid); }
   input[type=checkbox]:checked::after {
-    content:""; width:6px; height:11px; margin-top:-2px;
-    border:2px solid #fff; border-top:0; border-left:0; transform:rotate(45deg); }
-  input[type=range] { accent-color:var(--tint); height:28px; }
+    content:""; width:5px; height:10px; margin-top:-2px;
+    border:2px solid var(--on-solid); border-top:0; border-left:0;
+    transform:rotate(45deg); }
+  input[type=range] { accent-color:var(--solid); height:28px; }
 
-  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; }
   .row > div { flex:1; min-width:160px; }
 
-  /* Кнопки — плоские, как в HIG: заливка tint, нажатие = приглушение */
-  button { font:600 17px/1 var(--font); min-height:var(--hit); padding:0 18px;
-           border-radius:var(--r-ctl); border:none; cursor:pointer; white-space:nowrap;
-           display:inline-flex; align-items:center; justify-content:center; gap:6px;
-           background:var(--tint); color:#fff;
-           transition:opacity .15s ease, background-color .15s ease; }
-  button:hover:not(:disabled) { opacity:.85; }
-  button:active:not(:disabled) { opacity:.6; }
-  button:disabled { opacity:.35; cursor:default; }
-  /* Вторичные действия — «малый» размер контрола: та же высота 44pt,
-     но компактнее по тексту, чтобы ряд кнопок помещался в строку. */
-  button.ghost { background:var(--fill-2); color:var(--label);
-           font-size:15px; padding:0 14px; }
+  /* Кнопки. Главное действие — акцентный красный, вторичные — рамка.
+     Ни теней, ни градиентов. */
+  button { font:600 15px/1 var(--font); min-height:var(--hit); padding:0 16px;
+           border:1px solid transparent; border-radius:var(--r-ctl);
+           cursor:pointer; white-space:nowrap;
+           display:inline-flex; align-items:center; justify-content:center;
+           background:var(--accent); color:var(--on-accent);
+           transition:background-color .12s linear, border-color .12s linear; }
+  button:hover:not(:disabled) { background:var(--accent-hover); }
+  button:disabled { opacity:.4; cursor:default; }
+  button.ghost { background:transparent; color:var(--text);
+           border-color:var(--border-strong); font-size:14px; padding:0 14px; }
+  button.ghost:hover:not(:disabled) { background:var(--surface-2); }
   button.small, a.dl.small { min-height:var(--hit-sm); padding:0 12px;
-           font-size:15px; border-radius:var(--r-sm); }
+           font-size:14px; border-radius:var(--r-sm); }
 
-  .hint { font-size:13px; line-height:18px; color:var(--label-2); margin-top:8px; }
+  .hint { font-size:14px; line-height:20px; color:var(--text-2); margin-top:10px; }
 
-  /* Переключатель вкладок — сегментированный контрол iOS */
-  .tabs { display:flex; gap:2px; padding:2px; margin-bottom:16px;
-          background:var(--fill-2); border-radius:var(--r-ctl); }
-  .tab-btn { flex:1; min-height:36px; padding:0 12px; border-radius:8px;
-         background:transparent; color:var(--label); font-weight:500; font-size:15px; }
-  .tab-btn.active { background:var(--bg-3); font-weight:600;
-         box-shadow:0 3px 8px rgba(0,0,0,.24), 0 3px 1px rgba(0,0,0,.06); }
+  /* Вкладки — подчёркивание, без заливки */
+  .tabs { display:flex; gap:24px; margin-bottom:20px;
+          border-bottom:1px solid var(--border); }
+  .tab-btn { background:none; border:none; border-radius:0; padding:0 0 12px;
+         min-height:0; height:44px; color:var(--text-2); font-size:15px;
+         font-weight:500; border-bottom:2px solid transparent;
+         margin-bottom:-1px; }
+  .tab-btn:hover:not(:disabled) { background:none; color:var(--text); }
+  .tab-btn.active { color:var(--text); font-weight:600;
+         border-bottom-color:var(--text); }
 
-  /* Строка списка — высота 44pt, разделитель не заходит под чекбокс */
+  /* Строка списка — высота 44px, разделитель 1px */
   .ep { display:flex; align-items:center; gap:12px; min-height:var(--hit);
-        padding:9px 4px; border-bottom:1px solid var(--sep);
-        font-size:17px; line-height:22px; font-weight:400; color:var(--label);
+        padding:10px 0; border-bottom:1px solid var(--border);
+        font-size:15px; line-height:22px; font-weight:400; color:var(--text);
         cursor:pointer; }
   .ep:last-child { border-bottom:none; }
-  .ep-list { max-height:340px; overflow:auto; margin-top:8px;
+  .ep-list { max-height:340px; overflow:auto; margin-top:4px;
         -webkit-overflow-scrolling:touch; }
 
   .jobs { margin-top:4px; }
-  .job { padding:14px; border-radius:var(--r-ctl); margin-bottom:10px;
-         background:var(--bg-3); }
-  .job .name { font-size:17px; line-height:22px; font-weight:600;
-         margin-bottom:6px; word-break:break-word; }   /* HIG Headline */
+  .job { padding:16px; border:1px solid var(--border); border-radius:var(--r-ctl);
+         margin-bottom:8px; background:var(--surface); }
+  .job .name { font-size:16px; line-height:22px; font-weight:600;
+         margin-bottom:4px; word-break:break-word; }
 
   /* Мини-игра «Тетрис» как экран загрузки */
-  #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:4px 0 8px; }
+  #game { display:flex; flex-direction:column; align-items:center; gap:12px; margin:0; }
   .game-head, .game-bar, .game-next { width:min(100%, 300px); display:flex;
-           align-items:center; gap:8px; font-size:13px; color:var(--label-2); }
+           align-items:center; gap:8px; font-size:13px; color:var(--text-2);
+           font-variant-numeric:tabular-nums; }
   .game-head, .game-bar { justify-content:space-between; }
   .game-btns { display:flex; gap:8px; }
-  #next { background:var(--fill-2); border-radius:8px; }
-  #board { background:#000; border:1px solid var(--sep); border-radius:12px;
-           touch-action:none; }
+  #next { background:var(--surface-2); border-radius:var(--r-sm); }
+  #board { background:var(--surface-2); border:1px solid var(--border);
+           border-radius:var(--r-ctl); touch-action:none; }
   .game-controls { display:flex; gap:8px; }
-  .gbtn { width:64px; height:var(--hit); font-size:20px; color:var(--label);
-          border-radius:var(--r-ctl); background:var(--fill-2); user-select:none; }
-  #gameOver { font-size:15px; color:var(--red); display:flex; gap:8px; align-items:center; }
+  .gbtn { width:64px; height:var(--hit); font-size:18px; color:var(--text);
+          background:transparent; border:1px solid var(--border-strong);
+          border-radius:var(--r-ctl); user-select:none; }
+  .gbtn:hover:not(:disabled) { background:var(--surface-2); }
+  #gameOver { font-size:14px; color:var(--danger); font-weight:500; }
 
-  .meta { font-size:13px; line-height:18px; color:var(--label-2); margin-top:6px; }
-  .done { color:var(--green); }  .err { color:var(--red); }  .muted { color:var(--label-2); }
-  .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .meta { font-size:14px; line-height:20px; color:var(--text-2); margin-top:4px;
+          font-variant-numeric:tabular-nums; }
+  /* Успех — не цветом, а контрастом: grayscale остаётся основной палитрой */
+  .done { color:var(--text); font-weight:600; }
+  .err { color:var(--danger); }
+  .muted { color:var(--text-2); }
+  .controls { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
 
-  /* Готовый файл / копирование — systemGreen */
-  a.dl, button.copy { background:var(--green); color:#fff; }
-  a.dl { display:inline-flex; align-items:center; justify-content:center; gap:6px;
-         min-height:var(--hit); padding:0 18px; border-radius:var(--r-ctl);
-         font:600 17px/1 var(--font); text-decoration:none;
-         transition:opacity .15s ease; }
-  a.dl:hover { opacity:.85; }
-  a.dl:active { opacity:.6; }
+  /* Готовый файл / копирование — сплошная тёмная кнопка (высокий контраст) */
+  a.dl, button.copy { background:var(--solid); color:var(--on-solid);
+         border-color:var(--solid); }
+  a.dl:hover, button.copy:hover:not(:disabled) { background:var(--solid-hover);
+         border-color:var(--solid-hover); }
+  a.dl { display:inline-flex; align-items:center; justify-content:center;
+         min-height:var(--hit); padding:0 16px; border-radius:var(--r-ctl);
+         font:600 15px/1 var(--font); text-decoration:none;
+         transition:background-color .12s linear; }
 
-  textarea.ttext { min-height:220px; margin-top:10px; resize:vertical;
-         font-size:15px; line-height:20px; }
-  .tc-toggle { font-size:13px; color:var(--label-2); display:inline-flex;
+  textarea.ttext { min-height:220px; margin-top:12px; resize:vertical;
+         font-size:15px; line-height:22px; }
+  .tc-toggle { font-size:14px; color:var(--text-2); display:inline-flex;
          align-items:center; gap:8px; min-height:var(--hit-sm); cursor:pointer; }
-  /* Чекбокс в плотной панели кнопок — 20pt, но не мельче */
   .tc-toggle input[type=checkbox] { width:20px; height:20px; }
   .check-row { display:flex; align-items:center; gap:10px; min-height:var(--hit);
-         font-size:15px; line-height:20px; color:var(--label-2);
-         margin:4px 0 0; text-transform:none; letter-spacing:0; font-weight:400;
-         cursor:pointer; }
+         font-size:15px; line-height:22px; color:var(--text-2);
+         margin:8px 0 0; text-transform:none; letter-spacing:normal;
+         font-weight:400; cursor:pointer; }
 
-  ::selection { background:rgba(10,132,255,.35); }
+  ::selection { background:var(--g80); color:var(--g0); }
   /* !important: .hidden — утилита, она должна побеждать любые display:flex
      у классов ниже по файлу (.selbar, .ep, .check-row и т.п.). */
   .hidden { display:none !important; }
-  .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
+  .selbar { display:flex; gap:8px; align-items:center; margin:12px 0 0; flex-wrap:wrap; }
   .selbar .hint, .selbar label { margin:0; }
 
   /* Раскрывающаяся табличка файлов торрент-раздачи (нативный <details>) */
-  details.tfiles { margin-top:10px; }
-  details.tfiles summary { cursor:pointer; font-size:15px; color:var(--tint);
-         list-style:none; min-height:var(--hit-sm); display:flex; align-items:center; }
+  details.tfiles { margin-top:12px; border-top:1px solid var(--border); }
+  details.tfiles summary { cursor:pointer; font-size:14px; font-weight:500;
+         color:var(--text); list-style:none; min-height:var(--hit-sm);
+         display:flex; align-items:center; }
   details.tfiles summary::-webkit-details-marker { display:none; }
-  details.tfiles summary::before { content:"▸"; margin-right:6px; }
-  details.tfiles[open] summary::before { content:"▾"; }
+  details.tfiles summary::before { content:"\25B8"; margin-right:8px; color:var(--text-2); }
+  details.tfiles[open] summary::before { content:"\25BE"; }
   .tfile-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
-         min-height:var(--hit); padding:6px 2px;
-         border-bottom:1px solid var(--sep); font-size:15px; line-height:20px; }
-  .tfile-row:last-child { border-bottom:none; }
-  .tfile-head { color:var(--label-2); font-size:13px; min-height:var(--hit-sm);
-         user-select:none; }
+         min-height:var(--hit); padding:8px 0;
+         border-top:1px solid var(--border); font-size:14px; line-height:20px; }
+  .tfile-head { color:var(--text-2); font-size:12px; font-weight:600;
+         text-transform:uppercase; letter-spacing:.06em;
+         min-height:var(--hit-sm); user-select:none; }
   .tfile-head span { cursor:pointer; }
   /* Имени нужно не меньше 220px: если не влезает — переносим его на свою
      строку целиком, а не ломаем название по буквам в узкой колонке. */
   .tfile-name { flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
   .tfile-head .tfile-name { flex:1 1 auto; }
-  .tfile-size { color:var(--label-2); white-space:nowrap; }
+  .tfile-size { color:var(--text-2); white-space:nowrap;
+         font-variant-numeric:tabular-nums; }
   .tfile-status { white-space:nowrap; }
   .tfile-actions { white-space:nowrap; display:flex; gap:6px; align-items:center; }
-  .tfile-bar { flex-basis:100%; order:5; height:4px; border-radius:2px;
-         background:var(--fill-2); overflow:hidden; }
-  .tfile-bar-fill { height:100%; border-radius:2px; background:var(--tint); }
+  .tfile-bar { flex-basis:100%; order:5; height:2px; background:var(--border);
+         overflow:hidden; }
+  .tfile-bar-fill { height:100%; background:var(--solid); }
 
   /* Плеер: оверлей поверх страницы с <video> */
-  .player-overlay { position:fixed; inset:0; z-index:50; background:rgba(0,0,0,.55);
-         -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px);
+  .player-overlay { position:fixed; inset:0; z-index:50; background:rgba(10,10,10,.80);
          display:flex; align-items:center; justify-content:center; padding:16px; }
-  .player-box { background:var(--bg-2); border:1px solid var(--sep); border-radius:var(--r-card);
-         padding:14px; max-width:min(920px, 100%); width:100%;
-         box-shadow:0 24px 60px rgba(0,0,0,.60); }
+  .player-box { background:var(--surface); border:1px solid var(--border);
+         border-radius:var(--r); padding:16px; max-width:min(920px, 100%); width:100%; }
   .player-head { display:flex; align-items:center; justify-content:space-between; gap:12px;
-         margin-bottom:10px; font-size:17px; font-weight:600; word-break:break-word; }
+         margin-bottom:12px; font-size:16px; font-weight:600; word-break:break-word; }
   .player-body { min-height:80px; display:flex; align-items:center; justify-content:center; }
-  .player-body video { width:100%; max-height:70vh; border-radius:12px; background:#000; }
+  .player-body video { width:100%; max-height:70vh; border-radius:var(--r-ctl); background:#000; }
 
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 Скачать видео</h1>
+  <h1>Скачать видео</h1>
   <p class="sub">Вставь ссылку на страницу с видео — выбери серию и качество.
      Готовые файлы удаляются с сервера через 3 часа после загрузки
      (торренты — только вручную).</p>
@@ -232,8 +257,8 @@
 
   <!-- Переключатель вкладок: Видео / Торренты -->
   <div class="tabs gated" id="tabBar">
-    <button type="button" class="tab-btn active" onclick="showTab('video', this)">🎬 Видео</button>
-    <button type="button" class="tab-btn" onclick="showTab('torrent', this)">🧲 Торренты</button>
+    <button type="button" class="tab-btn active" onclick="showTab('video', this)">Видео</button>
+    <button type="button" class="tab-btn" onclick="showTab('torrent', this)">Торренты</button>
   </div>
 
   <div id="tabVideo">
@@ -244,7 +269,7 @@
         <div><input type="text" id="url" placeholder="https://..."
                     onkeydown="if(event.key==='Enter'){event.preventDefault();check();}"></div>
         <button id="checkBtn" onclick="check()">Проверить</button>
-        <button id="clearBtn" class="ghost" onclick="clearUrl()">🧹 Очистить</button>
+        <button id="clearBtn" class="ghost" onclick="clearUrl()">Очистить</button>
       </div>
       <div class="hint" id="checkHint"></div>
     </div>
@@ -274,10 +299,10 @@
           </select>
         </div>
         <button id="dlBtn" onclick="startDownload()">Скачать</button>
-        <button id="transBtn" class="ghost" onclick="startTranscribe()">📝 Субтитры</button>
-        <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">🎙 Свои субтитры</button>
-        <button id="transMBtn" class="ghost" onclick="startTranscribe(false, true)">🔗 С описанием</button>
-        <button id="transMWBtn" class="ghost" onclick="startTranscribe(true, true)">🔗 С описанием (свои)</button>
+        <button id="transBtn" class="ghost" onclick="startTranscribe()">Субтитры</button>
+        <button id="transWBtn" class="ghost" onclick="startTranscribe(true)">Свои субтитры</button>
+        <button id="transMBtn" class="ghost" onclick="startTranscribe(false, true)">С описанием</button>
+        <button id="transMWBtn" class="ghost" onclick="startTranscribe(true, true)">С описанием (свои)</button>
       </div>
     </div>
 
@@ -291,7 +316,7 @@
   <div class="hidden" id="tabTorrent">
     <!-- Торренты: поиск по трекеру + ручной magnet -->
     <div class="card gated" id="torrentCard">
-      <label>🧲 Торренты</label>
+      <label>Торренты</label>
       <div class="row">
         <div><input type="text" id="tq" placeholder="Название раздачи…"
                     onkeydown="if(event.key==='Enter'){event.preventDefault();torrentSearch();}"></div>
@@ -300,7 +325,7 @@
       <div class="row" style="margin-top:8px;">
         <div><input type="text" id="tmagnet" placeholder="…или вставьте magnet-ссылку"
                     onkeydown="if(event.key==='Enter'){event.preventDefault();addTorrentMagnet();}"></div>
-        <button class="ghost" onclick="addTorrentMagnet(this)">⬇ Скачать magnet</button>
+        <button class="ghost" onclick="addTorrentMagnet(this)">Скачать magnet</button>
       </div>
       <div class="hint" id="tHint"></div>
       <div class="jobs" id="tResults"></div>
@@ -336,14 +361,14 @@
   <div class="card" id="gameCard">
     <div id="game">
       <div class="game-head">
-        <span>🎮 Тетрис</span>
+        <span>Тетрис</span>
         <span id="gameScore">Очки: 0 · Линии: 0</span>
       </div>
       <div class="game-bar">
         <span id="gameBest">Рекорд: 0</span>
         <div class="game-btns">
-          <button class="ghost small" id="pauseBtn" onclick="GAME.playPause()">▶ Играть</button>
-          <button class="ghost small" onclick="GAME.restart()">↻ Заново</button>
+          <button class="ghost small" id="pauseBtn" onclick="GAME.playPause()">Играть</button>
+          <button class="ghost small" onclick="GAME.restart()">Заново</button>
         </div>
       </div>
       <div class="game-next">
@@ -352,10 +377,10 @@
       </div>
       <canvas id="board" width="220" height="352"></canvas>
       <div class="game-controls">
-        <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">◀</button>
-        <button class="gbtn" onmousedown="GAME.rotate()" ontouchstart="event.preventDefault();GAME.rotate()">⟳</button>
-        <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">▼</button>
-        <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">▶</button>
+        <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">←</button>
+        <button class="gbtn" onmousedown="GAME.rotate()" ontouchstart="event.preventDefault();GAME.rotate()">↻</button>
+        <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">↓</button>
+        <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">→</button>
       </div>
       <div id="gameOver" class="hidden">Игра окончена</div>
     </div>
@@ -372,7 +397,7 @@
     <div class="selbar">
       <label style="margin:0">Файлы на сервере</label>
       <span class="muted" id="diskFree" style="font-size:13px"></span>
-      <button class="ghost small" onclick="loadFiles()">⟳ Обновить</button>
+      <button class="ghost small" onclick="loadFiles()">Обновить</button>
     </div>
     <div class="jobs" id="serverList"></div>
   </div>
@@ -380,8 +405,8 @@
   <!-- Библиотека: SMB-витрина (постоянное хранилище для просмотра с ТВ) -->
   <div class="card gated hidden" id="libraryCard">
     <div class="selbar">
-      <label style="margin:0">📚 Библиотека (SMB для телевизора)</label>
-      <button class="ghost small" onclick="loadLibrary()">⟳ Обновить</button>
+      <label style="margin:0">Библиотека (SMB для телевизора)</label>
+      <button class="ghost small" onclick="loadLibrary()">Обновить</button>
     </div>
     <div class="jobs" id="libraryList"></div>
   </div>
@@ -502,10 +527,10 @@ async function check() {
 
   // Живой счётчик: показываем, что идёт обработка и сколько уже длится.
   let sec = 0;
-  hint.textContent = "⏳ Проверяю ссылку… (0 с). Иногда это занимает до минуты.";
+  hint.textContent = "Проверяю ссылку… (0 с). Иногда это занимает до минуты.";
   const timer = setInterval(() => {
     sec++;
-    hint.textContent = `⏳ Проверяю ссылку… (${sec} с). Иногда это занимает до минуты.`;
+    hint.textContent = `Проверяю ссылку… (${sec} с). Иногда это занимает до минуты.`;
   }, 1000);
 
   // Жёсткий таймаут на стороне браузера, чтобы не ждать вечно.
@@ -520,10 +545,10 @@ async function check() {
   } catch (e) {
     hint.classList.add("err");
     if (e.name === "AbortError") {
-      hint.textContent = "⚠ Сайт слишком долго не отвечает. Проверьте ссылку "
+      hint.textContent = "Сайт слишком долго не отвечает. Проверьте ссылку "
         + "или попробуйте позже — возможно, этот сайт недоступен с сервера.";
     } else {
-      hint.textContent = "⚠ " + e.message;
+      hint.textContent = e.message;
     }
   } finally {
     clearInterval(timer);
@@ -603,7 +628,7 @@ async function createJob(target, quality) {
       body: JSON.stringify({ url: target.url, quality }) });
     poll(job_id, el);
   } catch (e) {
-    el.querySelector(".meta").innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    el.querySelector(".meta").innerHTML = `<span class="err">${e.message}</span>`;
   }
 }
 
@@ -632,16 +657,16 @@ async function torrentSearch() {
       el.className = "job";
       el.innerHTML =
         `<div class="name">${escapeHtml(r.title)}</div>
-         <div class="meta">💾 ${escapeHtml(r.size)} · 🌱 ${r.seeders} · 🔻 ${r.leechers}</div>
+         <div class="meta">${escapeHtml(r.size)} · сиды ${r.seeders} · пиры ${r.leechers}</div>
          <div class="controls">
-           <button class="dl">⬇ Скачать</button>
+           <button class="dl">Скачать</button>
          </div>`;
       el.querySelector(".dl").addEventListener("click", ev =>
         addTorrent(r.detail, r.title, ev.currentTarget));
       list.appendChild(el);
     });
   } catch (e) {
-    hint.innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    hint.innerHTML = `<span class="err">${e.message}</span>`;
   }
 }
 
@@ -652,7 +677,7 @@ async function addTorrent(detail, title, btn) {
   } catch (e) {
     alert("Не удалось: " + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = "⬇ Скачать";
+    btn.disabled = false; btn.textContent = "Скачать";
   }
 }
 
@@ -669,7 +694,7 @@ async function addTorrentMagnet(btn) {
   } catch (e) {
     alert("Не удалось: " + e.message);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "⬇ Скачать magnet"; }
+    if (btn) { btn.disabled = false; btn.textContent = "Скачать magnet"; }
   }
 }
 
@@ -716,7 +741,7 @@ async function previewTorrentFiles(source, title) {
     TPICK = { source, title };
     list.innerHTML = "";
     err.classList.remove("hidden");
-    err.textContent = "⚠ " + e.message;
+    err.textContent = e.message;
     go.textContent = "Скачать всё как есть";
     go.classList.remove("hidden");
   }
@@ -771,11 +796,10 @@ function startJobCard(jobId, title, type) {
   document.getElementById("jobsCard").classList.remove("hidden");
   const wrap = document.getElementById("jobs");
   if (wrap.querySelector(`[data-job-id="${jobId}"]`)) return;   // уже есть
-  const icon = type === "torrent" ? "🧲 " : "";
   const el = document.createElement("div");
   el.className = "job";
   el.dataset.jobId = jobId;
-  el.innerHTML = `<div class="name">${icon}${escapeHtml(title)}</div>
+  el.innerHTML = `<div class="name">${escapeHtml(title)}</div>
     <div class="meta">в очереди…</div>
     <div class="controls"></div>`;
   wrap.prepend(el);
@@ -825,13 +849,13 @@ async function createTranscribeJob(target, force, meta) {
     <div class="meta">запуск…</div>
     <div class="controls tcancel"></div>
     <div class="controls tcontrols hidden">
-      <button class="copy small" onclick="copyText(this)">📋 Копировать</button>
-      <button class="copy small" onclick="downloadSubs(this,'srt')">⬇ .srt</button>
-      <button class="copy small" onclick="downloadSubs(this,'txt')">⬇ .txt</button>
+      <button class="copy small" onclick="copyText(this)">Копировать</button>
+      <button class="copy small" onclick="downloadSubs(this,'srt')">Скачать .srt</button>
+      <button class="copy small" onclick="downloadSubs(this,'txt')">Скачать .txt</button>
       <label class="tc-toggle"><input type="checkbox" checked
         onchange="renderTranscript(this)"> таймкоды</label>
       <button class="ghost small tc-redo hidden"
-        onclick="redoWhisper(this)">🎙 Сделать свои субтитры</button>
+        onclick="redoWhisper(this)">Сделать свои субтитры</button>
     </div>
     <textarea class="ttext hidden" readonly
       placeholder="Здесь появятся субтитры…"></textarea>`;
@@ -844,13 +868,13 @@ async function createTranscribeJob(target, force, meta) {
       method: "POST", body: JSON.stringify(body) });
     pollTranscribe(job_id, el);
   } catch (e) {
-    el.querySelector(".meta").innerHTML = `<span class="err">⚠ ${e.message}</span>`;
+    el.querySelector(".meta").innerHTML = `<span class="err">${e.message}</span>`;
   }
 }
 
 // Тихий ретрай при разовых сетевых сбоях опроса статуса (обрыв VPN-туннеля,
 // 502 от frp/nginx на секунду) — раньше одна такая ошибка красила карточку
-// в "⚠ Ошибка 502" и НАВСЕГДА останавливала опрос (poll()/pollTranscribe()
+// в "Ошибка 502" и НАВСЕГДА останавливала опрос (poll()/pollTranscribe()
 // просто делали return без следующего setTimeout), а кнопки на экране
 // оставались от последнего удачного опроса и уже ничего не делали.
 // Теперь: тихо повторяем с нарастающей паузой, ничего не рисуем, пока не
@@ -866,8 +890,8 @@ function pollRetry(el, err, resume) {
     return;
   }
   const meta = el.querySelector(".meta");
-  meta.innerHTML = `<span class="err">⚠ Проблема соединения (${escapeHtml(err.message)})</span> `
-    + `<button class="ghost small" data-retry>🔄 Обновить</button>`;
+  meta.innerHTML = `<span class="err">Проблема соединения (${escapeHtml(err.message)})</span> `
+    + `<button class="ghost small" data-retry>Обновить</button>`;
   meta.querySelector("[data-retry]").onclick = () => {
     delete el.dataset.pollFails;
     delete el.dataset.pollFailStart;
@@ -891,23 +915,23 @@ async function pollTranscribe(jobId, el) {
     meta.textContent = txt;
     if (!cancelBox.querySelector("button"))
       cancelBox.innerHTML = `<button class="ghost small" `
-        + `onclick="cancelTranscribe('${jobId}', this)">⛔ Остановить</button>`;
+        + `onclick="cancelTranscribe('${jobId}', this)">Остановить</button>`;
   };
   try {
     const s = await api("/api/transcribe/status/" + jobId);
     pollOk(el);
     if (s.state === "queued") {
-      active("⏳ В очереди…" + elapsed());
+      active("В очереди…" + elapsed());
     } else if (s.state === "subtitles") {
-      active("🔎 Ищу готовые субтитры…");
+      active("Ищу готовые субтитры…");
     } else if (s.state === "transcribing") {
       const stage = s.stage || "Распознаю речь";
       const pct = s.percent ? " " + Math.round(s.percent) + "%" : "";
-      active("🎙 " + stage + pct + elapsed());
+      active(stage + pct + elapsed());
     } else if (s.state === "done") {
       const fromSubs = s.source === "subtitles";
       const src = fromSubs ? "встроенные субтитры" : "своё распознавание";
-      meta.innerHTML = `<span class="done">✓ Готово</span> `
+      meta.innerHTML = `<span class="done">Готово</span> `
         + `<span class="muted">· ${src}</span>`;
       cancelBox.innerHTML = "";
       // Сегменты с таймкодами; фолбэк — единый блок текста без времени.
@@ -916,7 +940,7 @@ async function pollTranscribe(jobId, el) {
         : (s.text ? [{ start: 0, end: 0, text: s.text }] : []);
       // Шапка со ссылкой и описанием — только если их запрашивали.
       el._header = (s.link || s.description)
-        ? `🔗 ${s.link || ""}\n\n📄 Описание:\n${s.description || "—"}\n\n📝 Транскрибация:\n`
+        ? `Ссылка: ${s.link || ""}\n\nОписание:\n${s.description || "—"}\n\nТранскрибация:\n`
         : "";
       el.querySelector(".ttext").classList.remove("hidden");
       el.querySelector(".tcontrols").classList.remove("hidden");
@@ -926,11 +950,11 @@ async function pollTranscribe(jobId, el) {
       renderTranscript(el.querySelector(".tc-toggle input"));
       return;
     } else if (s.state === "cancelled") {
-      meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
+      meta.innerHTML = `<span class="err">Остановлено</span>`;
       cancelBox.innerHTML = "";
       return;
     } else if (s.state === "error") {
-      meta.innerHTML = `<span class="err">⚠ ${escapeHtml(s.error || "ошибка")}</span>`;
+      meta.innerHTML = `<span class="err">${escapeHtml(s.error || "ошибка")}</span>`;
       cancelBox.innerHTML = "";
       return;
     }
@@ -944,14 +968,14 @@ async function pollTranscribe(jobId, el) {
 async function cancelTranscribe(jobId, btn) {
   btn.disabled = true; btn.textContent = "Останавливаю…";
   try { await api("/api/transcribe/cancel/" + jobId, { method: "POST" }); }
-  catch (e) { btn.disabled = false; btn.textContent = "⛔ Остановить"; }
+  catch (e) { btn.disabled = false; btn.textContent = "Остановить"; }
 }
 
 function copyText(btn) {
   const ta = btn.closest(".job").querySelector(".ttext");
   const done = () => {
     const old = btn.textContent;
-    btn.textContent = "✓ Скопировано";
+    btn.textContent = "Скопировано";
     setTimeout(() => { btn.textContent = old; }, 1500);
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1038,7 +1062,7 @@ function showDisk(disk) {
   const el = document.getElementById("diskFree");
   if (!el) return;
   if (!disk || !disk.total) { el.textContent = ""; return; }
-  el.textContent = `💾 свободно ${fmtSize(disk.free)} из ${fmtSize(disk.total)}`;
+  el.textContent = `Свободно ${fmtSize(disk.free)} из ${fmtSize(disk.total)}`;
   el.style.color = disk.free < (disk.reserve || 0) ? "var(--err, #ff6b6b)" : "";
 }
 
@@ -1116,10 +1140,11 @@ const GAME = (function () {
     J: [[1, 0, 0], [1, 1, 1]],
     L: [[0, 0, 1], [1, 1, 1]],
   };
-  // Системные цвета Apple (тёмная тема) — те же, что у остального интерфейса
+  // Палитра Buzzvil: акцентные красный/оранжевый + серый. Фигуры должны
+  // различаться на глаз, поэтому берём разные ступени обеих шкал.
   const COLORS = {
-    I: "#64d2ff", O: "#ffd60a", T: "#bf5af2", S: "#30d158",
-    Z: "#ff453a", J: "#0a84ff", L: "#ff9f0a",
+    I: "#f97316", O: "#fdba74", T: "#ea580c", S: "#ef4444",
+    Z: "#b91c1c", J: "#fca5a5", L: "#737373",
   };
   let canvas, ctx, board, piece, color, px, py, nextKey;
   let score, lines, over, dropMs, acc, last, raf, started, paused;
@@ -1284,8 +1309,8 @@ const GAME = (function () {
   function updatePauseBtn() {
     const b = document.getElementById("pauseBtn");
     if (!b) return;
-    b.textContent = (!started || over) ? "▶ Играть"
-                  : paused ? "▶ Продолжить" : "⏸ Пауза";
+    b.textContent = (!started || over) ? "Играть"
+                  : paused ? "Продолжить" : "Пауза";
   }
 
   function start() {
@@ -1337,23 +1362,23 @@ const GAME = (function () {
 })();
 
 const stopBtn = jobId =>
-  `<button class="ghost small" onclick="cancelJob('${jobId}', this)">⛔ Остановить</button>`;
+  `<button class="ghost small" onclick="cancelJob('${jobId}', this)">Остановить</button>`;
 
 // Пауза — только для торрентов (у yt-dlp/Whisper останавливать и докачивать
 // с того же места нечем): реальный процесс останавливается, файлы остаются.
 const pauseBtn = jobId =>
-  `<button class="ghost small" onclick="pauseJob('${jobId}', this)">⏸ Пауза</button>`;
+  `<button class="ghost small" onclick="pauseJob('${jobId}', this)">Пауза</button>`;
 const resumeBtn = jobId =>
-  `<button class="ghost small" onclick="resumeJob('${jobId}', this)">▶ Продолжить</button>`;
+  `<button class="ghost small" onclick="resumeJob('${jobId}', this)">Продолжить</button>`;
 const recheckBtn = jobId =>
-  `<button class="ghost small" onclick="resumeJob('${jobId}', this, true)">🔁 Перечитать хэш</button>`;
+  `<button class="ghost small" onclick="resumeJob('${jobId}', this, true)">Перечитать хэш</button>`;
 // JS-аргумент внутрь HTML-атрибута onclick: JSON-строка + экранирование
 // кавычек как сущностей. Без этого имя файла с " или ' рвало атрибут и
 // кнопка «Смотреть» переставала работать.
 const attr = v => escapeHtml(JSON.stringify(v));
 
 const playBtn = (jobId, path, name) =>
-  `<button class="ghost small" onclick="openPlayer(${attr(playUrl(jobId, path))}, ${attr(name)})">▶ Смотреть</button>`;
+  `<button class="ghost small" onclick="openPlayer(${attr(playUrl(jobId, path))}, ${attr(name)})">Смотреть</button>`;
 
 // Префикс ссылки плеера: заканчивается на ? или &, дальше дописываются
 // probe=1 / t=<секунда>. Два источника — загрузка на сервере и файл витрины.
@@ -1363,13 +1388,13 @@ const libPlayUrl = name => "/api/library/play?name=" + encodeURIComponent(name) 
 
 // Кнопка «В библиотеку» — только если SMB-витрина настроена. Иначе пусто.
 const libBtn = jobId => LIBRARY_ENABLED
-  ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">📚 В библиотеку</button>`
+  ? `<button class="ghost small" onclick="addToLibrary('${jobId}', this)">В библиотеку</button>`
   : "";
 
 async function pauseJob(jobId, btn) {
   btn.disabled = true; btn.textContent = "Ставлю на паузу…";
   try { await api("/api/torrent/" + jobId + "/pause", { method: "POST" }); }
-  catch (e) { btn.disabled = false; btn.textContent = "⏸ Пауза"; alert("Не удалось: " + e.message); }
+  catch (e) { btn.disabled = false; btn.textContent = "Пауза"; alert("Не удалось: " + e.message); }
 }
 
 // Продолжить (с паузы) — тот же /resume, что и восстановление после краша
@@ -1419,7 +1444,7 @@ async function openPlayer(base, name) {
     <div class="player-box">
       <div class="player-head">
         <span>${escapeHtml(name)}</span>
-        <button class="ghost small" onclick="closePlayer()">✕ Закрыть</button>
+        <button class="ghost small" onclick="closePlayer()">Закрыть</button>
       </div>
       <div class="player-body muted">Открываю…</div>
     </div>`;
@@ -1430,12 +1455,12 @@ async function openPlayer(base, name) {
   try {
     info = await (await fetch(base + "probe=1")).json();
   } catch (e) {
-    body.innerHTML = `<span class="err">⚠ ${escapeHtml(e.message)}</span>`;
+    body.innerHTML = `<span class="err">${escapeHtml(e.message)}</span>`;
     return;
   }
   if (!document.getElementById("playerOverlay")) return;   // закрыли, пока ждали
   if (info.detail) {                                        // ошибка от сервера
-    body.innerHTML = `<span class="err">⚠ ${escapeHtml(info.detail)}</span>`;
+    body.innerHTML = `<span class="err">${escapeHtml(info.detail)}</span>`;
     return;
   }
 
@@ -1533,21 +1558,21 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
           const dlHref = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
           let status, actions, bar = "";
           if (f.done) {
-            status = '<span class="done">✓ готово</span>';
-            actions = `<a class="dl small" href="${dlHref}" download>⬇</a>`
+            status = '<span class="done">готово</span>';
+            actions = `<a class="dl small" href="${dlHref}" download>Скачать</a>`
               + `<button class="ghost small" onclick="openPlayer(`
-              + `${attr(playUrl(jobId, f.path))}, ${attr(f.path)})">▶</button>`
-              + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">🗑</button>`;
+              + `${attr(playUrl(jobId, f.path))}, ${attr(f.path)})">Смотреть</button>`
+              + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">Удалить</button>`;
           } else if (f.selected === false) {
             status = '<span class="muted">не выбран</span>';
-            actions = `<button class="ghost small" data-act="add" data-index="${f.index}">⬇ докачать</button>`;
+            actions = `<button class="ghost small" data-act="add" data-index="${f.index}">Докачать</button>`;
           } else {
             const pct = f.percent != null ? f.percent : 0;
             // interrupted — раздача сейчас не качается (упавший сервис), а не
             // просто пока не дошла очередь: не показываем «качается», это
             // вводит в заблуждение, будто прогресс сейчас идёт.
             status = interrupted
-              ? `<span class="muted">⏸ прервано ${pct}%</span>`
+              ? `<span class="muted">Прервано ${pct}%</span>`
               : `<span class="muted">качается… ${pct}%</span>`;
             actions = "";
             if (!interrupted) {
@@ -1572,7 +1597,7 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
       render();
     } catch (e) {
       det.querySelector(".tfiles-body").innerHTML =
-        `<span class="err">⚠ ${e.message}</span>`;
+        `<span class="err">${e.message}</span>`;
     }
     const active = ["queued", "downloading", "processing"].includes(container.dataset.jobState);
     if (det.open && active) setTimeout(refresh, 2000);
@@ -1634,7 +1659,7 @@ async function poll(jobId, el) {
     // раздачи (из .torrent или dn= у magnet) в s.title.
     if (s.type === "torrent" && s.title) {
       const nm = el.querySelector(".name");
-      const want = "🧲 " + s.title;
+      const want = s.title;
       if (nm.textContent !== want) nm.textContent = want;
     }
     if (s.state === "downloading") {
@@ -1653,46 +1678,46 @@ async function poll(jobId, el) {
       controls.innerHTML = stopBtn(jobId);
     } else if (s.state === "paused") {
       const pct = s.percent != null ? Math.round(s.percent) + "%" : "";
-      meta.innerHTML = `<span class="muted">⏸ На паузе ${pct}</span>`;
+      meta.innerHTML = `<span class="muted">На паузе ${pct}</span>`;
       controls.innerHTML = resumeBtn(jobId) + recheckBtn(jobId)
-        + `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
+        + `<button class="ghost small" onclick="deleteJob('${jobId}', this)">Удалить с сервера</button>`;
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "done") {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       // Торрент уехал в библиотеку (SMB) и удалён с сервера — дубля нет,
       // управление файлом теперь в разделе «Библиотека».
       if (s.in_library) {
-        meta.innerHTML = `<span class="done">✓ Готово${sz} — в разделе «Библиотека» ниже</span>`;
+        meta.innerHTML = `<span class="done">Готово${sz} — в разделе «Библиотека» ниже</span>`;
         controls.innerHTML = "";
         const det = el.querySelector("details.tfiles");   // файлов на сервере уже нет
         if (det) det.remove();
         loadLibrary();
         return;
       }
-      meta.innerHTML = `<span class="done">✓ Готово${sz}</span>`;
+      meta.innerHTML = `<span class="done">Готово${sz}</span>`;
       const href = "/api/file/" + jobId;
       const fname = s.filename || s.title || "video.mp4";
       controls.innerHTML =
-        `<a class="dl" href="${href}">⬇ Скачать файл</a>` +
+        `<a class="dl" href="${href}">Скачать файл</a>` +
         playBtn(jobId, "", fname) +
         libBtn(jobId) +
-        `<button class="ghost small" onclick="deleteJob('${jobId}', this)">🗑 Удалить с сервера</button>`;
+        `<button class="ghost small" onclick="deleteJob('${jobId}', this)">Удалить с сервера</button>`;
       controls.querySelector(".dl").addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, fname, ev.currentTarget); });
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
       loadFiles();
       return;
     } else if (s.state === "cancelled") {
-      meta.innerHTML = `<span class="err">⛔ Остановлено</span>`;
+      meta.innerHTML = `<span class="err">Остановлено</span>`;
       controls.innerHTML = ""; return;
     } else if (s.state === "deleted") {
-      meta.innerHTML = `<span class="muted">🗑 Удалено с сервера</span>`;
+      meta.innerHTML = `<span class="muted">Удалено с сервера</span>`;
       controls.innerHTML = ""; return;
     } else if (s.state === "expired") {
       meta.innerHTML = `<span class="muted">срок хранения истёк, файл удалён</span>`;
       controls.innerHTML = ""; return;
     } else if (s.state === "error") {
-      meta.innerHTML = `<span class="err">⚠ ${escapeHtml(s.error || "ошибка")}</span>`;
+      meta.innerHTML = `<span class="err">${escapeHtml(s.error || "ошибка")}</span>`;
       controls.innerHTML = ""; return;
     }
   } catch (e) {
@@ -1705,7 +1730,7 @@ async function poll(jobId, el) {
 async function cancelJob(jobId, btn) {
   btn.disabled = true; btn.textContent = "Останавливаю…";
   try { await api("/api/cancel/" + jobId, { method: "POST" }); }
-  catch (e) { btn.disabled = false; btn.textContent = "⛔ Остановить"; }
+  catch (e) { btn.disabled = false; btn.textContent = "Остановить"; }
 }
 
 async function deleteJob(jobId, btn) {
@@ -1714,11 +1739,11 @@ async function deleteJob(jobId, btn) {
   try {
     await api("/api/delete/" + jobId, { method: "POST" });
     const job = btn.closest(".job");
-    job.querySelector(".meta").innerHTML = `<span class="muted">🗑 Удалено с сервера</span>`;
+    job.querySelector(".meta").innerHTML = `<span class="muted">Удалено с сервера</span>`;
     job.querySelector(".controls").innerHTML = "";
     loadFiles();
   } catch (e) {
-    btn.disabled = false; btn.textContent = "🗑 Удалить с сервера";
+    btn.disabled = false; btn.textContent = "Удалить с сервера";
     alert("Не удалось удалить: " + e.message);
   }
 }
@@ -1763,26 +1788,26 @@ async function loadFiles() {
         // такая карточка просто пропадала из списка, теперь показываем
         // прогресс и даём кнопку продолжить (см. list_files/_run_torrent).
         const p = f.progress || {};
-        metaLine = `⏸ прервано — ${p.percent ?? 0}% `
+        metaLine = `Прервано — ${p.percent ?? 0}% `
           + `(готово ${p.done_files ?? 0} из ${p.total_files ?? "?"} файлов)`;
-        controls = `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this)">▶ Возобновить</button>`
-          + `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this, true)">🔁 Перечитать хэш</button>`
-          + (f.filename ? `<a class="dl" href="${href}">⬇ Скачать</a>` : "")
+        controls = `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this)">Возобновить</button>`
+          + `<button class="ghost small" onclick="resumeTorrent('${f.job_id}', this, true)">Перечитать хэш</button>`
+          + (f.filename ? `<a class="dl" href="${href}">Скачать</a>` : "")
           + (f.filename ? libBtn(f.job_id) : "")
-          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
+          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">Удалить</button>`;
       } else {
         const rem = f.torrent
           ? "не удаляется автоматически — только вручную"
           : (f.remaining ? "удалится через " + fmtTime(f.remaining) : "скоро будет удалён");
         const when = fmtDate(f.mtime);
         metaLine = `${fmtSize(f.size)}${when ? " · скачано " + when : ""} · ${rem}`;
-        controls = `<a class="dl" href="${href}">⬇ Скачать</a>`
+        controls = `<a class="dl" href="${href}">Скачать</a>`
           + (f.filename ? playBtn(f.job_id, "", f.filename) : "")
           + libBtn(f.job_id)
-          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">🗑 Удалить</button>`;
+          + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">Удалить</button>`;
       }
       el.innerHTML =
-        `<div class="name">${f.torrent ? "🧲 " : ""}${escapeHtml(name)}</div>
+        `<div class="name">${escapeHtml(name)}</div>
          <div class="meta">${metaLine}</div>
          <div class="controls">${controls}</div>`;
       const dl = el.querySelector(".dl");
@@ -1792,7 +1817,7 @@ async function loadFiles() {
       list.appendChild(el);
     });
   } catch (e) {
-    list.innerHTML = `<div class="err" style="font-size:13px">⚠ ${e.message}</div>`;
+    list.innerHTML = `<div class="err" style="font-size:13px">${e.message}</div>`;
   }
 }
 
@@ -1803,7 +1828,7 @@ async function deleteServerFile(jobId, btn) {
     await api("/api/delete/" + jobId, { method: "POST" });
     loadFiles();
   } catch (e) {
-    btn.disabled = false; btn.textContent = "🗑 Удалить";
+    btn.disabled = false; btn.textContent = "Удалить";
     alert("Не удалось удалить: " + e.message);
   }
 }
@@ -1839,9 +1864,9 @@ async function loadLibrary() {
         `<div class="name">${escapeHtml(f.name)}</div>
          <div class="meta">${fmtSize(f.size)}</div>
          <div class="controls">
-           <button class="ghost small" data-act="play">▶ Смотреть</button>
-           <a class="dl" href="${href}">⬇ Скачать</a>
-           <button class="ghost small" data-act="del">🗑 Удалить</button>
+           <button class="ghost small" data-act="play">Смотреть</button>
+           <a class="dl" href="${href}">Скачать</a>
+           <button class="ghost small" data-act="del">Удалить</button>
          </div>`;
       // Имя файла произвольное (кавычки, апострофы) — вешаем обработчики через
       // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
@@ -1855,7 +1880,7 @@ async function loadLibrary() {
       list.appendChild(el);
     });
   } catch (e) {
-    list.innerHTML = `<div class="err" style="font-size:13px">⚠ ${e.message}</div>`;
+    list.innerHTML = `<div class="err" style="font-size:13px">${e.message}</div>`;
   }
 }
 
@@ -1867,7 +1892,7 @@ async function addToLibrary(jobId, btn) {
   try {
     await api("/api/library/add", {
       method: "POST", body: JSON.stringify({ job_id: jobId }) });
-    btn.textContent = "✓ В библиотеке";
+    btn.textContent = "В библиотеке";
     loadLibrary();              // обновим список библиотеки — там появился файл
   } catch (e) {
     btn.disabled = false; btn.textContent = old;
@@ -1883,7 +1908,7 @@ async function deleteLibraryFile(name, btn) {
       method: "POST", body: JSON.stringify({ name }) });
     loadLibrary();
   } catch (e) {
-    btn.disabled = false; btn.textContent = "🗑 Удалить";
+    btn.disabled = false; btn.textContent = "Удалить";
     alert("Не удалось удалить: " + e.message);
   }
 }
