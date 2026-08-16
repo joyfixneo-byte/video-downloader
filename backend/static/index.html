@@ -4,167 +4,210 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Скачать видео</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
+  /* Оформление по Apple Human Interface Guidelines:
+     системный шрифт (SF Pro), системные цвета тёмной темы, материалы,
+     единая сетка размеров и минимальная цель нажатия 44pt для всех
+     интерактивных элементов (кнопки, чекбоксы, поля, строки списков). */
   :root {
-    --txt:#f4eee9; --muted:#c9bdb6;
-    --accent:#ec8a78; --accent2:#df7261;     /* коралл */
-    --glow:#ff5db1;                            /* маджента-фокус */
-    --ok:#62ab8c; --err:#ff6b6b;
-    --panel:rgba(38,46,46,.40); --panel-2:rgba(20,26,26,.42);
-    --line:rgba(255,255,255,.10); --line-2:rgba(255,255,255,.17);
-    --disp:'Space Grotesk', system-ui, -apple-system, "Segoe UI", sans-serif;
-    --body:'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    /* Системные цвета iOS/macOS, тёмная тема */
+    --bg:#000; --bg-2:#1c1c1e; --bg-3:#2c2c2e;
+    --label:#fff; --label-2:rgba(235,235,245,.60); --label-3:rgba(235,235,245,.30);
+    --fill:rgba(120,120,128,.36); --fill-2:rgba(120,120,128,.24);
+    --sep:rgba(84,84,88,.65);
+    --tint:#0a84ff;                 /* systemBlue — акцент приложения */
+    --green:#30d158; --red:#ff453a; /* systemGreen / systemRed */
+    /* Единая шкала размеров: всё кратно 4pt, цели нажатия — 44pt */
+    --hit:44px; --hit-sm:34px;
+    --r-card:16px; --r-ctl:12px; --r-sm:9px;
+    --font:-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+           "Segoe UI", system-ui, Roboto, "Helvetica Neue", sans-serif;
   }
   * { box-sizing: border-box; }
   html, body { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
   body {
-    margin:0; min-height:100vh; color:var(--txt); font-family:var(--body);
+    margin:0; min-height:100vh; color:var(--label);
+    font:400 17px/22px var(--font);          /* HIG Body */
     /* Запрещаем двойной тап-зум и удержание-выделение — на телефоне
        случайный промах по кнопке больше не зумит и не ломает игру. */
     touch-action: manipulation;
     background:
-      radial-gradient(1100px 760px at 12% -5%, #6f9b8d 0%, rgba(111,155,141,0) 55%),
-      radial-gradient(1000px 820px at 105% 108%, #d7a88f 0%, rgba(215,168,143,0) 55%),
-      radial-gradient(820px 680px at 60% 122%, #c98f9c 0%, rgba(201,143,156,0) 60%),
-      linear-gradient(165deg, #46534d 0%, #54504b 55%, #5f534f 100%);
+      radial-gradient(900px 700px at 15% -10%, rgba(10,132,255,.16) 0%, rgba(10,132,255,0) 60%),
+      radial-gradient(760px 640px at 100% 105%, rgba(94,92,230,.14) 0%, rgba(94,92,230,0) 60%),
+      var(--bg);
     background-attachment: fixed;
   }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 34px 18px 90px; }
-  h1 { font-family:var(--disp); font-size: 27px; font-weight:700; letter-spacing:.3px;
-       margin: 0 0 6px; color:#f7b0a0; }
-  .sub { color: rgba(244,238,233,.80); font-size: 14px; margin: 0 0 24px; max-width:62ch; line-height:1.5; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 96px; }
+  h1 { font-size:34px; line-height:41px; font-weight:700; letter-spacing:.37px;
+       margin: 0 0 8px; color:var(--label); }            /* HIG Large Title */
+  .sub { color:var(--label-2); font-size:15px; line-height:20px;
+         margin: 0 0 24px; max-width:62ch; }             /* HIG Subheadline */
 
-  .card { background:var(--panel); -webkit-backdrop-filter:blur(16px); backdrop-filter:blur(16px);
-          border:1px solid var(--line); border-radius:18px; padding:20px; margin-bottom:16px;
-          box-shadow:0 16px 38px rgba(12,22,22,.30), inset 0 1px 0 rgba(255,255,255,.16); }
+  /* Карточка = сгруппированная секция на «толстом материале» */
+  .card { background:rgba(28,28,30,.72);
+          -webkit-backdrop-filter:saturate(180%) blur(20px);
+          backdrop-filter:saturate(180%) blur(20px);
+          border:1px solid var(--sep); border-radius:var(--r-card);
+          padding:16px; margin-bottom:12px; }
 
-  label { display:block; font-size:11px; color:var(--muted); margin-bottom:8px;
-          text-transform:uppercase; letter-spacing:.7px; font-weight:600; }
+  /* Заголовок секции — как в сгруппированных списках iOS */
+  label { display:block; font-size:13px; line-height:18px; color:var(--label-2);
+          margin-bottom:8px; text-transform:uppercase; letter-spacing:.5px;
+          font-weight:600; }
+  /* Строки-переключатели тоже <label>, но это не заголовки секций */
+  label.ep, label.tc-toggle, label.check-row {
+          text-transform:none; letter-spacing:normal; margin-bottom:0; }
 
   input[type=text], input[type=password], select, textarea.ttext {
-    width:100%; padding:12px 14px; border-radius:12px; border:1px solid var(--line);
-    background:rgba(16,22,22,.45); color:var(--txt); font-size:16px; font-family:var(--body);
-    outline:none; box-shadow:inset 0 2px 6px rgba(0,0,0,.28);
-    transition:border-color .14s ease, box-shadow .14s ease; }
+    width:100%; min-height:var(--hit); padding:11px 14px; border-radius:var(--r-ctl);
+    border:1px solid var(--sep); background:var(--fill-2); color:var(--label);
+    font:400 17px/22px var(--font); outline:none;
+    transition:border-color .15s ease, box-shadow .15s ease; }
+  input::placeholder, textarea::placeholder { color:var(--label-3); }
   input:focus, select:focus, textarea.ttext:focus {
-    border-color:var(--glow);
-    box-shadow:inset 0 2px 6px rgba(0,0,0,.28), 0 0 0 3px rgba(255,93,177,.22); }
+    border-color:var(--tint); box-shadow:0 0 0 3px rgba(10,132,255,.30); }
+  :focus-visible { outline:2px solid var(--tint); outline-offset:2px; }
+
+  /* Чекбокс — 22pt кружок с галочкой, как в списках iOS: тот же масштаб,
+     что у остального интерфейса (нативный ~13px выглядел крошечным),
+     цель нажатия добирается высотой всей строки .ep. */
+  input[type=checkbox] {
+    -webkit-appearance:none; appearance:none; margin:0; flex:0 0 auto;
+    width:22px; height:22px; border-radius:50%; cursor:pointer;
+    border:1.5px solid var(--label-3); background:transparent;
+    display:inline-grid; place-content:center;
+    transition:background-color .15s ease, border-color .15s ease; }
+  input[type=checkbox]:checked { background:var(--tint); border-color:var(--tint); }
+  input[type=checkbox]:checked::after {
+    content:""; width:6px; height:11px; margin-top:-2px;
+    border:2px solid #fff; border-top:0; border-left:0; transform:rotate(45deg); }
+  input[type=range] { accent-color:var(--tint); height:28px; }
 
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
   .row > div { flex:1; min-width:160px; }
 
-  /* Кнопки — клейморфизм: пухлые, мягкая тень + внутренний хайлайт */
-  button { font-family:var(--disp); padding:12px 18px; border-radius:12px; border:none; cursor:pointer;
-           background:linear-gradient(180deg, var(--accent), var(--accent2)); color:#fff;
-           font-size:15px; font-weight:600; letter-spacing:.2px;
-           box-shadow:0 7px 16px rgba(205,105,90,.34), inset 0 1px 0 rgba(255,255,255,.45),
-                      inset 0 -2px 5px rgba(150,60,50,.26);
-           transition:transform .12s ease, box-shadow .12s ease, filter .12s ease; }
-  button:hover:not(:disabled) { transform:translateY(-1px); filter:brightness(1.05); }
-  button:active:not(:disabled) { transform:translateY(1px);
-           box-shadow:0 3px 9px rgba(205,105,90,.30), inset 0 2px 6px rgba(150,60,50,.30); }
-  button:disabled { opacity:.42; cursor:default; box-shadow:none; filter:grayscale(.35); }
-  button.ghost { background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
-           color:var(--txt); border:1px solid var(--line-2);
-           box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16); }
-  button.small { padding:7px 12px; font-size:13px; border-radius:10px; }
+  /* Кнопки — плоские, как в HIG: заливка tint, нажатие = приглушение */
+  button { font:600 17px/1 var(--font); min-height:var(--hit); padding:0 18px;
+           border-radius:var(--r-ctl); border:none; cursor:pointer; white-space:nowrap;
+           display:inline-flex; align-items:center; justify-content:center; gap:6px;
+           background:var(--tint); color:#fff;
+           transition:opacity .15s ease, background-color .15s ease; }
+  button:hover:not(:disabled) { opacity:.85; }
+  button:active:not(:disabled) { opacity:.6; }
+  button:disabled { opacity:.35; cursor:default; }
+  /* Вторичные действия — «малый» размер контрола: та же высота 44pt,
+     но компактнее по тексту, чтобы ряд кнопок помещался в строку. */
+  button.ghost { background:var(--fill-2); color:var(--label);
+           font-size:15px; padding:0 14px; }
+  button.small, a.dl.small { min-height:var(--hit-sm); padding:0 12px;
+           font-size:15px; border-radius:var(--r-sm); }
 
-  .hint { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.45; }
+  .hint { font-size:13px; line-height:18px; color:var(--label-2); margin-top:8px; }
 
-  /* Переключатель вкладок Видео/Торренты */
-  .tabs { display:flex; gap:8px; margin-bottom:16px; }
-  .tab-btn { background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
-         color:var(--txt); border:1px solid var(--line-2);
-         box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16); }
-  .tab-btn.active { background:linear-gradient(180deg, var(--accent), var(--accent2));
-         box-shadow:0 7px 16px rgba(205,105,90,.34), inset 0 1px 0 rgba(255,255,255,.45),
-                    inset 0 -2px 5px rgba(150,60,50,.26); }
+  /* Переключатель вкладок — сегментированный контрол iOS */
+  .tabs { display:flex; gap:2px; padding:2px; margin-bottom:16px;
+          background:var(--fill-2); border-radius:var(--r-ctl); }
+  .tab-btn { flex:1; min-height:36px; padding:0 12px; border-radius:8px;
+         background:transparent; color:var(--label); font-weight:500; font-size:15px; }
+  .tab-btn.active { background:var(--bg-3); font-weight:600;
+         box-shadow:0 3px 8px rgba(0,0,0,.24), 0 3px 1px rgba(0,0,0,.06); }
 
-  .ep { display:flex; align-items:center; gap:10px; padding:9px 6px;
-        border-bottom:1px solid var(--line); font-size:14px; }
+  /* Строка списка — высота 44pt, разделитель не заходит под чекбокс */
+  .ep { display:flex; align-items:center; gap:12px; min-height:var(--hit);
+        padding:9px 4px; border-bottom:1px solid var(--sep);
+        font-size:17px; line-height:22px; font-weight:400; color:var(--label);
+        cursor:pointer; }
   .ep:last-child { border-bottom:none; }
-  .ep input { width:auto; accent-color:var(--accent); }
-  .ep-list { max-height:320px; overflow:auto; margin-top:8px; }
+  .ep-list { max-height:340px; overflow:auto; margin-top:8px;
+        -webkit-overflow-scrolling:touch; }
 
   .jobs { margin-top:4px; }
-  .job { padding:14px; border:1px solid var(--line); border-radius:14px; margin-bottom:10px;
-         background:var(--panel-2); box-shadow:inset 0 1px 0 rgba(255,255,255,.10); }
-  .job .name { font-size:14px; font-weight:600; margin-bottom:8px; word-break:break-word; }
+  .job { padding:14px; border-radius:var(--r-ctl); margin-bottom:10px;
+         background:var(--bg-3); }
+  .job .name { font-size:17px; line-height:22px; font-weight:600;
+         margin-bottom:6px; word-break:break-word; }   /* HIG Headline */
 
   /* Мини-игра «Тетрис» как экран загрузки */
-  #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:8px 0 16px; }
-  .game-head { width:220px; display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
-  .game-bar { width:220px; display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--muted); }
+  #game { display:flex; flex-direction:column; align-items:center; gap:10px; margin:4px 0 8px; }
+  .game-head, .game-bar, .game-next { width:min(100%, 300px); display:flex;
+           align-items:center; gap:8px; font-size:13px; color:var(--label-2); }
+  .game-head, .game-bar { justify-content:space-between; }
   .game-btns { display:flex; gap:8px; }
-  .game-next { width:220px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
-  #next { background:rgba(12,16,16,.4); border:1px solid var(--line); border-radius:6px; }
-  #board { background:rgba(12,16,16,.55); border:1px solid var(--line); border-radius:10px;
-           box-shadow:inset 0 2px 9px rgba(0,0,0,.42); touch-action:none; }
+  #next { background:var(--fill-2); border-radius:8px; }
+  #board { background:#000; border:1px solid var(--sep); border-radius:12px;
+           touch-action:none; }
   .game-controls { display:flex; gap:8px; }
-  .gbtn { width:60px; height:50px; font-size:20px; color:var(--txt); border-radius:12px;
-          background:linear-gradient(180deg, rgba(255,255,255,.13), rgba(255,255,255,.05));
-          border:1px solid var(--line-2); user-select:none;
-          box-shadow:0 5px 12px rgba(12,22,22,.24), inset 0 1px 0 rgba(255,255,255,.16);
-          transition:transform .1s ease; }
-  .gbtn:active { transform:translateY(1px); filter:brightness(1.1); }
-  #gameOver { font-size:13px; color:var(--err); display:flex; gap:8px; align-items:center; }
+  .gbtn { width:64px; height:var(--hit); font-size:20px; color:var(--label);
+          border-radius:var(--r-ctl); background:var(--fill-2); user-select:none; }
+  #gameOver { font-size:15px; color:var(--red); display:flex; gap:8px; align-items:center; }
 
-  .meta { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.45; }
-  .done { color:var(--ok); }  .err { color:var(--err); }  .muted { color:var(--muted); }
+  .meta { font-size:13px; line-height:18px; color:var(--label-2); margin-top:6px; }
+  .done { color:var(--green); }  .err { color:var(--red); }  .muted { color:var(--label-2); }
   .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
 
-  /* Готовый файл / копирование — мягкий тёплый зелёный из палитры */
-  a.dl, button.copy { background:linear-gradient(180deg,#6fb89a,#4f9a7e);
-         box-shadow:0 7px 16px rgba(55,135,105,.30), inset 0 1px 0 rgba(255,255,255,.40),
-                    inset 0 -2px 5px rgba(40,95,75,.25); }
-  a.dl { display:inline-block; font-family:var(--disp); color:#fff; padding:9px 16px;
-         border-radius:11px; text-decoration:none; font-weight:600; letter-spacing:.2px;
-         transition:transform .12s ease, filter .12s ease; }
-  a.dl:hover { transform:translateY(-1px); filter:brightness(1.05); }
+  /* Готовый файл / копирование — systemGreen */
+  a.dl, button.copy { background:var(--green); color:#fff; }
+  a.dl { display:inline-flex; align-items:center; justify-content:center; gap:6px;
+         min-height:var(--hit); padding:0 18px; border-radius:var(--r-ctl);
+         font:600 17px/1 var(--font); text-decoration:none;
+         transition:opacity .15s ease; }
+  a.dl:hover { opacity:.85; }
+  a.dl:active { opacity:.6; }
 
-  textarea.ttext { min-height:220px; margin-top:10px; resize:vertical; line-height:1.55; font-size:16px; }
-  .tc-toggle { font-size:12px; color:var(--muted); display:inline-flex; align-items:center; gap:5px; cursor:pointer; }
-  .tc-toggle input { width:auto; margin:0; }
+  textarea.ttext { min-height:220px; margin-top:10px; resize:vertical;
+         font-size:15px; line-height:20px; }
+  .tc-toggle { font-size:13px; color:var(--label-2); display:inline-flex;
+         align-items:center; gap:8px; min-height:var(--hit-sm); cursor:pointer; }
+  /* Чекбокс в плотной панели кнопок — 20pt, но не мельче */
+  .tc-toggle input[type=checkbox] { width:20px; height:20px; }
+  .check-row { display:flex; align-items:center; gap:10px; min-height:var(--hit);
+         font-size:15px; line-height:20px; color:var(--label-2);
+         margin:4px 0 0; text-transform:none; letter-spacing:0; font-weight:400;
+         cursor:pointer; }
 
-  ::selection { background:rgba(255,93,177,.30); }
-  .hidden { display:none; }
+  ::selection { background:rgba(10,132,255,.35); }
+  /* !important: .hidden — утилита, она должна побеждать любые display:flex
+     у классов ниже по файлу (.selbar, .ep, .check-row и т.п.). */
+  .hidden { display:none !important; }
   .selbar { display:flex; gap:10px; align-items:center; margin:10px 0 4px; flex-wrap:wrap; }
+  .selbar .hint, .selbar label { margin:0; }
 
   /* Раскрывающаяся табличка файлов торрент-раздачи (нативный <details>) */
   details.tfiles { margin-top:10px; }
-  details.tfiles summary { cursor:pointer; font-size:12px; color:var(--muted);
-         list-style:none; }
+  details.tfiles summary { cursor:pointer; font-size:15px; color:var(--tint);
+         list-style:none; min-height:var(--hit-sm); display:flex; align-items:center; }
   details.tfiles summary::-webkit-details-marker { display:none; }
-  details.tfiles summary::before { content:"▸ "; }
-  details.tfiles[open] summary::before { content:"▾ "; }
-  .tfile-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 2px;
-         border-bottom:1px solid var(--line); font-size:13px; }
+  details.tfiles summary::before { content:"▸"; margin-right:6px; }
+  details.tfiles[open] summary::before { content:"▾"; }
+  .tfile-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+         min-height:var(--hit); padding:6px 2px;
+         border-bottom:1px solid var(--sep); font-size:15px; line-height:20px; }
   .tfile-row:last-child { border-bottom:none; }
-  .tfile-head { color:var(--muted); font-size:12px; user-select:none; }
+  .tfile-head { color:var(--label-2); font-size:13px; min-height:var(--hit-sm);
+         user-select:none; }
   .tfile-head span { cursor:pointer; }
-  .tfile-name { flex:1; word-break:break-word; }
-  .tfile-size { color:var(--muted); white-space:nowrap; }
+  /* Имени нужно не меньше 220px: если не влезает — переносим его на свою
+     строку целиком, а не ломаем название по буквам в узкой колонке. */
+  .tfile-name { flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
+  .tfile-head .tfile-name { flex:1 1 auto; }
+  .tfile-size { color:var(--label-2); white-space:nowrap; }
   .tfile-status { white-space:nowrap; }
-  .tfile-actions { white-space:nowrap; display:flex; gap:4px; align-items:center; }
+  .tfile-actions { white-space:nowrap; display:flex; gap:6px; align-items:center; }
   .tfile-bar { flex-basis:100%; order:5; height:4px; border-radius:2px;
-         background:var(--line); overflow:hidden; }
-  .tfile-bar-fill { height:100%; border-radius:2px;
-         background:linear-gradient(90deg, var(--accent), var(--accent2)); }
-  a.dl.small { padding:5px 10px; font-size:12px; }
+         background:var(--fill-2); overflow:hidden; }
+  .tfile-bar-fill { height:100%; border-radius:2px; background:var(--tint); }
 
   /* Плеер: оверлей поверх страницы с <video> */
-  .player-overlay { position:fixed; inset:0; z-index:50; background:rgba(10,14,14,.72);
+  .player-overlay { position:fixed; inset:0; z-index:50; background:rgba(0,0,0,.55);
+         -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px);
          display:flex; align-items:center; justify-content:center; padding:16px; }
-  .player-box { background:var(--panel-2); border:1px solid var(--line-2); border-radius:16px;
+  .player-box { background:var(--bg-2); border:1px solid var(--sep); border-radius:var(--r-card);
          padding:14px; max-width:min(920px, 100%); width:100%;
-         box-shadow:0 20px 50px rgba(0,0,0,.45); }
+         box-shadow:0 24px 60px rgba(0,0,0,.60); }
   .player-head { display:flex; align-items:center; justify-content:space-between; gap:12px;
-         margin-bottom:10px; font-size:14px; font-weight:600; word-break:break-word; }
+         margin-bottom:10px; font-size:17px; font-weight:600; word-break:break-word; }
   .player-body { min-height:80px; display:flex; align-items:center; justify-content:center; }
-  .player-body video { width:100%; max-height:70vh; border-radius:10px; background:#000; }
+  .player-body video { width:100%; max-height:70vh; border-radius:12px; background:#000; }
 
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
@@ -208,7 +251,7 @@
 
     <!-- Результат разбора -->
     <div class="card hidden gated cond" id="pickCard">
-      <div id="title" style="font-weight:600; margin-bottom:10px;"></div>
+      <div id="title" style="font-size:17px; font-weight:600; margin-bottom:12px;"></div>
 
       <div id="epBlock" class="hidden">
         <div class="selbar">
@@ -272,8 +315,8 @@
           <span class="hint" id="tFilePickCount"></span>
         </div>
         <div class="ep-list" id="tFilePickList"></div>
-        <label class="hint" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
-          <input type="checkbox" id="tFilePickAutoRest" style="width:auto">
+        <label class="check-row">
+          <input type="checkbox" id="tFilePickAutoRest">
           Докачать остальные файлы раздачи автоматически после выбранных
         </label>
         <div class="controls" style="margin-top:10px;">
@@ -328,7 +371,7 @@
   <div class="card gated" id="serverCard">
     <div class="selbar">
       <label style="margin:0">Файлы на сервере</label>
-      <span class="muted" id="diskFree" style="font-size:12px"></span>
+      <span class="muted" id="diskFree" style="font-size:13px"></span>
       <button class="ghost small" onclick="loadFiles()">⟳ Обновить</button>
     </div>
     <div class="jobs" id="serverList"></div>
@@ -1073,9 +1116,10 @@ const GAME = (function () {
     J: [[1, 0, 0], [1, 1, 1]],
     L: [[0, 0, 1], [1, 1, 1]],
   };
+  // Системные цвета Apple (тёмная тема) — те же, что у остального интерфейса
   const COLORS = {
-    I: "#00e5ff", O: "#ffd400", T: "#b14cff", S: "#33c481",
-    Z: "#ff5d6c", J: "#5b7cff", L: "#ff9f1a",
+    I: "#64d2ff", O: "#ffd60a", T: "#bf5af2", S: "#30d158",
+    Z: "#ff453a", J: "#0a84ff", L: "#ff9f0a",
   };
   let canvas, ctx, board, piece, color, px, py, nextKey;
   let score, lines, over, dropMs, acc, last, raf, started, paused;
@@ -1229,10 +1273,10 @@ const GAME = (function () {
   }
 
   function drawPaused() {
-    ctx.fillStyle = "rgba(8,12,12,.62)";
+    ctx.fillStyle = "rgba(0,0,0,.62)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#f4eee9";
-    ctx.font = "600 22px 'Space Grotesk', system-ui, sans-serif";
+    ctx.fillStyle = "#fff";
+    ctx.font = "600 22px -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif";
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText("ПАУЗА", canvas.width / 2, canvas.height / 2);
     ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
@@ -1405,7 +1449,7 @@ async function openPlayer(base, name) {
   body.style.display = "block";
   body.innerHTML = `
     <video controls autoplay src="${base}t=0"></video>
-    <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:12px">
+    <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:13px">
       <span class="muted" id="playClock">0:00</span>
       <input type="range" id="playSeek" min="0" max="${Math.floor(dur)}" value="0"
              step="1" style="flex:1" ${dur ? "" : "disabled"}>
