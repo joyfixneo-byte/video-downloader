@@ -920,7 +920,11 @@ def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
     cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
     if start > 0:
         cmd += ["-ss", str(start)]
-    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a?"]
+    # Только ПЕРВАЯ звуковая дорожка: в раздачах их бывает пять (дубляжи,
+    # комментарии), браузер всё равно играет одну, а перекодировать пришлось
+    # бы все — и достаточно одной экзотической (DTS-HD), чтобы ffmpeg упал
+    # целиком и поток пришёл пустым.
+    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a:0?"]
     cmd += _remux_codec_args(info if info is not None else _probe_media(src))
     cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4", "pipe:1"]
@@ -960,6 +964,9 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0):
         info = {} if native else _probe_media(target)
         return {"native": native, "duration": info.get("duration"),
                 "name": target.name,
+                # кодеки — чтобы плеер мог написать их в тексте ошибки:
+                # «не играет» без названий кодеков нечем чинить
+                "video": info.get("video"), "audio": info.get("audio"),
                 # перекодирование видео — это медленно, фронт предупреждает
                 "recode": bool(info) and info.get("video") not in BROWSER_VIDEO}
 

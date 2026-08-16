@@ -1480,15 +1480,19 @@ function closePlayer() {
 // Молчащий чёрный квадрат вместо видео — самое бесполезное, что может
 // показать плеер: у <video> ошибка декодирования не всплывает наружу, её
 // видно только по событию error на элементе. Ловим и пишем словами.
-function showPlayError(body) {
+function showPlayError(body, info) {
   const v = body.querySelector("video");
   if (!v) return;
   v.addEventListener("error", () => {
     if (body.querySelector(".play-err")) return;
+    // Без деталей («видео/звук такие-то, код ошибки такой-то») чинить нечего:
+    // у <video> наружу не всплывает ничего, кроме этого объекта.
+    const det = [(info || {}).video, (info || {}).audio,
+                 "код " + ((v.error || {}).code || "?")].filter(Boolean).join(" / ");
     body.insertAdjacentHTML("beforeend",
       '<div class="err play-err" style="margin-top:8px;font-size:13px">'
-      + 'Браузер не смог воспроизвести этот файл. Скачайте его кнопкой '
-      + '«Скачать» или откройте по адресу раздачи в VLC.</div>');
+      + 'Браузер не смог воспроизвести этот файл (' + escapeHtml(det) + '). '
+      + 'Скачайте его кнопкой «Скачать» или откройте по адресу раздачи в VLC.</div>');
   });
 }
 
@@ -1531,7 +1535,7 @@ async function openPlayer(base, name) {
 
   if (info.native) {   // браузер играет сам, с родной перемоткой
     body.innerHTML = `<video controls autoplay src="${base}"></video>`;
-    showPlayError(body);
+    showPlayError(body, info);
     return;
   }
 
@@ -1551,7 +1555,7 @@ async function openPlayer(base, name) {
       + 'его на лету. Может подтормаживать; для качества смотрите через VLC.'
       + '</div>' : ""}`;
   const video = body.querySelector("video");
-  showPlayError(body);
+  showPlayError(body, info);
   const seek = body.querySelector("#playSeek");
   const clock = body.querySelector("#playClock");
   let offset = 0;              // с какой секунды исходника начат текущий поток
