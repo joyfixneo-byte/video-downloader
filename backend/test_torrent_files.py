@@ -6,6 +6,7 @@
 """
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -504,6 +505,30 @@ def main():
         # ffprobe не сработал (пустой dict) — перекодируем на всякий случай,
         # это хуже по нагрузке, но играет всегда
         assert "copy" not in appmod._remux_codec_args({})
+
+        # --- 21в. Реальный баг: /api/play с настоящим ffmpeg падал с
+        # NameError (`_safe_name` вместо `safe_name`) — браузер получал 500
+        # вместо видео и показывал чёрный квадрат. Проверки выше это
+        # пропускали: они подменяли ffmpeg заведомо несуществующим бинарником
+        # и до строчки с ошибкой не доходили. Поэтому здесь — настоящий
+        # ffmpeg и настоящий поток. Без ffmpeg на машине проверка пропускается
+        # (на VM он есть, см. память test-env-has-real-binaries) ---
+        if shutil.which(appmod.FFMPEG_BIN):
+            real_dir = tmp / "jobrealplay"
+            real_dir.mkdir()
+            gen = subprocess.run(
+                [appmod.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
+                 "-f", "lavfi", "-i", "sine=frequency=440", "-t", "1",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 str(real_dir / "movie.mkv")], capture_output=True)
+            assert gen.returncode == 0, gen.stderr[-400:]
+            r = client.get("/api/play/jobrealplay")
+            assert r.status_code == 200, r.text[:400]
+            assert r.content[4:8] == b"ftyp", r.content[:32]   # это mp4, а не 500
+            # diag=1: та же команда с замером — чем чинить «не воспроизводится»
+            d = client.get("/api/play/jobrealplay", params={"diag": 1}).json()
+            assert d["code"] == 0 and d["bytes"] > 0, d
 
         # --- 22. Реальный баг: aria2 (--file-allocation=none) пишет куски
         # вразнобой, и как только записан ПОСЛЕДНИЙ кусок, st_size файла

@@ -1480,10 +1480,10 @@ function closePlayer() {
 // Молчащий чёрный квадрат вместо видео — самое бесполезное, что может
 // показать плеер: у <video> ошибка декодирования не всплывает наружу, её
 // видно только по событию error на элементе. Ловим и пишем словами.
-function showPlayError(body, info) {
+function showPlayError(body, info, base) {
   const v = body.querySelector("video");
   if (!v) return;
-  v.addEventListener("error", () => {
+  v.addEventListener("error", async () => {
     if (body.querySelector(".play-err")) return;
     // Без деталей («видео/звук такие-то, код ошибки такой-то») чинить нечего:
     // у <video> наружу не всплывает ничего, кроме этого объекта.
@@ -1492,7 +1492,21 @@ function showPlayError(body, info) {
     body.insertAdjacentHTML("beforeend",
       '<div class="err play-err" style="margin-top:8px;font-size:13px">'
       + 'Браузер не смог воспроизвести этот файл (' + escapeHtml(det) + '). '
-      + 'Скачайте его кнопкой «Скачать» или откройте по адресу раздачи в VLC.</div>');
+      + 'Скачайте его кнопкой «Скачать» или откройте по адресу раздачи в VLC.'
+      + '<div class="muted" style="margin-top:6px">Проверяю, что отдаёт сервер…</div></div>');
+    // Виноват сервер (ffmpeg не смог) или браузер (не понял поток) — по коду
+    // ошибки не различить. Спрашиваем сервер: сколько байт даёт ffmpeg за
+    // 3 секунды и что он пишет в stderr.
+    let d;
+    try { d = await (await fetch(base + "diag=1")).json(); }
+    catch (e) { d = { error: e.message }; }
+    const note = body.querySelector(".play-err .muted");
+    if (!note) return;
+    note.textContent = d.error
+      ? "Диагностика: " + d.error
+      : "ffmpeg за 3 с выдал " + (d.bytes || 0) + " байт (код " + d.code + ")"
+        + (d.stderr ? ": " + d.stderr : ".")
+        + (d.bytes ? " Данные есть — значит поток не доходит до браузера." : "");
   });
 }
 
@@ -1535,7 +1549,7 @@ async function openPlayer(base, name) {
 
   if (info.native) {   // браузер играет сам, с родной перемоткой
     body.innerHTML = `<video controls autoplay src="${base}"></video>`;
-    showPlayError(body, info);
+    showPlayError(body, info, base);
     return;
   }
 
@@ -1555,7 +1569,7 @@ async function openPlayer(base, name) {
       + 'его на лету. Может подтормаживать; для качества смотрите через VLC.'
       + '</div>' : ""}`;
   const video = body.querySelector("video");
-  showPlayError(body, info);
+  showPlayError(body, info, base);
   const seek = body.querySelector("#playSeek");
   const clock = body.querySelector("#playClock");
   let offset = 0;              // с какой секунды исходника начат текущий поток

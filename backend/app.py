@@ -912,11 +912,10 @@ def _remux_codec_args(info: dict) -> list:
     return args
 
 
-def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
-    """Генератор кусков mp4: ffmpeg перепаковывает дорожки в фрагментированный
-    mp4 и пишет в pipe. `-ss` ДО `-i` — перемотка по ключевым кадрам без чтения
-    всего файла. Субтитры в mp4 не влезают — намеренно отбрасываются, речь
-    только про воспроизведение."""
+def _remux_cmd(src: Path, start: float = 0.0, info: dict | None = None) -> list:
+    """Команда ffmpeg: перепаковка в фрагментированный mp4 в stdout. `-ss` ДО
+    `-i` — перемотка по ключевым кадрам без чтения всего файла. Субтитры в mp4
+    не влезают — намеренно отбрасываются, речь только про воспроизведение."""
     cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
     if start > 0:
         cmd += ["-ss", str(start)]
@@ -926,8 +925,29 @@ def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
     # целиком и поток пришёл пустым.
     cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a:0?"]
     cmd += _remux_codec_args(info if info is not None else _probe_media(src))
-    cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4", "pipe:1"]
+    return cmd + ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                  "-f", "mp4", "pipe:1"]
+
+
+def _remux_diag(src: Path) -> dict:
+    """Прогон той же команды на 3 секунды видео с замером: сколько байт отдал
+    ffmpeg и что написал в stderr. Нужно, когда в браузере «не воспроизводится»
+    — по одному коду ошибки <video> не понять, виноват сервер или клиент, а
+    лезть по ssh за журналом ради каждой проверки дорого."""
+    cmd = _remux_cmd(src)
+    cmd = cmd[:-1] + ["-t", "3", "pipe:1"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=120)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "cmd": " ".join(cmd)}
+    return {"bytes": len(out.stdout), "code": out.returncode,
+            "stderr": out.stderr.decode("utf-8", "replace")[-2000:],
+            "cmd": " ".join(cmd)}
+
+
+def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
+    """Генератор кусков mp4 из ffmpeg (см. _remux_cmd)."""
+    cmd = _remux_cmd(src, start, info)
     # ponytail: stderr в pipe и читаем только после смерти процесса — при
     # -loglevel error там пара строк, забить буфер нечем. Начнёт вешаться —
     # заменить на файл в /tmp.
@@ -952,13 +972,18 @@ def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
         proc.stdout.close()
 
 
-def _play_response(target: Path, t: float = 0.0, probe: int = 0):
+def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0):
     """Ответ плеера для готового файла. probe=1 — только справка о файле
     (нативный ли формат и длительность), чтобы фронт решил, нужен ли свой
-    ползунок. t — с какой секунды начать поток (перемотка для не нативных).
+    ползунок. diag=1 — отчёт о том, что выдаёт ffmpeg (см. _remux_diag).
+    t — с какой секунды начать поток (перемотка для не нативных).
     Общая логика для /api/play (загрузки) и /api/library/play (SMB-витрина):
     откуда взялся файл — не важно, дальше всё одинаково."""
     native = target.suffix.lower() in NATIVE_PLAYABLE
+
+    if diag:
+        return dict(_remux_diag(target), name=target.name,
+                    size=target.stat().st_size, **_probe_media(target))
 
     if probe:
         info = {} if native else _probe_media(target)
@@ -981,15 +1006,17 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0):
     return StreamingResponse(
         _remux_stream(target, max(0.0, t)), media_type="video/mp4",
         headers={"Content-Disposition":
-                 f'inline; filename="{_safe_name(target.stem)}.mp4"',
+                 f'inline; filename="{safe_name(target.stem)}.mp4"',
                  "Cache-Control": "no-store"})
 
 
 @app.get("/api/play/{job_id}")
-def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0):
+def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0,
+              diag: int = 0):
     """Просмотр в браузере файла загрузки/раздачи (см. _play_response)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    return _play_response(_resolve_ready_file(DOWNLOAD_DIR / safe, path), t, probe)
+    return _play_response(_resolve_ready_file(DOWNLOAD_DIR / safe, path), t,
+                          probe, diag)
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
@@ -1812,7 +1839,7 @@ def library_file(name: str):
 
 
 @app.get("/api/library/play")
-def library_play(name: str, t: float = 0.0, probe: int = 0):
+def library_play(name: str, t: float = 0.0, probe: int = 0, diag: int = 0):
     """Просмотр файла витрины в браузере — та же логика, что и для загрузок
     (см. _play_response): mp4 отдаём как есть, mkv перепаковываем на лету.
     Без пароля, как /api/library/file: <video> не умеет слать заголовок с
@@ -1820,7 +1847,7 @@ def library_play(name: str, t: float = 0.0, probe: int = 0):
     target = _safe_share_file(name)
     if not target.exists() or not target.is_file():
         raise HTTPException(404, "Файл не найден")
-    return _play_response(target, t, probe)
+    return _play_response(target, t, probe, diag)
 
 
 class LibraryDeleteRequest(BaseModel):
