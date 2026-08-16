@@ -490,6 +490,21 @@ def main():
         finally:
             appmod.FFMPEG_BIN, appmod.FFPROBE_BIN = old_ffmpeg, old_ffprobe
 
+        # --- 21b. Реальный баг: в плеере был чёрный квадрат. Раздачи с
+        # трекера — это часто HEVC + AC3/DTS, а `-c copy` тащил их в mp4 как
+        # есть: DTS туда вообще не мукается (ffmpeg падал на старте, поток
+        # приходил пустым), HEVC/AC3 не декодирует браузер. Копируем дорожку
+        # только если её поймёт браузер, иначе перекодируем ---
+        args = appmod._remux_codec_args({"video": "h264", "audio": "aac"})
+        assert args == ["-c:v", "copy", "-c:a", "copy"], args
+        args = appmod._remux_codec_args({"video": "hevc", "audio": "dts"})
+        assert "libx264" in args and "aac" in args and "copy" not in args, args
+        args = appmod._remux_codec_args({"video": "h264", "audio": "eac3"})
+        assert args[:2] == ["-c:v", "copy"] and "aac" in args, args
+        # ffprobe не сработал (пустой dict) — перекодируем на всякий случай,
+        # это хуже по нагрузке, но играет всегда
+        assert "copy" not in appmod._remux_codec_args({})
+
         # --- 22. Реальный баг: aria2 (--file-allocation=none) пишет куски
         # вразнобой, и как только записан ПОСЛЕДНИЙ кусок, st_size файла
         # становится полным, а середина — дыры (sparse), читаются нулями.

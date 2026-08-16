@@ -863,37 +863,83 @@ def _play_cache_path(target: Path) -> Path:
     return target.with_name("." + target.name + ".play.mp4")
 
 
-def _media_duration(src: Path) -> float | None:
-    """Длительность файла в секундах (для ползунка перемотки в плеере).
-    None — ffprobe недоступен или не смог разобрать файл."""
+# Что браузер умеет декодировать. Всё остальное в mkv с трекера (HEVC-видео,
+# AC3/EAC3/DTS-звук) нужно ПЕРЕкодировать, а не копировать: DTS/TrueHD ffmpeg
+# в mp4 вообще не запакует — процесс падал на старте, поток приходил пустым, и
+# в плеере оставался чёрный квадрат без единого кадра.
+BROWSER_VIDEO = {"h264", "vp8", "vp9", "av1"}
+BROWSER_AUDIO = {"aac", "mp3"}
+
+
+def _probe_media(src: Path) -> dict:
+    """Длительность (для ползунка перемотки) и кодеки первых дорожек.
+    Пустой dict — ffprobe недоступен или не смог разобрать файл."""
     try:
         out = subprocess.run(
-            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(src)],
+            [FFPROBE_BIN, "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,codec_name",
+             "-of", "json", str(src)],
             capture_output=True, text=True, timeout=30)
-        return float(out.stdout.strip())
+        data = json.loads(out.stdout)
     except Exception:
-        return None
+        return {}
+    info = {}
+    try:
+        info["duration"] = float(data["format"]["duration"])
+    except Exception:
+        pass
+    for s in data.get("streams", []):
+        kind = s.get("codec_type")          # video / audio / subtitle
+        if kind in ("video", "audio") and kind not in info:
+            info[kind] = s.get("codec_name")
+    return info
 
 
-def _remux_stream(src: Path, start: float = 0.0):
-    """Генератор кусков mp4: ffmpeg перепаковывает (не перекодирует) дорожки
-    в фрагментированный mp4 и пишет в pipe. `-ss` ДО `-i` — перемотка по
-    ключевым кадрам без чтения всего файла. Субтитры в mp4 не влезают —
-    намеренно отбрасываются, речь только про воспроизведение."""
+def _remux_codec_args(info: dict) -> list:
+    """Аргументы дорожек для ffmpeg: копировать браузерные кодеки как есть,
+    остальные перекодировать. Звук перекодируется почти даром, видео (HEVC)
+    заметно грузит VM — но иначе смотреть нельзя вообще."""
+    args = []
+    if info.get("video") in BROWSER_VIDEO:
+        args += ["-c:v", "copy"]
+    else:
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-pix_fmt", "yuv420p"]   # 10-битный HEVC иначе браузер не возьмёт
+    if info.get("audio") in BROWSER_AUDIO:
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    return args
+
+
+def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
+    """Генератор кусков mp4: ffmpeg перепаковывает дорожки в фрагментированный
+    mp4 и пишет в pipe. `-ss` ДО `-i` — перемотка по ключевым кадрам без чтения
+    всего файла. Субтитры в mp4 не влезают — намеренно отбрасываются, речь
+    только про воспроизведение."""
     cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
     if start > 0:
         cmd += ["-ss", str(start)]
-    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a?"]
+    cmd += _remux_codec_args(info if info is not None else _probe_media(src))
+    cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-f", "mp4", "pipe:1"]
+    # ponytail: stderr в pipe и читаем только после смерти процесса — при
+    # -loglevel error там пара строк, забить буфер нечем. Начнёт вешаться —
+    # заменить на файл в /tmp.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
+                            stderr=subprocess.PIPE)
+    empty = True
     try:
         while True:
             chunk = proc.stdout.read(64 * 1024)
             if not chunk:
+                if empty:   # ffmpeg умер, не отдав ни байта — видно в journalctl
+                    print("play: ffmpeg не отдал данных:",
+                          proc.stderr.read(4096).decode("utf-8", "replace"),
+                          flush=True)
                 return
+            empty = False
             yield chunk
     finally:
         # Закрыли вкладку / перемотали — ffmpeg должен умереть сразу, иначе
@@ -911,8 +957,11 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0):
     native = target.suffix.lower() in NATIVE_PLAYABLE
 
     if probe:
-        return {"native": native, "duration": _media_duration(target),
-                "name": target.name}
+        info = {} if native else _probe_media(target)
+        return {"native": native, "duration": info.get("duration"),
+                "name": target.name,
+                # перекодирование видео — это медленно, фронт предупреждает
+                "recode": bool(info) and info.get("video") not in BROWSER_VIDEO}
 
     if native:
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"

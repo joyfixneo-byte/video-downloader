@@ -1477,6 +1477,21 @@ function closePlayer() {
   ov.remove();                                                // ffmpeg на сервере умрёт
 }
 
+// Молчащий чёрный квадрат вместо видео — самое бесполезное, что может
+// показать плеер: у <video> ошибка декодирования не всплывает наружу, её
+// видно только по событию error на элементе. Ловим и пишем словами.
+function showPlayError(body) {
+  const v = body.querySelector("video");
+  if (!v) return;
+  v.addEventListener("error", () => {
+    if (body.querySelector(".play-err")) return;
+    body.insertAdjacentHTML("beforeend",
+      '<div class="err play-err" style="margin-top:8px;font-size:13px">'
+      + 'Браузер не смог воспроизвести этот файл. Скачайте его кнопкой '
+      + '«Скачать» или откройте по адресу раздачи в VLC.</div>');
+  });
+}
+
 function fmtClock(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -1516,6 +1531,7 @@ async function openPlayer(base, name) {
 
   if (info.native) {   // браузер играет сам, с родной перемоткой
     body.innerHTML = `<video controls autoplay src="${base}"></video>`;
+    showPlayError(body);
     return;
   }
 
@@ -1529,8 +1545,13 @@ async function openPlayer(base, name) {
       <input type="range" id="playSeek" min="0" max="${Math.floor(dur)}" value="0"
              step="1" style="flex:1" ${dur ? "" : "disabled"}>
       <span class="muted">${dur ? fmtClock(dur) : "длительность неизвестна"}</span>
-    </div>`;
+    </div>
+    ${info.recode ? '<div class="muted" style="margin-top:6px;font-size:13px">'
+      + 'Видео в формате, который браузер не понимает — сервер перекодирует '
+      + 'его на лету. Может подтормаживать; для качества смотрите через VLC.'
+      + '</div>' : ""}`;
   const video = body.querySelector("video");
+  showPlayError(body);
   const seek = body.querySelector("#playSeek");
   const clock = body.querySelector("#playClock");
   let offset = 0;              // с какой секунды исходника начат текущий поток
