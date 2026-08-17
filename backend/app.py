@@ -12,14 +12,17 @@ import time
 import uuid
 import shutil
 import socket
+import tempfile
 import ipaddress
 import mimetypes
 import threading
 import traceback
 import subprocess
+import http.cookiejar
+import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse, quote, unquote_plus
+from urllib.parse import urlparse, quote, unquote_plus, urlencode
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -872,61 +875,81 @@ BROWSER_AUDIO = {"aac", "mp3"}
 
 
 def _probe_media(src: Path) -> dict:
-    """Длительность (для ползунка перемотки) и кодеки первых дорожек.
+    """Длительность (для ползунка перемотки), кодек видео и СПИСОК звуковых
+    дорожек (язык/название/каналы) — из него плеер строит выпадашку выбора.
     Пустой dict — ffprobe недоступен или не смог разобрать файл."""
     try:
         out = subprocess.run(
             [FFPROBE_BIN, "-v", "error", "-show_entries",
-             "format=duration:stream=codec_type,codec_name",
+             "format=duration:stream=codec_type,codec_name,channels"
+             ":stream_tags=language,title",
              "-of", "json", str(src)],
             capture_output=True, text=True, timeout=30)
         data = json.loads(out.stdout)
     except Exception:
         return {}
-    info = {}
+    info = {"atracks": []}
     try:
         info["duration"] = float(data["format"]["duration"])
     except Exception:
         pass
     for s in data.get("streams", []):
         kind = s.get("codec_type")          # video / audio / subtitle
+        if kind == "audio":
+            tags = s.get("tags") or {}
+            info["atracks"].append({"codec": s.get("codec_name"),
+                                    "lang": tags.get("language"),
+                                    "title": tags.get("title"),
+                                    "channels": s.get("channels")})
         if kind in ("video", "audio") and kind not in info:
             info[kind] = s.get("codec_name")
     return info
 
 
-def _remux_codec_args(info: dict) -> list:
+def _remux_codec_args(info: dict, a: int = 0) -> list:
     """Аргументы дорожек для ffmpeg: копировать браузерные кодеки как есть,
     остальные перекодировать. Звук перекодируется почти даром, видео (HEVC)
-    заметно грузит VM — но иначе смотреть нельзя вообще."""
+    заметно грузит VM — но иначе смотреть нельзя вообще. `a` — номер выбранной
+    звуковой дорожки: смотрим кодек именно её, а не первой в файле."""
+    tracks = info.get("atracks") or []
+    audio = tracks[a]["codec"] if 0 <= a < len(tracks) else info.get("audio")
     args = []
     if info.get("video") in BROWSER_VIDEO:
         args += ["-c:v", "copy"]
     else:
         args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                  "-pix_fmt", "yuv420p"]   # 10-битный HEVC иначе браузер не возьмёт
-    if info.get("audio") in BROWSER_AUDIO:
+    if audio in BROWSER_AUDIO:
         args += ["-c:a", "copy"]
     else:
         args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
     return args
 
 
-def _remux_cmd(src: Path, start: float = 0.0, info: dict | None = None) -> list:
-    """Команда ffmpeg: перепаковка в фрагментированный mp4 в stdout. `-ss` ДО
-    `-i` — перемотка по ключевым кадрам без чтения всего файла. Субтитры в mp4
-    не влезают — намеренно отбрасываются, речь только про воспроизведение."""
-    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
+def _input_args(src: Path, start: float, a: int, info: dict | None) -> list:
+    """Общая часть команды ffmpeg для обоих способов отдачи (mp4-поток и HLS):
+    `-ss` ДО `-i` (перемотка по ключевым кадрам без чтения всего файла), видео
+    и ОДНА звуковая дорожка — та, что выбрал пользователь.
+
+    Одна, а не все: в раздачах их до пяти (дубляжи, комментарии), каждую
+    пришлось бы перекодировать, и достаточно одной экзотической (DTS-HD),
+    чтобы ffmpeg упал целиком. Выбор при этом не теряется — дорожка меняется
+    перезапросом потока с ?a=<номер> (см. /api/play). Субтитры отбрасываются:
+    в mp4 они не влезают, речь только про воспроизведение."""
+    cmd = []
     if start > 0:
         cmd += ["-ss", str(start)]
-    # Только ПЕРВАЯ звуковая дорожка: в раздачах их бывает пять (дубляжи,
-    # комментарии), браузер всё равно играет одну, а перекодировать пришлось
-    # бы все — и достаточно одной экзотической (DTS-HD), чтобы ffmpeg упал
-    # целиком и поток пришёл пустым.
-    cmd += ["-i", str(src), "-map", "0:v:0", "-map", "0:a:0?"]
-    cmd += _remux_codec_args(info if info is not None else _probe_media(src))
-    return cmd + ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                  "-f", "mp4", "pipe:1"]
+    cmd += ["-i", str(src), "-map", "0:v:0", "-map", f"0:a:{a}?"]
+    return cmd + _remux_codec_args(info if info is not None else _probe_media(src), a)
+
+
+def _remux_cmd(src: Path, start: float = 0.0, info: dict | None = None,
+               a: int = 0) -> list:
+    """Команда ffmpeg: перепаковка в фрагментированный mp4 в stdout."""
+    return ([FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
+            + _input_args(src, start, a, info)
+            + ["-movflags", "frag_keyframe+empty_moov+default_base_moof",
+               "-f", "mp4", "pipe:1"])
 
 
 def _remux_diag(src: Path) -> dict:
@@ -945,9 +968,10 @@ def _remux_diag(src: Path) -> dict:
             "cmd": " ".join(cmd)}
 
 
-def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
+def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None,
+                  a: int = 0):
     """Генератор кусков mp4 из ffmpeg (см. _remux_cmd)."""
-    cmd = _remux_cmd(src, start, info)
+    cmd = _remux_cmd(src, start, info, a)
     # ponytail: stderr в pipe и читаем только после смерти процесса — при
     # -loglevel error там пара строк, забить буфер нечем. Начнёт вешаться —
     # заменить на файл в /tmp.
@@ -972,11 +996,103 @@ def _remux_stream(src: Path, start: float = 0.0, info: dict | None = None):
         proc.stdout.close()
 
 
-def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0):
+# --- HLS: единственный способ отдать поток в Safari -------------------------
+# Установленный факт (Chrome тот же файл играет, Safari — нет, код 4): Safari
+# не берёт progressive fMP4 без Content-Length и без поддержки Range. Длины у
+# потока перекодирования нет и быть не может, поэтому для Safari отдаём ровно
+# то, что он умеет — HLS: тот же ffmpeg пишет сегменты в /tmp, браузер играет
+# плейлист нативно (никаких библиотек на фронте). Chrome остаётся на mp4-потоке.
+HLS_ROOT = Path(tempfile.gettempdir()) / "vd-hls"
+HLS_SESSIONS: dict[str, subprocess.Popen] = {}   # ключ сессии -> ffmpeg
+HLS_MAX_LIVE = 3          # больше одновременных сессий = зря греем VM
+
+
+def _hls_stop(key: str):
+    """Убить ffmpeg сессии и стереть её сегменты."""
+    proc = HLS_SESSIONS.pop(key, None)
+    if proc:
+        proc.kill()
+    shutil.rmtree(HLS_ROOT / key, ignore_errors=True)
+
+
+def _hls_cleanup():
+    """Сессии, о которых забыли: вкладку закрыли не по-человечески (свернули,
+    выключили телефон), stop не пришёл — ffmpeg с `-re` тихо перекодировал бы
+    фильм до конца, забивая /tmp. Чистим мёртвых и держим потолок живых."""
+    for key in list(HLS_SESSIONS):
+        if HLS_SESSIONS[key].poll() is not None:
+            HLS_SESSIONS.pop(key, None)
+        elif len(HLS_SESSIONS) > HLS_MAX_LIVE:
+            _hls_stop(key)                     # dict упорядочен — уходит старейшая
+    for d in HLS_ROOT.glob("*"):               # мусор от прошлых запусков сервиса
+        if d.is_dir() and d.name not in HLS_SESSIONS \
+                and time.time() - d.stat().st_mtime > 600:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _hls_start(src: Path, start: float, a: int, info: dict) -> str:
+    """Запустить ffmpeg в режиме HLS и дождаться первого сегмента. Возвращает
+    ключ сессии; плейлист — /api/hls/<ключ>/index.m3u8."""
+    _hls_cleanup()
+    key = uuid.uuid4().hex[:12]
+    d = HLS_ROOT / key
+    d.mkdir(parents=True, exist_ok=True)
+    # -re: читать в темпе воспроизведения. Без него ffmpeg перекодирует фильм
+    # целиком за считанные минуты и положит все гигабайты сегментов в /tmp.
+    # ponytail: запас у плеера = пара сегментов; начнёт спотыкаться на плохой
+    # сети — поднять до `-readrate 2` (ffmpeg 5+).
+    cmd = ([FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-re"]
+           + _input_args(src, start, a, info)
+           + ["-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event",
+              "-hls_flags", "independent_segments+temp_file",
+              "-hls_segment_filename", str(d / "s%05d.ts"), str(d / "index.m3u8")])
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    HLS_SESSIONS[key] = proc
+    playlist = d / "index.m3u8"
+    # Плейлист появляется только после первого сегмента: у копии видео это
+    # секунды, у перекодирования HEVC на слабой VM — заметно дольше.
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if playlist.exists() and playlist.stat().st_size > 0:
+            return key
+        if proc.poll() is not None:
+            err = proc.stderr.read(2000).decode("utf-8", "replace").strip()
+            _hls_stop(key)
+            raise HTTPException(500, f"ffmpeg не смог подготовить поток: {err}")
+        time.sleep(0.3)
+    _hls_stop(key)
+    raise HTTPException(504, "Сервер не успел подготовить поток за 90 секунд.")
+
+
+@app.get("/api/hls/{key}/{name}")
+def hls_file(key: str, name: str):
+    """Плейлист и сегменты запущенной HLS-сессии (см. _hls_start)."""
+    if not re.fullmatch(r"[a-f0-9]{12}", key) or not re.fullmatch(r"[\w.]+", name):
+        raise HTTPException(404, "Не найдено")
+    f = HLS_ROOT / key / name
+    if not f.is_file():
+        raise HTTPException(404, "Не найдено")
+    kind = ("application/vnd.apple.mpegurl" if name.endswith(".m3u8")
+            else "video/mp2t")
+    return FileResponse(f, media_type=kind, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/hls/{key}/stop")
+def hls_stop(key: str):
+    """Плеер закрыли или перемотали — гасим ffmpeg и стираем сегменты."""
+    if re.fullmatch(r"[a-f0-9]{12}", key):
+        _hls_stop(key)
+    return {"ok": True}
+
+
+def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0,
+                   a: int = 0, hls: int = 0):
     """Ответ плеера для готового файла. probe=1 — только справка о файле
-    (нативный ли формат и длительность), чтобы фронт решил, нужен ли свой
-    ползунок. diag=1 — отчёт о том, что выдаёт ffmpeg (см. _remux_diag).
-    t — с какой секунды начать поток (перемотка для не нативных).
+    (нативный ли формат, длительность, звуковые дорожки), чтобы фронт решил,
+    нужен ли свой ползунок и выпадашка дорожек. diag=1 — отчёт о том, что
+    выдаёт ffmpeg (см. _remux_diag). hls=1 — Safari: вместо потока запускаем
+    HLS-сессию и отдаём адрес плейлиста. t — с какой секунды начать,
+    a — номер звуковой дорожки.
     Общая логика для /api/play (загрузки) и /api/library/play (SMB-витрина):
     откуда взялся файл — не важно, дальше всё одинаково."""
     native = target.suffix.lower() in NATIVE_PLAYABLE
@@ -992,6 +1108,7 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0):
                 # кодеки — чтобы плеер мог написать их в тексте ошибки:
                 # «не играет» без названий кодеков нечем чинить
                 "video": info.get("video"), "audio": info.get("audio"),
+                "atracks": info.get("atracks") or [],
                 # перекодирование видео — это медленно, фронт предупреждает
                 "recode": bool(info) and info.get("video") not in BROWSER_VIDEO}
 
@@ -1003,8 +1120,11 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0):
     if not shutil.which(FFMPEG_BIN):
         raise HTTPException(500, "ffmpeg не установлен на сервере — "
                                  "просмотр в браузере недоступен.")
+    if hls:
+        key = _hls_start(target, max(0.0, t), max(0, a), _probe_media(target))
+        return {"key": key, "url": f"/api/hls/{key}/index.m3u8"}
     return StreamingResponse(
-        _remux_stream(target, max(0.0, t)), media_type="video/mp4",
+        _remux_stream(target, max(0.0, t), a=max(0, a)), media_type="video/mp4",
         headers={"Content-Disposition":
                  f'inline; filename="{safe_name(target.stem)}.mp4"',
                  "Cache-Control": "no-store"})
@@ -1012,11 +1132,11 @@ def _play_response(target: Path, t: float = 0.0, probe: int = 0, diag: int = 0):
 
 @app.get("/api/play/{job_id}")
 def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0,
-              diag: int = 0):
+              diag: int = 0, a: int = 0, hls: int = 0):
     """Просмотр в браузере файла загрузки/раздачи (см. _play_response)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
     return _play_response(_resolve_ready_file(DOWNLOAD_DIR / safe, path), t,
-                          probe, diag)
+                          probe, diag, a, hls)
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
@@ -1076,10 +1196,18 @@ def _search_torrents(query: str) -> list:
 
 
 def _resolve_magnet(detail: str) -> str:
-    """Достаёт magnet-ссылку со страницы конкретной раздачи 1337x."""
-    if not detail.startswith("/torrent/"):
+    """Достаёт magnet-ссылку со страницы конкретной раздачи. Источник узнаём по
+    самому пути: 1337x отдаёт /torrent/…, rutracker — /viewtopic.php?t=… (его
+    страницу открываем с кукой сессии, гостю magnet там не показывают).
+    Константы rutracker — в блоке ниже."""
+    if detail.startswith(RT_DETAIL_PREFIX):
+        if not re.fullmatch(r"/viewtopic\.php\?t=\d+", detail):
+            raise HTTPException(400, "Некорректная ссылка на раздачу")
+        page = _rt_get(detail)
+    elif detail.startswith("/torrent/"):
+        page = _tracker_get(f"{TRACKER_BASE}{detail}")
+    else:
         raise HTTPException(400, "Некорректная ссылка на раздачу")
-    page = _tracker_get(f"{TRACKER_BASE}{detail}")
     m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', page)
     if not m:
         raise HTTPException(502, "Не удалось получить magnet-ссылку раздачи")
@@ -1095,6 +1223,174 @@ def _resolve_torrent_source(magnet: str, detail: str) -> str:
     if not MAGNET_RE.match(magnet):
         raise HTTPException(400, "Нужна корректная magnet-ссылка")
     return magnet
+
+
+# --- Rutracker: второй источник поиска (нужен доступ к сайту) --------------
+# Rutracker закрыт для РФ-адресов, то есть работает только на инстансе, у
+# которого egress идёт через VPN. Какой именно это инстанс, приложение не знает
+# и знать не должно: код на обеих машинах одинаковый, а видимость раздела
+# решает проба соединения (_rt_probe) — по её результату /api/config говорит
+# фронту, показывать карточку поиска или плашку «нужен VPN».
+#
+# Клиент пишем на stdlib, как и скрейпер 1337x выше: нужны ровно логин и разбор
+# таблицы результатов — ради этого не тянем в проект requests+bs4+lxml.
+# Скачивание переиспользует общий торрент-пайплайн без изменений: результат
+# поиска несёт detail-путь, из которого _resolve_magnet берёт magnet.
+# ⚠️ Только личный просмотр легального контента (дистрибутивы и т.п.).
+
+RUTRACKER_BASE = "https://rutracker.org/forum"
+RUTRACKER_LOGIN = os.environ.get("RUTRACKER_LOGIN", "")
+RUTRACKER_PASSWORD = os.environ.get("RUTRACKER_PASSWORD", "")
+RT_DETAIL_PREFIX = "/viewtopic.php?t="  # так отличаем раздачу rutracker от 1337x
+RT_TIMEOUT = 20          # секунд на обычный запрос к сайту
+RT_PROBE_TIMEOUT = 5     # секунд на пробу доступности: /api/config не ждёт сеть
+RT_TTL = 600             # 10 минут — как часто перепроверяем доступность
+RT_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0 Safari/537.36"),
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
+
+_RT_LOCK = threading.Lock()
+_RT_OPENER = None        # общий opener с кукой сессии; None — ещё не логинились
+# Кеш пробы: state — "ok" | "no_network" | "no_account" | "checking".
+_RT_STATE = {"state": "checking", "at": 0.0}
+
+
+def _rt_decode(raw: bytes) -> str:
+    """Страницы rutracker отдаются в windows-1251. Без явного декодирования
+    кириллица в названиях раздач превращается в мусор."""
+    return raw.decode("cp1251", "replace")
+
+
+def _rt_login():
+    """Логинится и возвращает opener с кукой сессии. Гостю rutracker не
+    показывает ни поиск, ни magnet, поэтому без логина смысла нет. Кука живёт
+    только в памяти процесса. Пароль не логируем и не подставляем в текст
+    ошибок — наружу уходят только свои формулировки."""
+    if not (RUTRACKER_LOGIN and RUTRACKER_PASSWORD):
+        raise HTTPException(503, "Аккаунт rutracker не настроен на сервере "
+                                 "(RUTRACKER_LOGIN / RUTRACKER_PASSWORD).")
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar))
+    data = urlencode({"login_username": RUTRACKER_LOGIN,
+                      "login_password": RUTRACKER_PASSWORD,
+                      "login": "вход"}, encoding="cp1251").encode()
+    req = urllib.request.Request(f"{RUTRACKER_BASE}/login.php", data=data,
+                                  headers=RT_HEADERS)
+    try:
+        page = _rt_decode(opener.open(req, timeout=RT_TIMEOUT).read())
+    except Exception:
+        _RT_STATE.update(state="no_network", at=time.time())
+        raise HTTPException(502, "Rutracker недоступен с этого сервера "
+                                 "(нужен доступ через VPN).")
+    # Успех виден по сессионной куке — это надёжнее, чем искать слова на
+    # странице: разметка и язык интерфейса меняются, кука нет.
+    if not any(c.name == "bb_session" for c in jar):
+        raise HTTPException(
+            502, "Rutracker просит капчу — зайди на сайт браузером и пройди её."
+            if "captcha" in page.lower() else
+            "Логин на rutracker не прошёл: проверь RUTRACKER_LOGIN/PASSWORD.")
+    return opener
+
+
+def _rt_get(path: str) -> str:
+    """GET страницы rutracker с кукой сессии. Если сессия протухла (сайт снова
+    показывает форму логина) — логинимся заново и повторяем ровно один раз."""
+    global _RT_OPENER
+    req = urllib.request.Request(RUTRACKER_BASE + path, headers=RT_HEADERS)
+    for attempt in (1, 2):
+        with _RT_LOCK:
+            if _RT_OPENER is None:
+                _RT_OPENER = _rt_login()
+            opener = _RT_OPENER
+        try:
+            page = _rt_decode(opener.open(req, timeout=RT_TIMEOUT).read())
+        except Exception:
+            _RT_STATE.update(state="no_network", at=time.time())
+            raise HTTPException(502, "Rutracker не ответил (нужен доступ "
+                                     "через VPN или сайт лежит).")
+        if 'name="login_password"' not in page:
+            return page
+        with _RT_LOCK:
+            _RT_OPENER = None       # протухла — второй заход уже с новым логином
+    raise HTTPException(502, "Не удалось войти на rutracker — сессия не держится.")
+
+
+def _rt_size(n: int) -> str:
+    """Размер раздачи человеку: меньше гигабайта показываем в мегабайтах,
+    иначе «0.3 ГБ» на каждой второй раздаче."""
+    return _gb(n) if n >= 1024 ** 3 else f"{n / 1024 ** 2:.0f} МБ"
+
+
+def _rt_parse_rows(page: str) -> list:
+    """Разбирает таблицу результатов rutracker. Форма ответа — ровно та же,
+    что у _search_torrents (1337x): фронт и вся дальнейшая цепочка скачивания
+    не различают источники. ⚠️ Хрупкая часть: сменится вёрстка — вернём пусто,
+    тогда остаётся ручной magnet. Отделено от сети ради test_rutracker.py."""
+    out = []
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", page, re.S):
+        m = re.search(r'<a[^>]+href="viewtopic\.php\?t=(\d+)"[^>]*>(.*?)</a>',
+                       row, re.S)
+        if not m:
+            continue
+        size = re.search(r'tor-size[^>]*>\s*<u>(\d+)</u>', row)
+        seeds = re.search(r'seedmed[^>]*>\s*(\d+)', row)
+        leech = re.search(r'leechmed[^>]*>\s*(\d+)', row)
+        out.append({
+            "title": html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip(),
+            "detail": f"{RT_DETAIL_PREFIX}{m.group(1)}",
+            "size": _rt_size(int(size.group(1))) if size else "?",
+            "seeders": int(seeds.group(1)) if seeds else 0,
+            "leechers": int(leech.group(1)) if leech else 0,
+        })
+        if len(out) >= 30:
+            break
+    out.sort(key=lambda x: x["seeders"], reverse=True)  # больше сидов — выше
+    return out
+
+
+def _search_rutracker(query: str) -> list:
+    """Поиск раздач: страница результатов + разбор (см. _rt_parse_rows)."""
+    return _rt_parse_rows(_rt_get(f"/tracker.php?nm={quote(query)}"))
+
+
+def _rt_probe() -> str:
+    """Одна проба: пускает ли сеть этой машины на rutracker. Логин здесь не
+    делаем — вопрос ровно один, есть ли доступ (на инстансе без VPN его нет).
+    HTTPS выбран намеренно: подменённый DNS или заглушка провайдера дадут
+    ошибку TLS, а не ложный 200."""
+    if not (RUTRACKER_LOGIN and RUTRACKER_PASSWORD):
+        return "no_account"
+    req = urllib.request.Request(f"{RUTRACKER_BASE}/index.php",
+                                  headers=RT_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=RT_PROBE_TIMEOUT) as r:
+            return "ok" if r.status == 200 else "no_network"
+    except Exception:
+        return "no_network"
+
+
+def _rt_refresh():
+    _RT_STATE.update(state=_rt_probe(), at=time.time())
+
+
+def rutracker_state() -> str:
+    """Состояние для фронта, всегда мгновенно: отдаём кеш, а протухший кеш
+    обновляем в фоне — /api/config не должен ждать сеть. Отметку времени
+    двигаем до запуска пробы, чтобы параллельные запросы не наплодили потоков.
+    """
+    if time.time() - _RT_STATE["at"] > RT_TTL:
+        _RT_STATE["at"] = time.time()
+        threading.Thread(target=_rt_refresh, daemon=True).start()
+    return _RT_STATE["state"]
+
+
+# Первая проба — сразу при старте, в фоне: к моменту, когда кто-то откроет
+# страницу, состояние обычно уже известно и плашка не мигает «проверяю…».
+threading.Thread(target=_rt_refresh, daemon=True).start()
 
 
 def _bytes_from_aria2(s: str):
@@ -1361,21 +1657,42 @@ class TorrentRequest(BaseModel):
                               # после выбранных (имеет смысл только с token)
 
 
-@app.get("/api/torrent/search", dependencies=[Depends(check_password)])
-def torrent_search(q: str):
+def _check_query(q: str) -> str:
+    """Общая проверка поискового запроса для обоих источников."""
     q = (q or "").strip()
     if len(q) < 2:
         raise HTTPException(400, "Слишком короткий запрос")
     if len(q) > 200:
         raise HTTPException(400, "Слишком длинный запрос")
+    return q
+
+
+@app.get("/api/torrent/search", dependencies=[Depends(check_password)])
+def torrent_search(q: str):
     try:
-        return {"results": _search_torrents(q)}
+        return {"results": _search_torrents(_check_query(q))}
     except HTTPException:
         raise
     except Exception:
         traceback.print_exc()
         raise HTTPException(
             502, "Поиск сейчас недоступен (трекер не ответил или сменил "
+                 "вёрстку). Можно вставить magnet-ссылку вручную.")
+
+
+@app.get("/api/rutracker/search", dependencies=[Depends(check_password)])
+def rutracker_search(q: str):
+    """Второй источник поиска. Работает только там, где до сайта дотягивается
+    сеть; на инстансе без VPN фронт эту карточку не показывает вовсе
+    (состояние приходит в /api/config)."""
+    try:
+        return {"results": _search_rutracker(_check_query(q))}
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            502, "Поиск по rutracker не удался (сайт не ответил или сменил "
                  "вёрстку). Можно вставить magnet-ссылку вручную.")
 
 
@@ -1839,7 +2156,8 @@ def library_file(name: str):
 
 
 @app.get("/api/library/play")
-def library_play(name: str, t: float = 0.0, probe: int = 0, diag: int = 0):
+def library_play(name: str, t: float = 0.0, probe: int = 0, diag: int = 0,
+                 a: int = 0, hls: int = 0):
     """Просмотр файла витрины в браузере — та же логика, что и для загрузок
     (см. _play_response): mp4 отдаём как есть, mkv перепаковываем на лету.
     Без пароля, как /api/library/file: <video> не умеет слать заголовок с
@@ -1847,7 +2165,7 @@ def library_play(name: str, t: float = 0.0, probe: int = 0, diag: int = 0):
     target = _safe_share_file(name)
     if not target.exists() or not target.is_file():
         raise HTTPException(404, "Файл не найден")
-    return _play_response(target, t, probe, diag)
+    return _play_response(target, t, probe, diag, a, hls)
 
 
 class LibraryDeleteRequest(BaseModel):
@@ -1868,7 +2186,10 @@ def library_delete(req: LibraryDeleteRequest):
 @app.get("/api/config")
 def config():
     # Фронтенду нужно знать, спрашивать ли пароль.
-    return {"password_required": bool(ACCESS_PASSWORD)}
+    # Плюс состояние rutracker: есть ли на этом инстансе доступ к сайту.
+    # Читается из кеша, сеть здесь не ждём (см. rutracker_state).
+    return {"password_required": bool(ACCESS_PASSWORD),
+            "rutracker": rutracker_state()}
 
 
 # --- Рекорд тетриса (один глобальный рекорд за всё время) ------------------

@@ -258,6 +258,13 @@
          margin-bottom:12px; font-size:16px; font-weight:600; word-break:break-word; }
   .player-body { min-height:80px; display:flex; align-items:center; justify-content:center; }
   .player-body video { width:100%; max-height:70vh; border-radius:var(--r-ctl); background:#000; }
+  /* Поток перекодирования: у него своя длина (кусок с места перемотки, а не
+     фильм), поэтому родная шкала <video> показывала «0:03 / 0:06» рядом с
+     нашей «3:26 / 1:01:03» — две полосы об одном. Прячем родную, перемотка
+     нашим ползунком. Работает в Chrome/Safari; в Firefox шкала останется. */
+  video.stream::-webkit-media-controls-timeline,
+  video.stream::-webkit-media-controls-current-time-display,
+  video.stream::-webkit-media-controls-time-remaining-display { display:none; }
 
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
@@ -384,6 +391,28 @@
         Скачанные раздачи не удаляются автоматически — только вручную.
       </div>
     </div>
+
+    <!-- Rutracker: второй источник. Виден только на инстансе, у которого есть
+         доступ к сайту (egress через VPN); иначе вместо него плашка ниже.
+         Что именно показать, решает applyRutracker() по данным /api/config. -->
+    <div class="card gated cond hidden" id="rutrackerCard">
+      <label>Rutracker</label>
+      <div class="row">
+        <div><input type="text" id="rtq" placeholder="Название раздачи…"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();torrentSearch('rt');}"></div>
+        <button onclick="torrentSearch('rt')">Искать</button>
+      </div>
+      <div class="hint" id="rtHint"></div>
+      <div class="jobs" id="rtResults"></div>
+    </div>
+
+    <div class="card gated cond hidden" id="rutrackerOff">
+      <label>Rutracker</label>
+      <div class="hint">
+        <span id="rtOffText"></span>
+        <a id="rtLink" class="hidden" href="#">открыть сайт с VPN</a>
+      </div>
+    </div>
   </div>
 
   <!-- Игра «Тетрис» — доступна всегда, не только во время загрузки -->
@@ -502,9 +531,49 @@ function unlockApp() {
   document.querySelectorAll(".gated:not(.cond)").forEach(
     el => el.classList.remove("hidden"));
   document.getElementById("pwCard").classList.add("hidden");
+  applyRutracker();  // rutracker-блок — .cond, показываем его сами, по доступу
   loadFiles();
   loadLibrary();
   resumeJobs();     // вернуть карточки задач, идущих в фоне (после F5)
+}
+
+// --- Rutracker: карточка поиска или плашка «здесь недоступно» --------------
+// Один и тот же код крутится на двух серверах: с VPN и без. Сервер сам
+// проверяет, дотягивается ли он до rutracker, и присылает состояние в
+// /api/config. Молча прятать раздел нельзя — если доступа нет, на его месте
+// стоит плашка с причиной и ссылкой на инстанс, где он есть.
+let RT_STATE = "checking";
+const RT_OFF_TEXT = {
+  no_network: "Rutracker доступен только через VPN. Этот сервер ходит в сеть " +
+              "напрямую, поэтому поиск по нему здесь скрыт. Тот же сайт с VPN: ",
+  no_account: "Rutracker: на этом сервере не задан аккаунт " +
+              "(RUTRACKER_LOGIN / RUTRACKER_PASSWORD), поиск скрыт.",
+  checking: "Проверяю доступ к Rutracker…",
+};
+
+function applyRutracker() {
+  // Пока пароль не введён, показывать нечего: tabBar скрыт вместе со всем .gated.
+  if (document.getElementById("tabBar").classList.contains("hidden")) return;
+  const ok = RT_STATE === "ok";
+  document.getElementById("rutrackerCard").classList.toggle("hidden", !ok);
+  document.getElementById("rutrackerOff").classList.toggle("hidden", ok);
+  if (ok) return;
+  document.getElementById("rtOffText").textContent =
+    RT_OFF_TEXT[RT_STATE] || RT_OFF_TEXT.no_network;
+  // Ссылка на соседний инстанс: тот же хост, порт 8000 (см. ADDRESSES.md) —
+  // считаем от текущего адреса, чтобы работало и снаружи, и по локалке.
+  const link = document.getElementById("rtLink");
+  link.href = location.protocol + "//" + location.hostname + ":8000";
+  link.classList.toggle("hidden", RT_STATE !== "no_network");
+}
+
+// Проба на сервере занимает пару секунд после рестарта сервиса — если открыли
+// страницу раньше, чем она закончилась, перечитываем состояние один раз.
+async function recheckRutracker() {
+  try {
+    RT_STATE = (await fetch("/api/config").then(r => r.json())).rutracker;
+  } catch (e) { RT_STATE = "no_network"; }
+  applyRutracker();
 }
 
 // Проверяем пароль обращением к защищённому эндпоинту. true — пароль подходит.
@@ -554,6 +623,8 @@ async function init() {
   applyTheme(localStorage.getItem("theme") || "");   // подписать кнопку темы
   let cfg = { password_required: false };
   try { cfg = await fetch("/api/config").then(r => r.json()); } catch (e) {}
+  RT_STATE = cfg.rutracker || "checking";
+  if (RT_STATE === "checking") setTimeout(recheckRutracker, 3000);
   if (!cfg.password_required) {        // пароль не настроен — открыто всё
     unlockApp();
     return;
@@ -686,20 +757,28 @@ async function createJob(target, quality) {
 // Поиск по трекеру → список раздач; magnet берётся лениво при добавлении.
 // Скачивание переиспользует общий poll()/список файлов — торрент-задача
 // живёт в тех же JOBS, что и обычные загрузки.
-async function torrentSearch() {
-  const q = document.getElementById("tq").value.trim();
-  const hint = document.getElementById("tHint");
-  const list = document.getElementById("tResults");
+// Два источника, одна логика: ответы у них одинаковой формы, поэтому
+// различаются только поля ввода и адрес ручки (см. TSRC).
+const TSRC = {
+  x:  { q: "tq",  hint: "tHint",  list: "tResults",  url: "/api/torrent/search?q=" },
+  rt: { q: "rtq", hint: "rtHint", list: "rtResults", url: "/api/rutracker/search?q=" },
+};
+
+async function torrentSearch(src) {
+  const s = TSRC[src] || TSRC.x;
+  const q = document.getElementById(s.q).value.trim();
+  const hint = document.getElementById(s.hint);
+  const list = document.getElementById(s.list);
   // Вставили magnet прямо в поиск — не ищем (он длиннее лимита), а качаем.
   if (q.startsWith("magnet:")) {
     document.getElementById("tmagnet").value = q;
-    document.getElementById("tq").value = "";
+    document.getElementById(s.q).value = "";
     return addTorrentMagnet();
   }
   if (q.length < 2) { hint.textContent = "Введите запрос (от 2 символов)."; return; }
   hint.textContent = "Ищу…"; list.innerHTML = "";
   try {
-    const { results } = await api("/api/torrent/search?q=" + encodeURIComponent(q));
+    const { results } = await api(s.url + encodeURIComponent(q));
     if (!results.length) { hint.textContent = "Ничего не найдено."; return; }
     hint.textContent = "";
     results.forEach(r => {
@@ -1469,9 +1548,29 @@ async function resumeJob(jobId, btn, checkIntegrity = false) {
 // в нём не работает — рисуем свой ползунок и перематываем перезапросом
 // потока с нужной секунды (?t=), а время показываем как «начало потока +
 // сколько проиграно».
+// Safari (iPhone/iPad, macOS) не берёт mp4-поток перекодирования: у потока нет
+// длины и нет Range, и <video> отваливается с кодом 4 ещё до декодирования —
+// в Chrome тот же файл играет. Единственный формат потокового видео, который
+// Safari понимает, — HLS: сервер по ?hls=1 запускает ffmpeg с сегментами и
+// отдаёт адрес плейлиста, браузер играет его сам, без библиотек.
+const CAN_HLS = !!document.createElement("video")
+  .canPlayType("application/vnd.apple.mpegurl");
+
+// Ключ живой HLS-сессии: её надо погасить, иначе ffmpeg на сервере продолжит
+// перекодировать фильм в /tmp после закрытия плеера.
+let HLS_KEY = null;
+function stopHls() {
+  if (!HLS_KEY) return;
+  fetch("/api/hls/" + HLS_KEY + "/stop", { method: "POST", keepalive: true })
+    .catch(() => {});
+  HLS_KEY = null;
+}
+addEventListener("pagehide", stopHls);   // вкладку закрыли, не нажав «Закрыть»
+
 function closePlayer() {
   const ov = document.getElementById("playerOverlay");
   if (!ov) return;
+  stopHls();
   const v = ov.querySelector("video");
   if (v) { v.pause(); v.removeAttribute("src"); v.load(); }  // обрываем поток —
   ov.remove();                                                // ffmpeg на сервере умрёт
@@ -1555,25 +1654,56 @@ async function openPlayer(base, name) {
 
   // Перепаковка на лету: свой ползунок поверх потока.
   const dur = info.duration || 0;
+  const tracks = info.atracks || [];
   body.style.display = "block";
   body.innerHTML = `
-    <video controls autoplay src="${base}t=0"></video>
+    <video class="stream" controls autoplay playsinline></video>
     <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:13px">
       <span class="muted" id="playClock">0:00</span>
       <input type="range" id="playSeek" min="0" max="${Math.floor(dur)}" value="0"
              step="1" style="flex:1" ${dur ? "" : "disabled"}>
       <span class="muted">${dur ? fmtClock(dur) : "длительность неизвестна"}</span>
     </div>
-    ${info.recode ? '<div class="muted" style="margin-top:6px;font-size:13px">'
-      + 'Видео в формате, который браузер не понимает — сервер перекодирует '
-      + 'его на лету. Может подтормаживать; для качества смотрите через VLC.'
-      + '</div>' : ""}`;
+    ${tracks.length > 1 ? `
+    <div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px">
+      <label for="playAudio" style="margin:0">Звук</label>
+      <select id="playAudio">${tracks.map((tr, i) =>
+        `<option value="${i}">${escapeHtml(audioLabel(tr, i))}</option>`).join("")}</select>
+    </div>` : ""}
+    <div class="muted" id="playNote" style="margin-top:6px;font-size:13px">
+      ${info.recode ? 'Видео в формате, который браузер не понимает — сервер '
+        + 'перекодирует его на лету. Может подтормаживать; для качества '
+        + 'смотрите через VLC.' : ""}</div>`;
   const video = body.querySelector("video");
   showPlayError(body, info, base);
   const seek = body.querySelector("#playSeek");
   const clock = body.querySelector("#playClock");
+  const note = body.querySelector("#playNote");
+  const audioSel = body.querySelector("#playAudio");
   let offset = 0;              // с какой секунды исходника начат текущий поток
+  let track = 0;               // выбранная звуковая дорожка
   let dragging = false;
+
+  // Перезапуск потока с нужной секунды и нужной дорожкой: и перемотка, и смена
+  // звука — это одно и то же, новый ffmpeg с другими аргументами.
+  async function start(pos) {
+    offset = pos;
+    stopHls();
+    const q = base + "t=" + pos + "&a=" + track;
+    if (!CAN_HLS) { video.src = q; video.play().catch(() => {}); return; }
+    video.removeAttribute("src");
+    note.textContent = "Готовлю поток…";
+    let d;
+    try { d = await (await fetch(q + "&hls=1")).json(); }
+    catch (e) { d = { detail: e.message }; }
+    if (!document.getElementById("playerOverlay")) { stopHls(); return; }
+    if (!d.url) { note.textContent = d.detail || "Сервер не отдал поток."; return; }
+    note.textContent = "";
+    HLS_KEY = d.key;
+    video.src = d.url;
+    video.play().catch(() => {});
+  }
+  start(0);
 
   video.addEventListener("timeupdate", () => {
     const pos = offset + video.currentTime;
@@ -1581,12 +1711,21 @@ async function openPlayer(base, name) {
     if (!dragging && dur) seek.value = Math.min(Math.floor(pos), Math.floor(dur));
   });
   seek.addEventListener("input", () => { dragging = true; clock.textContent = fmtClock(seek.value); });
-  seek.addEventListener("change", () => {
-    dragging = false;
-    offset = Number(seek.value);
-    video.src = base + "t=" + offset;   // новый поток с этой секунды
-    video.play().catch(() => {});
+  seek.addEventListener("change", () => { dragging = false; start(Number(seek.value)); });
+  if (audioSel) audioSel.addEventListener("change", () => {
+    track = Number(audioSel.value);
+    start(Math.floor(offset + video.currentTime));   // не теряем место просмотра
   });
+}
+
+// Подпись звуковой дорожки в выпадашке: «Дорожка 2 · рус · eac3 5.1». Что есть
+// в файле, то и показываем — у раздач с трекера обычно заполнен язык, иногда
+// название («Дубляж», «Авторский»).
+function audioLabel(tr, i) {
+  const ch = { 1: "моно", 2: "стерео", 6: "5.1", 8: "7.1" }[tr.channels]
+    || (tr.channels ? tr.channels + " кан." : "");
+  return [tr.title || "Дорожка " + (i + 1), tr.lang, tr.codec, ch]
+    .filter(Boolean).join(" · ");
 }
 
 // Раскрывающаяся табличка файлов торрент-раздачи: показывает статус каждого
