@@ -105,7 +105,8 @@ def main():
         raw_status = appmod._torrent_status_files(raw_dir)
         assert raw_status == [{"path": "movie.mkv", "size": 500, "downloaded": 500,
                                "done": True, "percent": 100, "index": None,
-                               "selected": True}], raw_status
+                               "selected": True, "state": "done",
+                               "lib": None}], raw_status
 
         # --- 4. /api/file отдаёт готовый файл раздачи, даже если она "качается" ---
         job_id = "job1"   # совпадает с job_dir выше (tmp / "job1")
@@ -176,22 +177,37 @@ def main():
         # _drain_torrent_to_library: без библиотеки (SHARE_PATH=None) не трогаем
         assert appmod.SHARE_PATH is None
         drain_dir = tmp / "drain"
-        drain_dir.mkdir()
-        appmod.JOBS["drain"] = {"published": {"a"}, "publish_failed": set()}
+        (drain_dir / "Drain").mkdir(parents=True)
+        (drain_dir / ".torrent_job").touch()
+        (drain_dir / ".meta.torrent").write_bytes(
+            make_torrent("Drain", [("E01.mkv", 3), ("E02.mkv", 3)]))
+        (drain_dir / ".selected").write_text("1")
+        (drain_dir / "Drain" / "E01.mkv").write_bytes(b"abc")
+        appmod._add_published(drain_dir, "Drain/E01.mkv", "E01.mkv")
+        appmod.JOBS["drain"] = {"publish_failed": set()}
         assert appmod._drain_torrent_to_library("drain", drain_dir) is False
-        assert drain_dir.is_dir()   # ничего не удалили — библиотеки нет
+        assert (drain_dir / "Drain" / "E01.mkv").is_file()   # библиотеки нет — не трогаем
 
-        # с «библиотекой»: всё опубликовано и без ошибок → папку удаляем
+        # с «библиотекой»: всё опубликовано и без ошибок → файлы с сервера
+        # убираем, но «скелет» раздачи (метаданные) оставляем — иначе докачать
+        # оставшиеся серии будет нечем (раньше тут был rmtree всей папки)
         share = tmp / "share"
         share.mkdir()
         appmod.SHARE_PATH = share
         try:
-            appmod.JOBS["drain"] = {"published": {"a"}, "publish_failed": {"b"}}
+            appmod.JOBS["drain"] = {"publish_failed": {"b"}}
             assert appmod._drain_torrent_to_library("drain", drain_dir) is False  # есть провал
-            assert drain_dir.is_dir()
-            appmod.JOBS["drain"] = {"published": {"a"}, "publish_failed": set()}
+            assert (drain_dir / "Drain" / "E01.mkv").is_file()
+            appmod.JOBS["drain"] = {"publish_failed": set()}
             assert appmod._drain_torrent_to_library("drain", drain_dir) is True
-            assert not drain_dir.exists()   # уехало в библиотеку — удалено с сервера
+            assert not (drain_dir / "Drain" / "E01.mkv").exists()  # уехал в библиотеку
+            assert (drain_dir / ".meta.torrent").is_file(), "скелет раздачи должен остаться"
+            # индекс уехавшего файла вычеркнут из .selected — иначе «Возобновить»
+            # и авторезюм при старте скачали бы его заново поверх библиотеки
+            assert appmod._selected_indices(drain_dir) == set()
+            # служебный .published не должен сойти за «готовый файл» задачи
+            assert appmod._result_file(drain_dir) is None
+            assert appmod._real_job_files(drain_dir) == []
         finally:
             appmod.SHARE_PATH = None
 
@@ -630,6 +646,87 @@ def main():
         finally:
             appmod.SHARE_PATH = None
             appmod.FFPROBE_BIN = old_ffprobe
+
+        # --- 26. Управление раздачей после докачки: «скелет» виден в
+        # /api/files, файлы в витрине помечены library/gone, а «Докачать»
+        # работает и во время активной загрузки (раньше отвечало 409
+        # «Раздача уже качается») ---
+        appmod.SHARE_PATH = share
+        try:
+            (share / "E01.mkv").write_bytes(b"abc")
+            rows = {f["path"]: f for f in appmod._torrent_status_files(drain_dir)}
+            assert rows["Drain/E01.mkv"]["state"] == "library", rows
+            assert rows["Drain/E01.mkv"]["lib"] == "E01.mkv", rows
+            assert rows["Drain/E01.mkv"]["done"] is True, rows
+            assert rows["Drain/E02.mkv"]["state"] == "skipped", rows
+
+            appmod.JOBS.pop("drain", None)      # как после рестарта сервиса
+            r = client.get("/api/files")
+            item = {i["job_id"]: i for i in r.json()["files"]}.get("drain")
+            assert item and item["skeleton"] is True, item
+            assert item["lib_files"] == 1 and item["total_files"] == 2, item
+            assert item["interrupted"] is False, item   # не «прервана», всё на месте
+
+            # файл удалили из витрины руками → «был удалён», качать заново или
+            # нет решает человек (кнопка «Скачать заново»)
+            (share / "E01.mkv").unlink()
+            rows = {f["path"]: f for f in appmod._torrent_status_files(drain_dir)}
+            assert rows["Drain/E01.mkv"]["state"] == "gone", rows
+
+            # файл, выбранный заново («Скачать заново»), показывает прогресс,
+            # а не «в библиотеке»: иначе строка врёт, что качать нечего
+            (drain_dir / ".selected").write_text("1")
+            rows = {f["path"]: f for f in appmod._torrent_status_files(drain_dir)}
+            assert rows["Drain/E01.mkv"]["state"] == "downloading", rows
+            (drain_dir / ".selected").write_text("")
+
+            # авто-докачка «остального» не тянет уехавшее в библиотеку заново
+            (share / "E01.mkv").write_bytes(b"abc")
+            (drain_dir / ".auto_rest").touch()
+            appmod.JOBS["drain"] = {"state": "done"}
+            appmod._maybe_continue_unselected("drain", drain_dir,
+                                              drain_dir / ".meta.torrent")
+            assert appmod._selected_indices(drain_dir) == {2}, "в докачку должен уйти только E02"
+        finally:
+            appmod.SHARE_PATH = None
+
+        # «Докачать» во время активной загрузки: не 409, а добавление на лету
+        live_dir = tmp / "joblive"
+        live_dir.mkdir()
+        (live_dir / ".meta.torrent").write_bytes(
+            make_torrent("Live", [("L1.mkv", 5), ("L2.mkv", 5), ("L3.mkv", 5)]))
+        (live_dir / ".torrent_job").touch()
+        (live_dir / ".selected").write_text("1")
+        appmod.JOBS["joblive"] = {
+            "state": "downloading", "percent": 23, "speed": None, "eta": None,
+            "title": "Live", "filename": None, "error": None, "cancel": False,
+            "total": None, "size": None, "type": "torrent"}
+        r = client.post("/api/torrent/joblive/add-files", json={"files": [3]})
+        assert r.status_code == 200, r.text
+        assert r.json().get("queued") is True, r.text
+        assert appmod.JOBS["joblive"]["pause"] is True
+        assert appmod.JOBS["joblive"]["add_files"] == {1, 3}, appmod.JOBS["joblive"]
+        # второе нажатие копится в тот же набор — один перезапуск, а не два
+        r = client.post("/api/torrent/joblive/add-files", json={"files": [2]})
+        assert r.status_code == 200, r.text
+        assert appmod.JOBS["joblive"]["add_files"] == {1, 2, 3}
+
+        # _finish_pause: с add_files перезапускает раздачу расширенным списком,
+        # без него — обычная пауза
+        calls = []
+        real_run = appmod._run_torrent
+        appmod._run_torrent = lambda jid, src, sel=None, **kw: calls.append((jid, src, sel))
+        try:
+            appmod._finish_pause("joblive", str(live_dir / ".meta.torrent"))
+        finally:
+            appmod._run_torrent = real_run
+        assert calls and calls[0][2] == [1, 2, 3], calls
+        assert appmod.JOBS["joblive"]["state"] == "queued"
+        assert "add_files" not in appmod.JOBS["joblive"]
+        appmod.JOBS["joblive"]["pause"] = True
+        appmod._finish_pause("joblive", str(live_dir / ".meta.torrent"))
+        assert appmod.JOBS["joblive"]["state"] == "paused"
+        assert appmod.JOBS["joblive"]["pause"] is False
 
         print("OK: все проверки живого статуса файлов торрента прошли")
     finally:

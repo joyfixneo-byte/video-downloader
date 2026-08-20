@@ -222,6 +222,71 @@ def _torrent_expected_sizes(job_dir: Path) -> dict:
         return {}
 
 
+# Служебные файлы в папке торрент-задачи: маркер задачи, список выбранных
+# индексов, отметка «докачать остальное», карта уехавшего в библиотеку. Один
+# список на весь модуль — иначе очередной маркер (как непустой .published)
+# сойдёт за «готовый файл раздачи» там, где его забыли перечислить, и станет
+# результатом задачи.
+SERVICE_FILES = {".torrent_job", ".selected", ".auto_rest", ".published"}
+
+
+def _published_map(job_dir: Path) -> dict:
+    """rel-путь файла раздачи -> имя, под которым он лежит в SMB-витрине.
+
+    Живёт на диске (.published), а не в JOBS: раздача переживает рестарт
+    сервиса, а после отправки файлов в библиотеку это единственный след
+    того, что они вообще были скачаны (см. _drain_torrent_to_library)."""
+    f = job_dir / ".published"
+    if not f.is_file():
+        return {}
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _add_published(job_dir: Path, rel: str, lib_name: str):
+    """Дописывает один файл в карту опубликованного (см. _published_map)."""
+    data = _published_map(job_dir)
+    data[rel] = lib_name
+    (job_dir / ".published").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _published_indices(job_dir: Path) -> set:
+    """1-based индексы файлов раздачи, уже уехавших в библиотеку."""
+    published = _published_map(job_dir)
+    meta = job_dir / ".meta.torrent"
+    if not published or not meta.is_file():
+        return set()
+    try:
+        files = _torrent_file_list(meta)
+    except Exception:
+        return set()
+    names = {Path(k).name for k in published}
+    return {f["index"] for f in files
+            if f["path"] in published or Path(f["path"]).name in names}
+
+
+def _drop_selected(job_dir: Path, indices: set):
+    """Убирает индексы из .selected: файл уехал в библиотеку и удалён с
+    сервера, в текущей закачке он больше не участвует. Без этого
+    «Возобновить» и авторезюм при старте сервиса считают его недокачанным и
+    тянут заново поверх библиотеки. Если выбора не было вовсе (качали весь
+    торрент) — записываем явный список «всё, кроме уехавшего»."""
+    if not indices:
+        return
+    sel = _selected_indices(job_dir)
+    if sel is None:
+        try:
+            sel = {f["index"] for f in _torrent_file_list(job_dir / ".meta.torrent")}
+        except Exception:
+            return
+    (job_dir / ".selected").write_text(
+        ",".join(str(i) for i in sorted(sel - indices)))
+
+
 def _real_job_files(job_dir: Path) -> list[Path]:
     """Все настоящие готовые файлы задачи на диске: без временных/ещё
     качающихся (см. _file_done) и служебных (маркер задачи, список выбранных
@@ -232,7 +297,7 @@ def _real_job_files(job_dir: Path) -> list[Path]:
     sizes = _torrent_expected_sizes(job_dir)
     out = []
     for p in job_dir.rglob("*"):
-        if p.suffix.lower() == ".torrent" or p.name in (".selected", ".torrent_job"):
+        if p.suffix.lower() == ".torrent" or p.name in SERVICE_FILES:
             continue
         rel = str(p.relative_to(job_dir)).replace("\\", "/")
         expected = sizes.get(rel, sizes.get(p.name))
@@ -341,18 +406,20 @@ def _publish_newly_done(job_id: str, job_dir: Path):
         job = JOBS.get(job_id)
         if job is None:
             return
-        published = job.setdefault("published", set())
         failed = job.setdefault("publish_failed", set())
+    published = _published_map(job_dir)
     for p in _real_job_files(job_dir):
         rel = str(p.relative_to(job_dir)).replace("\\", "/")
         if rel in published or rel in failed:
             continue
         try:
-            _publish_to_share(p)
-            published.add(rel)
+            name = _publish_to_share(p)
         except Exception:
             traceback.print_exc()
             failed.add(rel)
+            continue
+        published[rel] = name
+        _add_published(job_dir, rel, name)
 
 
 def _count_active(jobs: dict, lock, states) -> int:
@@ -407,19 +474,36 @@ def _require_disk_space(need_bytes: int = 0):
 def _drain_torrent_to_library(job_id: str, job_dir: Path) -> bool:
     """После докачки торрента: копии файлов уже уехали в SMB-библиотеку
     (см. _publish_newly_done). Удаляем их с сервера, чтобы торрент жил только
-    в библиотеке и не забивал диск VM. True — всё уехало, папка задачи удалена.
+    в библиотеке и не забивал диск VM. True — всё уехало, файлы удалены.
     False (ничего не удаляем) — библиотека выключена ИЛИ часть файлов не
     опубликовалась (шара отвалилась): тогда файлы остаются на сервере, чтобы
-    их не потерять, с ручной кнопкой-повтором «В библиотеку»."""
+    их не потерять, с ручной кнопкой-повтором «В библиотеку».
+
+    ⚠️ Саму папку задачи НЕ удаляем (раньше сносили целиком через rmtree).
+    В ней остаются .meta.torrent, .selected и .published — «скелет» раздачи,
+    по которому потом можно докачать любые другие файлы (см.
+    /api/torrent/{job_id}/add-files). Из-за прежнего rmtree многофайловая
+    раздача после первой же докачки исчезала вместе с метаданными, и
+    докачать оставшиеся серии было нечем. Скелет живёт до ручного «Удалить
+    раздачу» (/api/delete) — автоочистка торрент-папки не трогает."""
     if not SHARE_PATH:
         return False
     with JOBS_LOCK:
-        job = JOBS.get(job_id) or {}
-        failed = set(job.get("publish_failed", ()))
-        published = set(job.get("published", ()))
-    if failed or not published:
+        failed = set((JOBS.get(job_id) or {}).get("publish_failed", ()))
+    if failed or not _published_map(job_dir):
         return False
-    shutil.rmtree(job_dir, ignore_errors=True)
+    for f in _real_job_files(job_dir):
+        f.unlink(missing_ok=True)
+        _play_cache_path(f).unlink(missing_ok=True)   # remux-кэш плеера, если был
+    # Опустевшие подпапки раздачи (aria2 кладёт файлы в папку с именем
+    # торрента) — снизу вверх, непустые rmdir просто откажется удалять.
+    for d in sorted((x for x in job_dir.rglob("*") if x.is_dir()),
+                    key=lambda x: -len(x.parts)):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    _drop_selected(job_dir, _published_indices(job_dir))
     return True
 
 
@@ -757,8 +841,8 @@ def list_files():
             # continue) — теперь показываем с прогрессом и кнопкой «Возобновить».
             interrupted = False
             progress = None
+            status = _torrent_status_files(d) if is_torrent else []
             if is_torrent:
-                status = _torrent_status_files(d)
                 selected_rows = [f for f in status if f["selected"]]
                 if selected_rows and not all(f["done"] for f in selected_rows):
                     interrupted = True
@@ -769,7 +853,14 @@ def list_files():
                         "done_files": sum(1 for f in selected_rows if f["done"]),
                         "total_files": len(selected_rows),
                     }
-            if not result and not interrupted:
+            # «Скелет» раздачи: файлов на сервере нет (уехали в SMB-витрину),
+            # но метаданные на месте. Раньше такая папка молча пропускалась —
+            # раздача исчезала из интерфейса, и докачать оставшиеся серии было
+            # неоткуда. Показываем карточку с табличкой файлов.
+            skeleton = bool(is_torrent and not result and not interrupted
+                            and (d / ".meta.torrent").is_file()
+                            and _published_map(d))
+            if not result and not interrupted and not skeleton:
                 continue
             mtime = result.stat().st_mtime if result else d.stat().st_mtime
             # Торрент не чистится авто только если есть библиотека (туда он
@@ -797,6 +888,9 @@ def list_files():
                 "torrent": is_torrent,
                 "interrupted": interrupted,
                 "progress": progress,
+                "skeleton": skeleton,
+                "lib_files": sum(1 for f in status if f["state"] == "library"),
+                "total_files": len(status),
                 "mtime": mtime,
             })
     items.sort(key=lambda x: x["mtime"], reverse=True)  # новые сверху
@@ -1438,7 +1532,9 @@ def _maybe_continue_unselected(job_id: str, job_dir: Path, meta_target: Path):
         all_indices = {f["index"] for f in _torrent_file_list(meta_target)}
     except Exception:
         return
-    remaining = all_indices - selected
+    # Уехавшее в библиотеку (файлов на сервере нет, но они скачаны) —
+    # не «оставшееся»: иначе авто-докачка качает их по второму разу.
+    remaining = all_indices - selected - _published_indices(job_dir)
     if not remaining:
         return
     if _count_active(JOBS, JOBS_LOCK,
@@ -1450,6 +1546,33 @@ def _maybe_continue_unselected(job_id: str, job_dir: Path, meta_target: Path):
         JOBS[job_id].update(state="queued", percent=None, speed=None,
                             eta=None, filename=None, error=None, cancel=False)
     _run_torrent(job_id, str(meta_target), select=select)
+
+
+def _finish_pause(job_id: str, source: str):
+    """aria2 остановлен по флагу pause. Если паузу поставила докачка на лету
+    (add_files — см. /api/torrent/{job_id}/add-files), сразу перезапускаем
+    раздачу с расширенным списком файлов: aria2 продолжит уже качавшийся
+    файл с того же места по своему .aria2-контрольнику, перерыв — пара
+    секунд. Иначе это обычная пауза, ждём кнопки «Продолжить».
+
+    ponytail: перезапуск процесса вместо aria2 RPC — добавить файл в живую
+    закачку без рестарта умеет только демон aria2c --enable-rpc; поднимать
+    его ради одной кнопки не стали. Рекурсия ровно на один уровень за
+    нажатие (нажатия копятся в один набор, см. add-files), апгрейд — RPC,
+    если понадобится добавлять файлы пачками во время многочасовой раздачи."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return None
+        add = job.pop("add_files", None)
+        if add:
+            job.update(state="queued", percent=None, speed=None, eta=None,
+                       filename=None, error=None, pause=False, cancel=False)
+        else:
+            job.update(state="paused", speed=None, eta=None, pause=False)
+    if add:
+        return _run_torrent(job_id, source, sorted(add))
+    return None
 
 
 def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
@@ -1572,17 +1695,14 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
                 proc.wait(timeout=10)
             except Exception:
                 proc.kill()
-            with JOBS_LOCK:
-                JOBS[job_id].update(state="paused", speed=None, eta=None,
-                                     pause=False)
-            return
+            return _finish_pause(job_id, source)
 
         proc.wait()
         _publish_newly_done(job_id, job_dir)  # публикуем всё, что докачалось
         real = [p for p in job_dir.rglob("*")
                 if p.is_file() and not _is_temp(p)
                 and p.suffix.lower() != ".torrent"
-                and p.name not in (".selected", ".torrent_job")]
+                and p.name not in SERVICE_FILES]
         if not real:
             raise RuntimeError("aria2 не скачал файл (нет пиров или битый magnet)")
         if not check_integrity:
@@ -1616,6 +1736,13 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
                 JOBS[job_id].update(
                     state="done", percent=100,
                     filename=result.name, size=result.stat().st_size)
+        # «Докачать» могли нажать в последние секунды загрузки — когда флаг
+        # паузы уже никто не прочитает (цикл вывода aria2 закончился). Тогда
+        # добираем список здесь, иначе нажатие пропало бы молча.
+        with JOBS_LOCK:
+            pending_add = bool((JOBS.get(job_id) or {}).get("add_files"))
+        if pending_add:
+            return _finish_pause(job_id, source)
         # Выбранные файлы готовы — если раньше стоял флаг «докачать остальное
         # автоматически», сейчас самое время добавить в закачку остальное.
         _maybe_continue_unselected(job_id, job_dir, meta_target)
@@ -1632,9 +1759,7 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
             with JOBS_LOCK:
                 JOBS[job_id].update(state="cancelled", filename=None)
         elif paused:
-            with JOBS_LOCK:
-                JOBS[job_id].update(state="paused", speed=None, eta=None,
-                                     pause=False)
+            _finish_pause(job_id, source)
         else:
             traceback.print_exc()
             with JOBS_LOCK:
@@ -1764,12 +1889,21 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
     вся раздача целиком) и selected (участвует в текущей загрузке). Если для
     задачи сохранены .meta.torrent-метаданные, в список попадают и ещё не
     выбранные файлы (size есть, done=False, selected=False) — их можно
-    докачать через /api/torrent/{job_id}/add-files."""
+    докачать через /api/torrent/{job_id}/add-files.
+
+    У каждой строки есть state — что с файлом прямо сейчас:
+      done        — лежит готовым на сервере;
+      library     — на сервере его нет, он уехал в SMB-витрину (lib — имя
+                    файла там), см. _drain_torrent_to_library;
+      gone        — уехал в витрину, но оттуда его удалили вручную: качать
+                    заново или нет, решает человек;
+      downloading — выбран и ещё качается;
+      skipped     — при старте не выбирали, можно докачать."""
     on_disk = {}
     for p in job_dir.rglob("*"):
         if not p.is_file() or _is_temp(p):
             continue
-        if p.name in (".selected",) or p.suffix.lower() == ".torrent" or p.name == ".torrent_job":
+        if p.name in SERVICE_FILES or p.suffix.lower() == ".torrent":
             continue
         rel = str(p.relative_to(job_dir)).replace("\\", "/")
         on_disk[rel] = _written_bytes(p)
@@ -1786,7 +1920,10 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         else:
             pct = 0
         return {"path": path, "size": full or downloaded, "downloaded": downloaded,
-                "done": done, "percent": pct, "index": index, "selected": selected}
+                "done": done, "percent": pct, "index": index, "selected": selected,
+                "state": "done" if done else ("skipped" if not selected
+                                              else "downloading"),
+                "lib": None}
 
     meta = job_dir / ".meta.torrent"
     if not meta.is_file():
@@ -1803,6 +1940,7 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
                 for rel, size in on_disk.items()]
         return sorted(rows, key=lambda x: _natkey(x["path"]))
     selected = _selected_indices(job_dir)
+    published = _published_map(job_dir)
     items = []
     for f in expected:
         downloaded = on_disk.get(f["path"])
@@ -1812,8 +1950,17 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
             downloaded = on_disk.get(Path(f["path"]).name)
         is_selected = selected is None or f["index"] in selected
         done = downloaded is not None and downloaded >= f["size"]
-        items.append(_row(f["path"], f["size"], downloaded or 0, done,
-                          index=f["index"], selected=is_selected))
+        row = _row(f["path"], f["size"], downloaded or 0, done,
+                   index=f["index"], selected=is_selected)
+        lib = published.get(f["path"]) or published.get(Path(f["path"]).name)
+        if lib and not done and not is_selected:
+            # Файла на сервере нет, потому что он уехал в витрину. Сверяемся
+            # с витриной: файл оттуда могли удалить руками — тогда это не
+            # «готово», а «был, но удалён» (качать заново — решение человека).
+            in_share = bool(SHARE_PATH) and (SHARE_PATH / lib).is_file()
+            row.update(state="library" if in_share else "gone", lib=lib,
+                       done=in_share, percent=100 if in_share else 0)
+        items.append(row)
     # Порядок как в самой раздаче (index): серии идут подряд 1,2,3… Раньше
     # сортировали по размеру — порядок серий перемешивался. Другие сортировки
     # (имя/размер/статус) фронт делает сам по клику на заголовок.
@@ -1988,17 +2135,19 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
     же папке задачи с расширенным списком --select-file. Уже готовые файлы
     aria2 не перекачивает (проверяет по данным на диске), качаются только
     новые. Работает только для задач, у которых сохранены .meta.torrent
-    (то есть скачивание шло через выбор файлов, а не «скачать всё как есть»)."""
+    (то есть скачивание шло через выбор файлов, а не «скачать всё как есть»).
+
+    Раздача прямо сейчас качается — тоже не проблема: файл добавляется на
+    лету (раньше тут был отказ 409 «Раздача уже качается», и докачать вторую
+    серию, пока идёт первая, было нельзя). Помечаем задачу на перезапуск с
+    расширенным списком, останавливаем aria2 тем же флагом pause и сразу
+    поднимаем заново — прогресс качающегося файла не теряется, см.
+    _finish_pause."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
     job_dir = DOWNLOAD_DIR / safe
     meta = job_dir / ".meta.torrent"
     if not job_dir.is_dir() or not meta.is_file():
         raise HTTPException(400, "Для этой раздачи докачка недоступна")
-    with JOBS_LOCK:
-        job = JOBS.get(safe)
-        state = job.get("state") if job else None
-    if state in ("queued", "downloading", "processing"):
-        raise HTTPException(409, "Раздача уже качается")
     add = set(req.files)
     if not add:
         raise HTTPException(400, "Не выбраны файлы для докачки")
@@ -2006,6 +2155,14 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
     select = sorted(selected | add)
     # Место нужно только под ДОбавленные файлы — уже скачанные лежат на диске.
     _require_disk_space(_selected_size(str(meta), sorted(add)))
+    with JOBS_LOCK:
+        job = JOBS.get(safe)
+        if job and job.get("state") in ("queued", "downloading", "processing"):
+            # Нажатия копятся в один набор: пять кнопок подряд — один
+            # перезапуск aria2, а не пять.
+            job.setdefault("add_files", set()).update(select)
+            job["pause"] = True
+            return {"ok": True, "queued": True}
     with JOBS_LOCK:
         JOBS[safe] = {
             "state": "queued", "percent": None, "speed": None,

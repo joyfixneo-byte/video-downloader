@@ -1745,9 +1745,16 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   let files = [];
   let sort = { field: "index", dir: 1 };
   let showSkipped = false;
+  // Файлы, которые только что отправили в докачку: сервер подхватит их через
+  // пару секунд (перезапуск aria2), а показать «в очереди» надо сразу —
+  // иначе строка ещё несколько тиков выглядит нетронутой, будто не сработало.
+  const pending = new Set();
 
   const idx = f => (f.index == null ? 0 : f.index);
-  const rank = f => (f.done ? 0 : (f.selected === false ? 2 : 1));
+  // Порядок при сортировке по «Статусу»: что есть → что качается → что было
+  // и удалено из библиотеки → что вообще не выбирали.
+  const RANK = { done: 0, library: 0, downloading: 1, gone: 2, skipped: 3 };
+  const rank = f => (RANK[f.state] != null ? RANK[f.state] : 1);
   const byName = (a, b) => a.path.localeCompare(b.path, undefined, { numeric: true });
   const CMP = {
     name: byName,
@@ -1765,8 +1772,10 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
       return;
     }
     body.className = "tfiles-body";
-    const skipped = files.filter(f => f.selected === false).length;
-    const shown = (showSkipped ? files : files.filter(f => f.selected !== false))
+    // Файл в библиотеке (и удалённый из неё) формально «не выбран», но
+    // прятать его нельзя — это как раз то, чем управляет пользователь.
+    const skipped = files.filter(f => f.state === "skipped").length;
+    const shown = (showSkipped ? files : files.filter(f => f.state !== "skipped"))
       .slice().sort((a, b) => CMP[sort.field](a, b) * sort.dir);
     const head = `<div class="tfile-row tfile-head">
         <span class="tfile-name" data-sort="name">Имя${arrow("name")}</span>
@@ -1785,7 +1794,23 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
       ? shown.map(f => {
           const dlHref = "/api/file/" + jobId + "?path=" + encodeURIComponent(f.path);
           let status, actions, bar = "";
-          if (f.done) {
+          if (pending.has(f.index)) {
+            // Только что нажали «Докачать»/«Скачать заново»: сервер поднимет
+            // aria2 через пару секунд, но кнопку показывать уже нельзя.
+            status = '<span class="muted">в очереди…</span>';
+            actions = "";
+          } else if (f.state === "library") {
+            // Файла на сервере нет — он уехал в SMB-витрину; кнопки ведут
+            // туда же, куда и раздел «Библиотека».
+            const libHref = "/api/library/file?name=" + encodeURIComponent(f.lib);
+            status = '<span class="done">в библиотеке</span>';
+            actions = `<a class="dl small" href="${libHref}" download>Скачать</a>`
+              + `<button class="ghost small" onclick="openPlayer(`
+              + `${attr(libPlayUrl(f.lib))}, ${attr(f.lib)})">Смотреть</button>`;
+          } else if (f.state === "gone") {
+            status = '<span class="muted">был удалён</span>';
+            actions = `<button class="ghost small" data-act="add" data-index="${f.index}">Скачать заново</button>`;
+          } else if (f.done) {
             status = '<span class="done">готово</span>';
             actions = `<a class="dl small" href="${dlHref}" download>Скачать</a>`
               + `<button class="ghost small" onclick="openPlayer(`
@@ -1822,6 +1847,9 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   const refresh = async () => {
     try {
       files = (await api("/api/torrent/" + jobId + "/files")).files;
+      files.forEach(f => {
+        if (f.state !== "skipped" && f.state !== "gone") pending.delete(f.index);
+      });
       render();
     } catch (e) {
       det.querySelector(".tfiles-body").innerHTML =
@@ -1862,8 +1890,14 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
       } else if (btn.dataset.act === "add") {
         await api("/api/torrent/" + jobId + "/add-files", {
           method: "POST", body: JSON.stringify({ files: [+btn.dataset.index] }) });
-        container.dataset.jobState = "queued";
-        poll(jobId, container);
+        pending.add(+btn.dataset.index);
+        // Раздача уже качается — файл добавлен на лету, карточку опрашивает
+        // уже запущенный poll; второй цикл опроса тут только дублировал бы
+        // запросы.
+        if (!["queued", "downloading", "processing"].includes(container.dataset.jobState)) {
+          container.dataset.jobState = "queued";
+          poll(jobId, container);
+        }
       }
       refresh();
     } catch (e) {
@@ -1915,11 +1949,17 @@ async function poll(jobId, el) {
       // Торрент уехал в библиотеку (SMB) и удалён с сервера — дубля нет,
       // управление файлом теперь в разделе «Библиотека».
       if (s.in_library) {
-        meta.innerHTML = `<span class="done">Готово${sz} — в разделе «Библиотека» ниже</span>`;
+        meta.innerHTML = `<span class="done">Готово${sz} — файлы в разделе `
+          + `«Библиотека» ниже. Остальные файлы раздачи можно докачать здесь же.</span>`;
         controls.innerHTML = "";
-        const det = el.querySelector("details.tfiles");   // файлов на сервере уже нет
+        // Табличку файлов НЕ убираем (раньше убирали): раздача жива и после
+        // отправки в библиотеку — по ней докачиваются оставшиеся серии.
+        // Пересоздаём, чтобы статусы перечитались уже после переезда файлов.
+        const det = el.querySelector("details.tfiles");
         if (det) det.remove();
+        if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
         loadLibrary();
+        loadFiles();
         return;
       }
       meta.innerHTML = `<span class="done">Готово${sz}</span>`;
@@ -2023,6 +2063,13 @@ async function loadFiles() {
           + (f.filename ? `<a class="dl" href="${href}">Скачать</a>` : "")
           + (f.filename ? libBtn(f.job_id) : "")
           + `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">Удалить</button>`;
+      } else if (f.skeleton) {
+        // Файлы этой раздачи уехали в библиотеку, на сервере их нет — но сама
+        // раздача жива: в табличке ниже видно, что уже скачано, и можно
+        // докачать любые другие файлы (раньше раздача просто исчезала).
+        metaLine = `Раздача · ${f.lib_files} из ${f.total_files} файлов в библиотеке`
+          + ` · на сервере файлов нет`;
+        controls = `<button class="ghost small" onclick="deleteServerFile('${f.job_id}', this)">Удалить раздачу</button>`;
       } else {
         const rem = f.torrent
           ? "не удаляется автоматически — только вручную"
@@ -2050,13 +2097,18 @@ async function loadFiles() {
 }
 
 async function deleteServerFile(jobId, btn) {
-  if (!confirm("Удалить этот файл с сервера?")) return;
+  const old = btn.textContent;
+  // Одна кнопка на два случая: файл на сервере и «скелет» раздачи без
+  // файлов. Во втором случае удаляются только метаданные раздачи.
+  if (!confirm(old.includes("раздачу")
+      ? "Удалить раздачу целиком? Файлы, уехавшие в библиотеку, останутся."
+      : "Удалить этот файл с сервера?")) return;
   btn.disabled = true; btn.textContent = "Удаляю…";
   try {
     await api("/api/delete/" + jobId, { method: "POST" });
     loadFiles();
   } catch (e) {
-    btn.disabled = false; btn.textContent = "Удалить";
+    btn.disabled = false; btn.textContent = old;
     alert("Не удалось удалить: " + e.message);
   }
 }
