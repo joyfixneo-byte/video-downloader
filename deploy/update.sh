@@ -32,7 +32,20 @@ fi
 
 AFTER=$(git rev-parse HEAD)
 
-if [ "$BEFORE" = "$AFTER" ]; then
+# yt-dlp ломается по расписанию YouTube, а не по расписанию репозитория:
+# сайты меняют защиту ссылок — и старая версия отдаёт «HTTP Error 403».
+# Поэтому обновляем его на каждом vdup, независимо от того, менялся ли код.
+# Ошибка обновления (сеть/VPN) не должна валить весь vdup.
+echo "→ проверяю обновление yt-dlp"
+if timeout 180 "$REPO/.venv/bin/pip" install -U yt-dlp 2>&1 | grep -q "Successfully installed"; then
+  YTDLP_NEW=1
+  echo "  ✓ yt-dlp обновлён (нужен перезапуск сервиса)"
+else
+  YTDLP_NEW=""
+  echo "  · yt-dlp уже свежий (или обновиться не вышло — проверь сеть)"
+fi
+
+if [ "$BEFORE" = "$AFTER" ] && [ -z "$YTDLP_NEW" ]; then
   echo "✓ Уже актуально, ничего не менялось."
   exit 0
 fi
@@ -44,7 +57,7 @@ fi
 
 # Если менялись только файлы фронтенда — перезапуск не нужен
 CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
-if echo "$CHANGED" | grep -qvE '^backend/static/'; then
+if [ -n "$YTDLP_NEW" ] || echo "$CHANGED" | grep -qvE '^backend/static/'; then
   echo "→ изменения вне фронтенда, перезапускаю сервис"
   sudo systemctl restart video-downloader
   echo "✓ Обновлено и перезапущено."

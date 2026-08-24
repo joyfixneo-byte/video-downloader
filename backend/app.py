@@ -547,6 +547,11 @@ def friendly_error(e) -> str:
     low = msg.lower()
     if "unsupported url" in low:
         return "Этот сайт или ссылка пока не поддерживаются."
+    if "403" in low and "forbidden" in low:
+        return ("Сайт отказался отдавать видеофайл (403). Обычно это значит, "
+                "что yt-dlp на сервере устарел — YouTube меняет защиту ссылок "
+                "почти каждую неделю. Обновите его: vdup (он теперь сам "
+                "обновляет yt-dlp) и попробуйте ещё раз.")
     if "timed out" in low or "timeout" in low or "read operation" in low:
         return ("Сайт не ответил вовремя. Возможно, он недоступен с этого "
                 "сервера или перегружен — проверьте ссылку или попробуйте позже.")
