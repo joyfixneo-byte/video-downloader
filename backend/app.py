@@ -19,6 +19,7 @@ import threading
 import traceback
 import subprocess
 import http.cookiejar
+import importlib.metadata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -2345,13 +2346,68 @@ def library_delete(req: LibraryDeleteRequest):
     return {"ok": True}
 
 
+# Отметка «когда таймер последний раз проверял обновления yt-dlp» — это mtime
+# файла, который трогает deploy/ytdlp-update.sh. Отдельного формата не нужно:
+# всё содержимое отметки — сам факт её существования и дата.
+YTDLP_STAMP = BASE_DIR / "data" / "ytdlp_checked"
+
+
+def _vparts(v: str) -> tuple:
+    """Версия в сравнимый вид: «2026.07.04» и «2026.7.4» — одно и то же.
+
+    pip и importlib.metadata отдают версию нормализованной по PEP 440, без
+    ведущих нулей, а сам yt_dlp печатает её как есть. Сравнивать эти две
+    строки напрямую нельзя — иначе строка внизу страницы вечно показывала бы
+    «ждёт перезапуска», даже когда ничего не обновлялось."""
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def _ytdlp_status() -> dict:
+    """Что сейчас с yt-dlp: какая версия работает и какая лежит на диске.
+
+    `yt_dlp.version.__version__` — версия, импортированная при старте процесса,
+    то есть та, которой мы реально качаем. `importlib.metadata.version` читает
+    dist-info с диска в момент вызова. Значит, если ночной таймер поставил
+    свежий yt-dlp, эти два числа разойдутся — и разойдутся ровно до тех пор,
+    пока сервис не перезапустят. Никакого файла состояния для этого не нужно.
+    """
+    running = getattr(yt_dlp.version, "__version__", "?")
+    try:
+        installed = importlib.metadata.version("yt-dlp")
+    except Exception:      # noqa: BLE001 — сломанный dist-info не повод ронять /api/config
+        installed = running
+    try:
+        checked_at = YTDLP_STAMP.stat().st_mtime
+    except OSError:        # таймер ещё ни разу не отрабатывал
+        checked_at = None
+    return {"running": running, "installed": installed, "checked_at": checked_at,
+            "restart_pending": _vparts(installed) != _vparts(running)}
+
+
+def _is_busy() -> bool:
+    """Заняты ли мы чем-то, что нельзя обрывать перезапуском сервиса.
+
+    Спрашивает deploy/ytdlp-update.sh перед тем, как применить новую версию
+    yt-dlp. Считаем и загрузки, и транскрибацию: торренты после рестарта
+    поднимутся сами (_resume_interrupted_torrents), а вот обычная загрузка и
+    получасовой Whisper пропадут молча."""
+    return bool(_count_active(JOBS, JOBS_LOCK,
+                              ("queued", "downloading", "processing"))
+                or _count_active(TJOBS, TJOBS_LOCK,
+                                 ("queued", "subtitles", "transcribing")))
+
+
 @app.get("/api/config")
 def config():
     # Фронтенду нужно знать, спрашивать ли пароль.
     # Плюс состояние rutracker: есть ли на этом инстансе доступ к сайту.
     # Читается из кеша, сеть здесь не ждём (см. rutracker_state).
+    # Плюс версия yt-dlp — её показывает строка внизу страницы, а `busy`
+    # читает ночной скрипт обновления, решая, можно ли сейчас перезапускаться.
     return {"password_required": bool(ACCESS_PASSWORD),
-            "rutracker": rutracker_state()}
+            "rutracker": rutracker_state(),
+            "busy": _is_busy(),
+            "ytdlp": _ytdlp_status()}
 
 
 # --- Рекорд тетриса (один глобальный рекорд за всё время) ------------------

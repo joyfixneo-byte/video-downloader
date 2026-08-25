@@ -468,6 +468,13 @@
     </div>
     <div class="jobs" id="libraryList"></div>
   </div>
+
+  <!-- Версия yt-dlp. Его обновляет ночной systemd-таймер
+       (deploy/ytdlp-update.sh), и если в этот момент шла загрузка —
+       перезапуск отложен, а новая версия ещё не применилась. Строку
+       заполняет applyYtdlp() по данным /api/config. -->
+  <div class="muted" id="ytdlpLine"
+       style="font-size:12px;text-align:center;margin:18px 0 4px"></div>
 </div>
 
 <script>
@@ -619,12 +626,33 @@ function cycleTheme() {
   applyTheme(next);
 }
 
+// Строка про yt-dlp внизу страницы. Показываем не ради красоты: скачивание
+// ломается именно из-за устаревшего yt-dlp (403 от YouTube), а обновляется он
+// ночью сам — по этой строке видно, что таймер жив и когда он был. Если
+// running и installed разошлись, значит новая версия уже лежит на диске,
+// но перезапуск был отложен из-за активной загрузки.
+function applyYtdlp(y) {
+  const el = document.getElementById("ytdlpLine");
+  if (!el || !y) return;
+  let text = "yt-dlp " + y.running;
+  if (y.restart_pending) {   // сравнение версий делает бэкенд, см. _vparts
+    text += " · обновлён до " + y.installed + ", применится после перезапуска сервиса";
+  } else if (y.checked_at) {
+    text += " · проверено " + new Date(y.checked_at * 1000).toLocaleString("ru-RU",
+      { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  } else {
+    text += " · автопроверка обновлений ещё не отрабатывала";
+  }
+  el.textContent = text;
+}
+
 async function init() {
   applyTheme(localStorage.getItem("theme") || "");   // подписать кнопку темы
   let cfg = { password_required: false };
   try { cfg = await fetch("/api/config").then(r => r.json()); } catch (e) {}
   RT_STATE = cfg.rutracker || "checking";
   if (RT_STATE === "checking") setTimeout(recheckRutracker, 3000);
+  applyYtdlp(cfg.ytdlp);
   if (!cfg.password_required) {        // пароль не настроен — открыто всё
     unlockApp();
     return;

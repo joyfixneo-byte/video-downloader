@@ -27,14 +27,22 @@ sed -e "s|__APP_DIR__|$APP_DIR|g" \
     "$APP_DIR/deploy/video-downloader.service" \
     > /etc/systemd/system/video-downloader.service
 
+echo "==> Устанавливаю таймер автообновления yt-dlp..."
+# yt-dlp ломается по расписанию YouTube, а не репозитория — без таймера
+# он тихо стареет в venv, пока однажды не начнёт отдавать «403 Forbidden».
+sed -e "s|__APP_DIR__|$APP_DIR|g"     "$APP_DIR/deploy/video-downloader-ytdlp.service"     > /etc/systemd/system/video-downloader-ytdlp.service
+cp "$APP_DIR/deploy/video-downloader-ytdlp.timer"    /etc/systemd/system/video-downloader-ytdlp.timer
+
 systemctl daemon-reload
 systemctl enable video-downloader
 systemctl restart video-downloader
+systemctl enable --now video-downloader-ytdlp.timer
 
 echo ""
 echo "==> Готово. Сервис запущен на порту 8000."
 echo "    Статус:  systemctl status video-downloader"
 echo "    Логи:    journalctl -u video-downloader -f"
+echo "    Автообновление yt-dlp: systemctl list-timers | grep ytdlp"
 echo ""
 echo "    Чтобы задать пароль доступа, добавь в юнит строку"
 echo "    Environment=DOWNLOADER_PASSWORD=твой_пароль и сделай:"

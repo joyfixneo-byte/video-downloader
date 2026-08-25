@@ -21,6 +21,10 @@ JOURNAL = ROOT / "docs" / "FUNCTIONS.md"
 
 ROUTE = re.compile(r"^(GET|POST|PUT|DELETE) (/api/\S+)$")
 FUNC = re.compile(r"^[A-Za-z_][\w.]*\(\)$|^[A-Z][A-Z_]+$")   # foo() или GAME
+# Инфраструктура (скрипты деплоя, systemd-юниты) — тоже функция для
+# пользователя, просто её точка входа лежит не в app.py: например ночное
+# автообновление yt-dlp это deploy/ytdlp-update.sh, а не питоновская функция.
+SCRIPT = re.compile(r"^[\w./-]+\.(sh|service|timer)$")
 
 
 def code_routes():
@@ -85,9 +89,16 @@ def main():
                 if token.rstrip("()") not in front + APP.read_text(encoding="utf-8"):
                     errors.append(f"«{name}»: функции {token} больше нет "
                                   "ни в index.html, ни в app.py")
+            elif SCRIPT.match(token):
+                # Проверяем ровно то же, что и для функций: что точка входа
+                # из журнала всё ещё существует в репозитории.
+                if not (ROOT / token).is_file():
+                    errors.append(f"«{name}»: журнал протух — файла {token} "
+                                  "в репозитории больше нет")
             else:
                 errors.append(f"«{name}»: непонятный токен точки входа {token!r} "
-                              "(ожидается `GET /api/…` или `имяФункции()`)")
+                              "(ожидается `GET /api/…`, `имяФункции()` "
+                              "или путь к скрипту вида deploy/foo.sh)")
 
     for method, path in sorted(code_routes() - in_journal):
         errors.append(f"{method} {path} есть в app.py, но не записана в журнал "

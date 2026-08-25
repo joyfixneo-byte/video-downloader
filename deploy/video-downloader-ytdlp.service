@@ -1,0 +1,14 @@
+[Unit]
+# Обновляет yt-dlp и, если сервис свободен, перезапускает его на новой версии.
+# Вся логика — в deploy/ytdlp-update.sh, он лежит в репозитории и приезжает
+# обычным `git pull` через vdup. Юнит ставится один раз и больше не трогается.
+Description=Обновление yt-dlp для video-downloader
+# Таймер срабатывает ночью, когда VPN-туннель мог ещё не подняться.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Без User=: .venv принадлежит root (создан через sudo bash install.sh),
+# и systemctl restart основного сервиса тоже требует root.
+ExecStart=__APP_DIR__/deploy/ytdlp-update.sh
