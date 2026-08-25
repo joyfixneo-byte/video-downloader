@@ -155,14 +155,24 @@
   .tab-btn.active { color:var(--text); font-weight:600;
          border-bottom-color:var(--text); }
 
-  /* Строка списка — высота 44px, разделитель 1px */
-  .ep { display:flex; align-items:center; gap:12px; min-height:var(--hit);
-        padding:10px 0; border-bottom:1px solid var(--border);
-        font-size:15px; line-height:22px; font-weight:400; color:var(--text);
+  /* Строка списка: чекбокс | имя | размер. Именно grid с min-width:0 у имени —
+     во flex длинный путь одним неразрывным токеном распирал список вбок. */
+  .ep { display:grid; grid-template-columns:auto 1fr auto; align-items:center;
+        gap:10px; min-height:36px; padding:6px 0;
+        border-bottom:1px solid var(--border);
+        font-size:14px; line-height:20px; font-weight:400; color:var(--text);
         cursor:pointer; }
+  .ep > span { min-width:0; overflow-wrap:anywhere; }
+  .ep .size { font-size:13px; color:var(--text-2); white-space:nowrap;
+        font-variant-numeric:tabular-nums; }
   .ep:last-child { border-bottom:none; }
-  .ep-list { max-height:340px; overflow:auto; margin-top:4px;
-        -webkit-overflow-scrolling:touch; }
+  /* overflow-x:hidden — прокрутки вбок нет вообще, поэтому фокус на чекбоксе
+     больше не «кидает влево» при выборе файла. */
+  .ep-list { max-height:min(50vh, 420px); overflow-y:auto; overflow-x:hidden;
+        margin-top:4px; -webkit-overflow-scrolling:touch; }
+  /* Общая папка раздачи — один раз над списком вместо повтора в каждой строке */
+  .ep-dir { font-size:13px; line-height:18px; color:var(--text-2);
+        overflow-wrap:anywhere; margin:8px 0 0; }
 
   .jobs { margin-top:4px; }
   .job { padding:16px; border:1px solid var(--border); border-radius:var(--r-ctl);
@@ -375,6 +385,7 @@
           <button class="ghost small" onclick="selectAllTorrentFiles(false)">Снять все</button>
           <span class="hint" id="tFilePickCount"></span>
         </div>
+        <div class="ep-dir hidden" id="tFilePickDir"></div>
         <div class="ep-list" id="tFilePickList"></div>
         <label class="check-row">
           <input type="checkbox" id="tFilePickAutoRest">
@@ -861,12 +872,31 @@ async function addTorrentMagnet(btn) {
 // если метаданные получить не удалось (нет пиров/трекер недоступен).
 let TPICK = null;
 
+// Общее начало путей (по сегментам, не по символам — иначе «S01E1/» и «S01E10/»
+// склеились бы в обрезок). Пусто, если файл один или общей папки нет.
+// Разрешаем перенос по разделителям имени: без этого на телефоне строка рвётся
+// посередине номера серии («S01E0 / 1»), а с <wbr> — по ближайшей точке.
+function softWrap(name) {
+  return escapeHtml(name).replace(/[._\-\/]/g, "$&<wbr>");
+}
+
+function commonDir(paths) {
+  if (paths.length < 2) return "";
+  const segs = paths.map(p => p.split("/"));
+  const first = segs[0];
+  let n = 0;
+  while (n < first.length - 1 && segs.every(s => s.length > n + 1 && s[n] === first[n])) n++;
+  return n ? first.slice(0, n).join("/") + "/" : "";
+}
+
 async function previewTorrentFiles(source, title) {
   const wrap = document.getElementById("tFilePick");
   const err = document.getElementById("tFilePickErr");
   const bar = document.getElementById("tFilePickBar");
   const list = document.getElementById("tFilePickList");
   const go = document.getElementById("tFilePickGo");
+  const dirEl = document.getElementById("tFilePickDir");
+  dirEl.classList.add("hidden");
   wrap.classList.remove("hidden");
   err.classList.add("hidden");
   bar.classList.add("hidden");
@@ -882,11 +912,16 @@ async function previewTorrentFiles(source, title) {
       method: "POST", body: JSON.stringify(source) });
     TPICK = { token, source, title };
     list.innerHTML = "";
+    const dir = commonDir(files.map(f => f.path));
+    dirEl.innerHTML = softWrap(dir);
+    dirEl.classList.toggle("hidden", !dir);
     files.forEach(f => {
       const row = document.createElement("label");
       row.className = "ep";
+      row.title = f.path;               // полный путь — в подсказке при наведении
       row.innerHTML = `<input type="checkbox" data-i="${f.index}" checked>
-                       <span>${escapeHtml(f.path)} · ${fmtSize(f.size)}</span>`;
+                       <span>${softWrap(f.path.slice(dir.length))}</span>
+                       <span class="size">${fmtSize(f.size)}</span>`;
       row.querySelector("input").addEventListener("change", updateTorrentFileCount);
       list.appendChild(row);
     });
