@@ -1,0 +1,11 @@
+[Unit]
+Description=Проверка живости video-downloader раз в минуту
+
+[Timer]
+# Первая проверка через 2 минуты после загрузки — дать сервису подняться.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

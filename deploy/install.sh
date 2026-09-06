@@ -33,16 +33,32 @@ echo "==> Устанавливаю таймер автообновления yt-
 sed -e "s|__APP_DIR__|$APP_DIR|g"     "$APP_DIR/deploy/video-downloader-ytdlp.service"     > /etc/systemd/system/video-downloader-ytdlp.service
 cp "$APP_DIR/deploy/video-downloader-ytdlp.timer"    /etc/systemd/system/video-downloader-ytdlp.timer
 
+echo "==> Устанавливаю сторожа (самопроверка сайта раз в минуту)..."
+# Процесс может зависнуть, не упав (общий пул потоков FastAPI кончился), —
+# systemd такого не видит, а снаружи это «502 Bad Gateway». Сторож раз в минуту
+# дёргает /api/config и перезапускает приложение или туннель.
+sed -e "s|__APP_DIR__|$APP_DIR|g" \
+    "$APP_DIR/deploy/video-downloader-watchdog.service" \
+    > /etc/systemd/system/video-downloader-watchdog.service
+cp "$APP_DIR/deploy/video-downloader-watchdog.timer" \
+   /etc/systemd/system/video-downloader-watchdog.timer
+
 systemctl daemon-reload
 systemctl enable video-downloader
 systemctl restart video-downloader
 systemctl enable --now video-downloader-ytdlp.timer
+systemctl enable --now video-downloader-watchdog.timer
 
 echo ""
 echo "==> Готово. Сервис запущен на порту 8000."
 echo "    Статус:  systemctl status video-downloader"
 echo "    Логи:    journalctl -u video-downloader -f"
 echo "    Автообновление yt-dlp: systemctl list-timers | grep ytdlp"
+echo "    Сторож:  journalctl -u video-downloader-watchdog -f"
+echo ""
+echo "    Чтобы сторож ловил и обрыв туннеля (а не только зависший сайт),"
+echo "    раскомментируй в /etc/systemd/system/video-downloader-watchdog.service"
+echo "    строку WATCHDOG_PUBLIC_URL со своим внешним адресом (см. комментарий там)."
 echo ""
 echo "    Чтобы задать пароль доступа, добавь в юнит строку"
 echo "    Environment=DOWNLOADER_PASSWORD=твой_пароль и сделай:"
