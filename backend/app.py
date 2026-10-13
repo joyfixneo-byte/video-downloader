@@ -48,6 +48,7 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # иначе копия ляжет на локальный диск VM и забьёт его.
 SHARE_DIR = os.environ.get("SHARE_DIR", "").strip()
 SHARE_PATH = Path(SHARE_DIR) if SHARE_DIR else None
+STAGING_DIR = SHARE_PATH / ".staging" if SHARE_PATH else None
 
 # Необязательный пароль. Если переменная окружения DOWNLOADER_PASSWORD задана,
 # то фронтенд должен присылать её в заголовке X-Access-Password.
@@ -99,8 +100,9 @@ def _cleanup_loop():
     while True:
         try:
             now = time.time()
-            if DOWNLOAD_DIR.exists():
-                for d in DOWNLOAD_DIR.iterdir():
+            for d in list(DOWNLOAD_DIR.iterdir()) + (
+                    list(STAGING_DIR.iterdir())
+                    if STAGING_DIR and STAGING_DIR.exists() else []):
                     if not d.is_dir() or d.name == ".meta":
                         continue
                     # Торренты: если библиотека (SMB) есть — они туда уезжают
@@ -373,54 +375,52 @@ def check_url_safe(url: str):
 
 
 def _publish_to_share(result: Path) -> str:
-    """Копирует готовый файл в папку-витрину (SMB-шару) для просмотра с ТВ.
+    """Публикует файл в корень SMB-библиотеки атомарной заменой.
 
-    Вызывается вручную по кнопке «В библиотеку» (см. /api/library/add), а для
-    файлов торрент-раздачи — ещё и автоматически по мере докачки каждого
-    файла (см. _publish_newly_done). Возвращает имя файла в витрине. Ошибки
-    пробрасываем — вызывающий код сам решает, показать их или залогировать.
-    Копируем во временное имя `*.part` и переименовываем — чтобы плеер на ТВ
-    не подхватил полускопированный файл."""
+    Вызывается для обычных загрузок и после проверки торрент-файлов; legacy-
+    файлы могут быть добавлены через /api/library/add. Возвращает имя файла.
+    Ошибки пробрасываем вызывающему коду, чтобы показать их или залогировать.
+    Готовый файл из staging находится на том же mount, поэтому переименовываем
+    его без второй постоянной копии. Старые файлы из DOWNLOAD_DIR копируются.
+    В обоих случаях ТВ не увидит незавершённую запись."""
     SHARE_PATH.mkdir(parents=True, exist_ok=True)
     target = SHARE_PATH / result.name
     # Такой же файл уже опубликован (то же имя и размер) — не копируем второй раз.
     if target.exists() and target.stat().st_size == result.stat().st_size:
+        if STAGING_DIR and result.resolve().is_relative_to(STAGING_DIR.resolve()):
+            result.unlink(missing_ok=True)
         return target.name
     # Имя занято другим роликом — добавляем короткий суффикс, чтобы не затереть.
     if target.exists():
         target = SHARE_PATH / f"{result.stem} ({uuid.uuid4().hex[:6]}){result.suffix}"
     tmp = SHARE_PATH / (target.name + ".part")
-    shutil.copyfile(result, tmp)
+    if STAGING_DIR and result.resolve().is_relative_to(STAGING_DIR.resolve()):
+        result.replace(tmp)
+    else:
+        shutil.copyfile(result, tmp)
     tmp.replace(target)
     return target.name
 
 
-def _publish_newly_done(job_id: str, job_dir: Path):
-    """Публикует в SMB-витрину файлы раздачи, которые только что докачались
-    (см. _file_done) — не дожидаясь конца всей раздачи. Публикацию каждого
-    файла пробуем один раз: успех/неудача запоминаются в JOBS, чтобы при
-    сбое шары не долбить копированием большого файла на каждый тик прогресса
-    (ручная кнопка «В библиотеку» остаётся как повтор)."""
+def _job_dir(job_id: str) -> Path:
+    """Новые задачи живут в SMB staging, старые продолжают работать из downloads."""
+    staged = STAGING_DIR / job_id if STAGING_DIR else None
+    if staged and (staged.exists() or not (DOWNLOAD_DIR / job_id).exists()):
+        return staged
+    return DOWNLOAD_DIR / job_id
+
+
+def _require_library():
     if not SHARE_PATH:
-        return
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if job is None:
-            return
-        failed = job.setdefault("publish_failed", set())
-    published = _published_map(job_dir)
-    for p in _real_job_files(job_dir):
-        rel = str(p.relative_to(job_dir)).replace("\\", "/")
-        if rel in published or rel in failed:
-            continue
-        try:
-            name = _publish_to_share(p)
-        except Exception:
-            traceback.print_exc()
-            failed.add(rel)
-            continue
-        published[rel] = name
-        _add_published(job_dir, rel, name)
+        raise HTTPException(503, "SMB-библиотека не настроена. Укажите SHARE_DIR на смонтированную шару.")
+    try:
+        SHARE_PATH.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt" and not os.path.ismount(SHARE_PATH):
+            raise OSError("путь SHARE_DIR не является точкой монтирования SMB")
+        if not os.access(SHARE_PATH, os.W_OK):
+            raise OSError("нет прав на запись")
+    except OSError as exc:
+        raise HTTPException(507, f"SMB-библиотека недоступна для записи: {exc}")
 
 
 def _count_active(jobs: dict, lock, states) -> int:
@@ -440,7 +440,7 @@ def _gb(n: int) -> str:
 def _disk_free() -> tuple[int, int]:
     """(свободно, всего) байт на диске с рабочей папкой. (0, 0) — не узнать."""
     try:
-        u = shutil.disk_usage(DOWNLOAD_DIR)
+        u = shutil.disk_usage(SHARE_PATH or DOWNLOAD_DIR)
     except OSError:
         return 0, 0
     return u.free, u.total
@@ -464,21 +464,16 @@ def _require_disk_space(need_bytes: int = 0):
             raise HTTPException(
                 507, f"Не хватит места: нужно {_gb(need_bytes)} плюс запас "
                 f"{DISK_MIN_FREE_MB} МБ, а свободно {_gb(free)}. Удалите "
-                "ненужное в разделах «Файлы на сервере» или «Библиотека» "
+                "ненужное в карточке «Библиотека SMB» "
                 "(либо снимите часть файлов с раздачи) и повторите.")
         raise HTTPException(
             507, f"На диске сервера почти нет места (свободно {_gb(free)}). "
-            "Удалите ненужные файлы в разделах «Файлы на сервере» "
-            "или «Библиотека» и повторите.")
+            "Удалите ненужные файлы в карточке «Библиотека SMB» и повторите.")
 
 
 def _drain_torrent_to_library(job_id: str, job_dir: Path) -> bool:
-    """После докачки торрента: копии файлов уже уехали в SMB-библиотеку
-    (см. _publish_newly_done). Удаляем их с сервера, чтобы торрент жил только
-    в библиотеке и не забивал диск VM. True — всё уехало, файлы удалены.
-    False (ничего не удаляем) — библиотека выключена ИЛИ часть файлов не
-    опубликовалась (шара отвалилась): тогда файлы остаются на сервере, чтобы
-    их не потерять, с ручной кнопкой-повтором «В библиотеку».
+    """Публикует готовые файлы атомарным rename из staging в корень SMB.
+    При ошибке публикации файлы остаются в staging, чтобы их не потерять.
 
     ⚠️ Саму папку задачи НЕ удаляем (раньше сносили целиком через rmtree).
     В ней остаются .meta.torrent, .selected и .published — «скелет» раздачи,
@@ -489,10 +484,13 @@ def _drain_torrent_to_library(job_id: str, job_dir: Path) -> bool:
     раздачу» (/api/delete) — автоочистка торрент-папки не трогает."""
     if not SHARE_PATH:
         return False
-    with JOBS_LOCK:
-        failed = set((JOBS.get(job_id) or {}).get("publish_failed", ()))
-    if failed or not _published_map(job_dir):
-        return False
+    for f in _real_job_files(job_dir):
+        rel = str(f.relative_to(job_dir)).replace("\\", "/")
+        try:
+            _add_published(job_dir, rel, _publish_to_share(f))
+        except Exception:
+            traceback.print_exc()
+            return False
     for f in _real_job_files(job_dir):
         f.unlink(missing_ok=True)
         _play_cache_path(f).unlink(missing_ok=True)   # remux-кэш плеера, если был
@@ -667,7 +665,14 @@ def info(req: InfoRequest):
 # --- Фоновое скачивание ----------------------------------------------------
 
 def _run_download(job_id: str, url: str, quality: str):
-    job_dir = DOWNLOAD_DIR / job_id
+    try:
+        _require_library()
+    except HTTPException as e:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id].update(state="error", error=e.detail)
+        return
+    job_dir = _job_dir(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
 
     def hook(d):
@@ -724,12 +729,15 @@ def _run_download(job_id: str, url: str, quality: str):
         result = _result_file(job_dir)
         if not result:
             raise RuntimeError("Файл не найден после скачивания")
+        library_name = _publish_to_share(result) if SHARE_PATH else None
+        if library_name:
+            result = SHARE_PATH / library_name
+            _add_published(job_dir, "__video__", library_name)
         with JOBS_LOCK:
             JOBS[job_id].update(
                 state="done", percent=100,
-                filename=result.name, size=result.stat().st_size)
-        # В SMB-витрину файл больше не копируется автоматически — только
-        # вручную, кнопкой «В библиотеку» (эндпоинт /api/library/add).
+                filename=result.name, size=result.stat().st_size,
+                library_name=library_name)
     except Exception as e:
         # Если это была отмена пользователем — чистим частичные файлы.
         with JOBS_LOCK:
@@ -750,6 +758,7 @@ def download(req: DownloadRequest):
     if not url:
         raise HTTPException(400, "Пустая ссылка")
     check_url_safe(url)
+    _require_library()
     _require_disk_space()
     if _count_active(JOBS, JOBS_LOCK,
                      ("queued", "downloading", "processing")) >= JOB_CEILING:
@@ -809,7 +818,7 @@ def delete_file(job_id: str):
     # job_id приходит из адреса — оставляем только буквы/цифры,
     # чтобы нельзя было выйти за пределы папки загрузок.
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    target = DOWNLOAD_DIR / safe
+    target = _job_dir(safe)
     if target.exists() and target.is_dir():
         shutil.rmtree(target, ignore_errors=True)
     with JOBS_LOCK:
@@ -824,9 +833,10 @@ def list_files():
     """Список файлов, реально лежащих на сервере (читаем с диска,
     чтобы видеть их даже после перезапуска сервиса)."""
     items = []
-    if DOWNLOAD_DIR.exists():
-        now = time.time()
-        for d in DOWNLOAD_DIR.iterdir():
+    roots = [DOWNLOAD_DIR] + ([STAGING_DIR] if STAGING_DIR else [])
+    dirs = [d for root in roots if root.exists() for d in root.iterdir()]
+    now = time.time()
+    for d in dirs:
             if not d.is_dir():
                 continue
             # Задачу, которая ещё качается/склеивается, не показываем как
@@ -914,11 +924,18 @@ def get_file(job_id: str, path: str = ""):
     # Чистим job_id так же, как при удалении: только буквы/цифры, чтобы нельзя
     # было выйти за пределы папки загрузок.
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
+    job_dir = _job_dir(safe)
 
     with JOBS_LOCK:
         job = JOBS.get(safe)
         state = job.get("state") if job else None
+        library_name = job.get("library_name") if job else None
+    if not library_name:
+        library_name = _published_map(job_dir).get("__video__")
+    if not path and library_name and SHARE_PATH:
+        target = _safe_share_file(library_name)
+        return FileResponse(target, filename=target.name,
+                            media_type="application/octet-stream")
 
     # path — конкретный файл многофайловой торрент-раздачи (раскрывающаяся
     # табличка); в отличие от запроса без path, отдаём его и во время
@@ -1235,17 +1252,21 @@ def play_file(job_id: str, path: str = "", t: float = 0.0, probe: int = 0,
               diag: int = 0, a: int = 0, hls: int = 0):
     """Просмотр в браузере файла загрузки/раздачи (см. _play_response)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    return _play_response(_resolve_ready_file(DOWNLOAD_DIR / safe, path), t,
+    with JOBS_LOCK:
+        job = JOBS.get(safe)
+        library_name = job.get("library_name") if job else None
+    if not library_name:
+        library_name = _published_map(_job_dir(safe)).get("__video__")
+    if library_name and SHARE_PATH:
+        return _play_response(_safe_share_file(library_name), t, probe, diag, a, hls)
+    return _play_response(_resolve_ready_file(_job_dir(safe), path), t,
                           probe, diag, a, hls)
 
 
 # --- Торренты (aria2 + поиск по публичному трекеру) ------------------------
-# Фаза 1: нашёл раздачу (или вставил magnet) → aria2c качает её на сервер в ту
-# же папку DOWNLOAD_DIR/<job_id>/. Готовый файл попадает в общий список
-# (/api/files) и отдаётся теми же ручками, что и yt-dlp-загрузки — торрент-
-# задача живёт в тех же JOBS, поэтому /api/status, /api/cancel, /api/delete,
-# /api/file и автоочистка работают для неё без изменений. Просмотр — после
-# докачки (стриминг во время загрузки — отдельный этап).
+# Новые задачи работают в SHARE_DIR/.staging/<job_id>; готовые файлы атомарно
+# переименовываются в корень SMB, а metadata сохраняются для resume/add-files.
+# Старые папки задач в DOWNLOAD_DIR остаются совместимыми.
 # ⚠️ Только личный просмотр легального контента (дистрибутивы и т.п.).
 
 ARIA2_BIN = os.environ.get("ARIA2_BIN", "aria2c")
@@ -1598,7 +1619,14 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
     хэш уже скачанных кусков) — используется и вручную (кнопка «Перечитать
     хэш»), и один раз автоматически сразу после обычной докачки (см. ниже),
     поэтому сам себя не рекурсирует дважды."""
-    job_dir = DOWNLOAD_DIR / job_id
+    try:
+        _require_library()
+    except HTTPException as e:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id].update(state="error", error=e.detail)
+        return
+    job_dir = _job_dir(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     # Маркер: эта папка — торрент-задача, автоочистка (_cleanup_loop) её не трогает.
     (job_dir / ".torrent_job").touch()
@@ -1673,9 +1701,6 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
                         speed=_bytes_from_aria2(spd.group(1)) if spd else None,
                         eta=_seconds_from_aria2(eta.group(1)) if eta else None,
                         total=_bytes_from_aria2(tot.group(1)) if tot else None)
-            # Файлы могут докачиваться поодиночке раньше, чем вся раздача —
-            # публикуем их в SMB-витрину сразу, не дожидаясь состояния "done".
-            _publish_newly_done(job_id, job_dir)
             if is_magnet:
                 _capture_magnet_metadata(job_dir, meta_target)
 
@@ -1704,7 +1729,6 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
             return _finish_pause(job_id, source)
 
         proc.wait()
-        _publish_newly_done(job_id, job_dir)  # публикуем всё, что докачалось
         real = [p for p in job_dir.rglob("*")
                 if p.is_file() and not _is_temp(p)
                 and p.suffix.lower() != ".torrent"
@@ -1980,7 +2004,7 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
 TORRENT_META: dict[str, dict] = {}
 TORRENT_META_LOCK = threading.Lock()
 TORRENT_META_TTL = 1800  # 30 минут — если так и не скачали, чистим за собой
-TORRENT_META_DIR = DOWNLOAD_DIR / ".meta"
+TORRENT_META_DIR = (STAGING_DIR / ".meta") if STAGING_DIR else DOWNLOAD_DIR / ".meta"
 
 
 def _prune_torrent_meta():
@@ -1996,6 +2020,7 @@ def _prune_torrent_meta():
 
 @app.post("/api/torrent/files", dependencies=[Depends(check_password)])
 def torrent_files_preview(req: TorrentRequest):
+    _require_library()
     magnet = _resolve_torrent_source(req.magnet, req.detail)
     _require_disk_space()
     _prune_torrent_meta()
@@ -2051,6 +2076,7 @@ def _selected_size(torrent_path: str, select=None) -> int:
 
 @app.post("/api/torrent", dependencies=[Depends(check_password)])
 def torrent_add(req: TorrentRequest):
+    _require_library()
     source = None
     select = None
     if req.token:
@@ -2096,7 +2122,7 @@ def torrent_job_files(job_id: str):
     диска, а не из JOBS, чтобы список был виден и после рестарта, и опрашиваем
     почаще во время загрузки, чтобы видеть, какие файлы уже готовы."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
+    job_dir = _job_dir(safe)
     if not job_dir.is_dir():
         raise HTTPException(404, "Задача не найдена")
     return {"files": _torrent_status_files(job_dir)}
@@ -2114,7 +2140,7 @@ class TorrentAddFilesRequest(BaseModel):
 def torrent_delete_file(job_id: str, req: TorrentFileActionRequest):
     """Удаляет один файл раздачи (не всю задачу) — например, ненужную серию."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
+    job_dir = _job_dir(safe)
     if not job_dir.is_dir():
         raise HTTPException(404, "Задача не найдена")
     base = job_dir.resolve()
@@ -2150,7 +2176,7 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
     поднимаем заново — прогресс качающегося файла не теряется, см.
     _finish_pause."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
+    job_dir = _job_dir(safe)
     meta = job_dir / ".meta.torrent"
     if not job_dir.is_dir() or not meta.is_file():
         raise HTTPException(400, "Для этой раздачи докачка недоступна")
@@ -2190,7 +2216,7 @@ def torrent_resume(job_id: str, check_integrity: bool = False):
     check_integrity=True — это же «▶ Продолжить», но с --check-integrity=true
     (кнопка «🔁 Перечитать хэш»)."""
     safe = re.sub(r"[^a-zA-Z0-9]", "", job_id)
-    job_dir = DOWNLOAD_DIR / safe
+    job_dir = _job_dir(safe)
     meta = job_dir / ".meta.torrent"
     if not job_dir.is_dir() or not meta.is_file():
         raise HTTPException(
@@ -2273,12 +2299,11 @@ def library_add(req: LibraryAddRequest):
     Вызывается кнопкой «В библиотеку» на сайте. Для многофайловой раздачи
     (торрент с несколькими сериями/файлами) копирует ВСЕ готовые файлы, а не
     только самый большой — иначе часть серий молча терялась."""
-    if not SHARE_PATH:
-        raise HTTPException(400, "Библиотека (SMB) не настроена")
+    _require_library()
     # job_id из тела запроса — оставляем только буквы/цифры, чтобы нельзя
     # было выйти за пределы папки загрузок.
     safe = re.sub(r"[^a-zA-Z0-9]", "", req.job_id)
-    files = _real_job_files(DOWNLOAD_DIR / safe)
+    files = _real_job_files(_job_dir(safe))
     if not files:
         raise HTTPException(404, "Файл не найден")
     names = []
@@ -2809,9 +2834,8 @@ def _resume_interrupted_torrents():
     недокачанный, задачи ещё нет в JOBS (свежий старт процесса). Уважает
     JOB_CEILING — то, что не влезло, остаётся с ручной кнопкой «Возобновить»
     на карточке (см. list_files)."""
-    if not DOWNLOAD_DIR.exists():
-        return
-    for d in DOWNLOAD_DIR.iterdir():
+    roots = [DOWNLOAD_DIR] + ([STAGING_DIR] if STAGING_DIR else [])
+    for d in (d for root in roots if root.exists() for d in root.iterdir()):
         if not d.is_dir() or d.name == ".meta":
             continue
         if not (d / ".torrent_job").exists():

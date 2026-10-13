@@ -27,6 +27,13 @@ sed -e "s|__APP_DIR__|$APP_DIR|g" \
     "$APP_DIR/deploy/video-downloader.service" \
     > /etc/systemd/system/video-downloader.service
 
+# Telegram worker is installed but deliberately not enabled here: it must run
+# only on apps-vpn, where YouTube egress is available.
+sed -e "s|__APP_DIR__|$APP_DIR|g" \
+    -e "s|__USER__|$SERVICE_USER|g" \
+    "$APP_DIR/deploy/video-downloader-telegram.service" \
+    > /etc/systemd/system/video-downloader-telegram.service
+
 echo "==> Устанавливаю таймер автообновления yt-dlp..."
 # yt-dlp ломается по расписанию YouTube, а не репозитория — без таймера
 # он тихо стареет в venv, пока однажды не начнёт отдавать «403 Forbidden».

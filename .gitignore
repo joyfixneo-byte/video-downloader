@@ -2,6 +2,7 @@
 backend/downloads/
 # Состояние рантайма (глобальный рекорд тетриса и т.п.)
 backend/data/
+backend/data/telegram_bot.sqlite3*
 # Python
 __pycache__/
 *.pyc

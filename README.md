@@ -77,11 +77,12 @@ New-NetFirewallRule -DisplayName "video-dl LAN 8000" -Direction Inbound -Action 
 Прямую ссылку на файл `http://192.168.88.251:8000/api/file/<job_id>` можно вставить
 в VLC на Apple TV («Сеть» → «Открыть сетевой поток»).
 
-### 2. SMB-витрина: телевизор видит файлы списком
-Понравившиеся ролики кнопкой **«📚 В библиотеку»** складываются в папку-витрину на
-хосте, расшаренную по SMB. Apple TV в VLC просто открывает её и выбирает файл — без
-ПК и без ввода ссылок. (Автоматически при скачивании файлы туда не копируются —
-только то, что сам отметишь, чтобы витрина не забивалась лишним.)
+### 2. SMB-библиотека: телевизор видит готовые файлы списком
+Все обычные загрузки и завершённые торренты сохраняются в общей SMB-библиотеке.
+Рабочие данные и незавершённые файлы находятся в скрытом каталоге
+`SHARE_DIR/.staging`; после завершения файл атомарно переименовывается в корень
+SMB. Постоянной копии в `downloads/` нет. Веб-страница показывает задачи и
+готовые файлы в одной карточке «Библиотека SMB».
 
 **На SRV-HOST** (PowerShell от администратора; пароль придумай свой):
 ```powershell
@@ -106,15 +107,47 @@ touch /mnt/videoshare/_test && rm /mnt/videoshare/_test && echo "Запись в
 ```
 Затем в `/etc/systemd/system/video-downloader.service` раскомментируй
 `Environment=SHARE_DIR=/mnt/videoshare` и `sudo systemctl daemon-reload && sudo systemctl restart video-downloader`.
+Убедись, что сервисный пользователь может писать в `/mnt/videoshare` и что это
+точка монтирования, а не локальная папка VM.
 
 **На Apple TV:** VLC → «Сеть» → «Подключиться к серверу» → `smb://192.168.88.251`,
 логин `videoshare` и пароль. Папка `VideoShare` — список готовых файлов.
 
-> Файлы в витрине не чистятся автоматически (это твоя «библиотека»). Управлять
-> ими можно прямо с сайта — раздел **«📚 Библиотека (SMB)»**: список, скачать,
-> удалить (появляется, только если задан `SHARE_DIR`). Либо вручную из папки
-> `S:\VideoShare`. Сайт по-прежнему сам удаляет свои рабочие копии в
-> `downloads/` через `RETENTION_HOURS`.
+> Готовые файлы в библиотеке не удаляются автоматически. Управлять ими можно
+> на сайте в карточке **«Библиотека SMB»**: посмотреть, скачать или удалить.
+> Незавершённые задачи хранятся в `.staging`; торрент-метаданные остаются там
+> для возобновления и докачки.
+
+## Личный Telegram-бот для YouTube (только VM-apps-vpn)
+
+Бот принимает ссылку на одно видео YouTube, ставит в очередь существующего `/api/download` с качеством `best`, следит за `/api/status` и отправляет результат в тот же чат. Кнопка «Остановить» вызывает `/api/cancel`. Доступ разрешён только одному Telegram user ID. Индекс canonical YouTube ID хранится в `backend/data/telegram_bot.sqlite3`; при совпадении названия со старым файлом без индекса бот сообщает о возможном дубле и не скачивает его.
+
+1. Создай бота через `@BotFather` и узнай свой числовой Telegram user ID.
+2. На **apps-vpn** создай закрытый env-файл, заменив значения:
+
+   ```bash
+   sudo install -d -m 700 /etc/video-downloader
+   sudo install -m 600 /dev/null /etc/video-downloader/telegram.env
+   sudo sh -c 'cat > /etc/video-downloader/telegram.env' <<'EOF'
+   TELEGRAM_BOT_TOKEN=токен_от_BotFather
+   TELEGRAM_ALLOWED_ID=твой_числовой_Telegram_ID
+   # Укажи, только если у веб-сервиса настроен пароль:
+   # DOWNLOADER_PASSWORD=тот_же_пароль_что_в_video-downloader.service
+   EOF
+   ```
+
+3. Убедись, что на этой VM уже настроен `SHARE_DIR=/mnt/videoshare`, SMB смонтирован, и веб-сервис отвечает на `http://127.0.0.1:8000/api/library`. Установщик кладёт unit worker-а, но не запускает его. Включи его только на VM-apps-vpn:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now video-downloader-telegram
+   sudo systemctl status video-downloader-telegram
+   sudo journalctl -u video-downloader-telegram -f
+   ```
+
+4. Отправь боту `/start`, затем ссылку на YouTube. Проверь готовый файл в SMB и сообщение о результате. Повтори ту же ссылку: повторная загрузка не должна стартовать. Для проверки отмены отправь другое видео и нажми «Остановить».
+
+Не включай `video-downloader-telegram` на VM-apps с прямым egress. После изменения токена или ID обнови env-файл и выполни `sudo systemctl restart video-downloader-telegram`.
 
 ## Полезные команды
 ```bash

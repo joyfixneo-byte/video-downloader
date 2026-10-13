@@ -179,6 +179,19 @@
          margin-bottom:8px; background:var(--surface); }
   .job .name { font-size:16px; line-height:22px; font-weight:600;
          margin-bottom:4px; word-break:break-word; }
+  .library-tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 12px; }
+  .library-groups { min-height:64px; }
+  .library-group { margin:14px 0 8px; }
+  .library-group-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .library-group-head button { white-space:normal; text-align:left; }
+  .action-open { position:fixed; right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); z-index:20; }
+  .action-panel { border:0; padding:0; width:min(620px, 100vw); max-width:none; height:100dvh; max-height:none;
+    margin:0 0 0 auto; color:var(--text); background:var(--bg); }
+  .action-panel::backdrop { background:rgba(0,0,0,.5); }
+  .action-panel-inner { height:100%; overflow:auto; padding:20px; padding-bottom:calc(24px + env(safe-area-inset-bottom)); }
+  .action-panel-head { position:sticky; top:-20px; z-index:2; display:flex; justify-content:space-between; align-items:center;
+    gap:12px; padding:12px 0; background:var(--bg); border-bottom:1px solid var(--border); margin-bottom:12px; }
+  @media (min-width:900px) { .action-panel { width:min(560px, 50vw); } }
 
   /* Мини-игра «Тетрис» как экран загрузки */
   #game { display:flex; flex-direction:column; align-items:center; gap:12px; margin:0; }
@@ -287,8 +300,7 @@
             onclick="cycleTheme()">Тема: авто</button>
   </div>
   <p class="sub">Вставь ссылку на страницу с видео — выбери серию и качество.
-     Готовые файлы удаляются с сервера через 3 часа после загрузки
-     (торренты — только вручную).</p>
+     Готовые файлы сохраняются в общей SMB-библиотеке.</p>
 
   <!-- Пароль -->
   <div class="card hidden" id="pwCard">
@@ -306,6 +318,15 @@
     <button type="button" class="tab-btn active" onclick="showTab('video', this)">Видео</button>
     <button type="button" class="tab-btn" onclick="showTab('torrent', this)">Торренты</button>
   </div>
+
+  <button type="button" class="ghost action-open gated" id="actionOpen" onclick="openActionPanel()">Ссылка и действия</button>
+  <dialog class="action-panel" id="actionPanel" aria-labelledby="actionPanelTitle">
+    <div class="action-panel-inner">
+      <div class="action-panel-head"><strong id="actionPanelTitle">Ссылка и действия</strong>
+        <button type="button" class="ghost small" onclick="closeActionPanel()">Закрыть</button></div>
+      <div id="actionPanelBody"></div>
+    </div>
+  </dialog>
 
   <div id="tabVideo">
     <!-- Ссылка -->
@@ -461,23 +482,23 @@
     <div class="jobs" id="jobs"></div>
   </div>
 
-  <!-- Файлы на сервере (рабочая папка, чистится через 3 часа) -->
+  <!-- Единый список загрузок и готовых файлов SMB -->
   <div class="card gated" id="serverCard">
     <div class="selbar">
-      <label style="margin:0">Файлы на сервере</label>
+      <label style="margin:0">Библиотека SMB</label>
       <span class="muted" id="diskFree" style="font-size:13px"></span>
+      <button class="ghost small" onclick="toggleCompletedGroups()">Свернуть завершённые</button>
       <button class="ghost small" onclick="loadFiles()">Обновить</button>
     </div>
-    <div class="jobs" id="serverList"></div>
-  </div>
-
-  <!-- Библиотека: SMB-витрина (постоянное хранилище для просмотра с ТВ) -->
-  <div class="card gated hidden" id="libraryCard">
-    <div class="selbar">
-      <label style="margin:0">Библиотека (SMB для телевизора)</label>
-      <button class="ghost small" onclick="loadLibrary()">Обновить</button>
+    <div class="library-tools" aria-label="Сортировка списка">
+      <label for="librarySort" style="margin:0">Сортировать</label>
+      <select id="librarySort" onchange="setLibrarySort(this.value)">
+        <option value="date">Дата</option><option value="name">Имя</option>
+        <option value="size">Размер</option><option value="status">Статус</option>
+      </select>
+      <button type="button" class="ghost small" id="libraryDirection" onclick="toggleLibraryDirection()">Сначала новые</button>
     </div>
-    <div class="jobs" id="libraryList"></div>
+    <div class="jobs library-groups" id="serverList"></div>
   </div>
 
   <!-- Версия yt-dlp. Его обновляет ночной systemd-таймер
@@ -509,6 +530,37 @@ document.addEventListener("touchend", e => {
 let PARSED = null;          // результат /api/info
 let PASSWORD = localStorage.getItem("dl_pw") || "";
 let LIBRARY_ENABLED = false; // настроена ли SMB-витрина (показывать кнопку «В библиотеку»)
+let LIBRARY_SORT = localStorage.getItem("library_sort") || "date";
+let LIBRARY_DESC = localStorage.getItem("library_desc") !== "false";
+const COLLAPSED_GROUPS = new Set(JSON.parse(localStorage.getItem("library_collapsed") || "[]"));
+const PLAYLIST_GROUPS = JSON.parse(localStorage.getItem("playlist_groups") || "{}");
+const PLAYLIST_TITLES = JSON.parse(localStorage.getItem("playlist_titles") || "{}");
+const PLAYLIST_FILES = JSON.parse(localStorage.getItem("playlist_files") || "{}");
+const ACTIVE_JOBS = new Map();
+
+function openActionPanel() { document.getElementById("actionPanel").showModal(); }
+function closeActionPanel() { document.getElementById("actionPanel").close(); }
+function placeActionForms() {
+  const body = document.getElementById("actionPanelBody");
+  ["tabVideo", "tabTorrent"].forEach(id => body.appendChild(document.getElementById(id)));
+  document.getElementById("librarySort").value = LIBRARY_SORT;
+  document.getElementById("libraryDirection").textContent = LIBRARY_DESC ? "Сначала новые" : "Сначала старые";
+}
+function setLibrarySort(value) { LIBRARY_SORT = value; localStorage.setItem("library_sort", value); loadFiles(); }
+function toggleLibraryDirection() {
+  LIBRARY_DESC = !LIBRARY_DESC; localStorage.setItem("library_desc", String(LIBRARY_DESC));
+  document.getElementById("libraryDirection").textContent = LIBRARY_DESC ? "Сначала новые" : "Сначала старые";
+  loadFiles();
+}
+function toggleCompletedGroups() {
+  const groups = [...document.querySelectorAll(".library-group")];
+  const allCollapsed = groups.filter(g => g.dataset.complete === "true").every(g => COLLAPSED_GROUPS.has(g.dataset.groupId));
+  groups.filter(g => g.dataset.complete === "true").forEach(g => {
+    if (allCollapsed) COLLAPSED_GROUPS.delete(g.dataset.groupId); else COLLAPSED_GROUPS.add(g.dataset.groupId);
+  });
+  localStorage.setItem("library_collapsed", JSON.stringify([...COLLAPSED_GROUPS]));
+  loadFiles();
+}
 
 function headers() {
   const h = { "Content-Type": "application/json" };
@@ -551,7 +603,6 @@ function unlockApp() {
   document.getElementById("pwCard").classList.add("hidden");
   applyRutracker();  // rutracker-блок — .cond, показываем его сами, по доступу
   loadFiles();
-  loadLibrary();
   resumeJobs();     // вернуть карточки задач, идущих в фоне (после F5)
 }
 
@@ -769,15 +820,21 @@ function startDownload() {
   } else {
     targets.push({ url: PARSED.url, title: PARSED.title });
   }
-  document.getElementById("jobsCard").classList.remove("hidden");
   GAME.start();
-  targets.forEach(t => createJob(t, quality));
+  const groupId = PARSED.type === "playlist" ? "playlist-" + crypto.randomUUID() : null;
+  targets.forEach(t => createJob(t, quality, groupId, PARSED.title));
 }
 
-async function createJob(target, quality) {
-  const wrap = document.getElementById("jobs");
+async function createJob(target, quality, groupId, groupTitle) {
+  const wrap = document.getElementById("serverList");
   const el = document.createElement("div");
   el.className = "job";
+  el.dataset.groupId = groupId || "pending-" + Date.now();
+  el.dataset.groupTitle = groupTitle || target.title;
+  el.dataset.sortName = target.title || "Загрузка";
+  el.dataset.sortStatus = "queued";
+  el.dataset.jobState = "queued";
+  el.dataset.sortDate = String(Date.now() / 1000);
   el.innerHTML = `<div class="name">${escapeHtml(target.title)}</div>
     <div class="meta">в очереди…</div>
     <div class="controls"></div>`;
@@ -786,8 +843,18 @@ async function createJob(target, quality) {
     const { job_id } = await api("/api/download", {
       method: "POST",
       body: JSON.stringify({ url: target.url, quality }) });
+    el.dataset.jobId = job_id;
+    el.dataset.groupId = groupId || job_id;
+    el.dataset.jobState = "queued";
+    if (groupId) {
+      PLAYLIST_GROUPS[job_id] = groupId; PLAYLIST_TITLES[groupId] = groupTitle;
+      localStorage.setItem("playlist_groups", JSON.stringify(PLAYLIST_GROUPS));
+      localStorage.setItem("playlist_titles", JSON.stringify(PLAYLIST_TITLES));
+    }
+    ACTIVE_JOBS.set(job_id, el);
     poll(job_id, el);
   } catch (e) {
+    el.dataset.jobState = "error"; el.dataset.sortStatus = "error";
     el.querySelector(".meta").innerHTML = `<span class="err">${e.message}</span>`;
   }
 }
@@ -985,15 +1052,21 @@ function startTorrentJob(jobId, title) { startJobCard(jobId, title, "torrent"); 
 // Создаёт карточку в списке загрузок и запускает poll(). Используется и при
 // старте, и при восстановлении карточек после перезагрузки страницы (resumeJobs).
 function startJobCard(jobId, title, type) {
-  document.getElementById("jobsCard").classList.remove("hidden");
-  const wrap = document.getElementById("jobs");
-  if (wrap.querySelector(`[data-job-id="${jobId}"]`)) return;   // уже есть
+  const wrap = document.getElementById("serverList");
+  if (ACTIVE_JOBS.has(jobId)) return;
   const el = document.createElement("div");
   el.className = "job";
   el.dataset.jobId = jobId;
+  el.dataset.groupId = PLAYLIST_GROUPS[jobId] || jobId;
+  el.dataset.groupTitle = title;
+  el.dataset.sortName = title;
+  el.dataset.sortStatus = "queued";
+  el.dataset.jobState = "queued";
+  el.dataset.sortDate = String(Date.now() / 1000);
   el.innerHTML = `<div class="name">${escapeHtml(title)}</div>
     <div class="meta">в очереди…</div>
     <div class="controls"></div>`;
+  ACTIVE_JOBS.set(jobId, el);
   wrap.prepend(el);
   poll(jobId, el);
 }
@@ -1980,6 +2053,9 @@ async function poll(jobId, el) {
     const s = await api("/api/status/" + jobId);
     pollOk(el);
     el.dataset.jobState = s.state;   // читает живая табличка файлов раздачи
+    el.dataset.sortStatus = s.state || "";
+    el.dataset.sortName = s.title || el.querySelector(".name").textContent;
+    el.dataset.sortDate = el.dataset.sortDate || String(Date.now() / 1000);
     // Человеческое название вместо «Торрент (magnet)»: сервер отдаёт имя
     // раздачи (из .torrent или dn= у magnet) в s.title.
     if (s.type === "torrent" && s.title) {
@@ -1992,28 +2068,36 @@ async function poll(jobId, el) {
       const spd = s.speed ? (s.speed / 1048576).toFixed(1) + " МБ/с" : "";
       const eta = s.eta ? " · осталось ~" + fmtTime(s.eta) : "";
       const sz = s.total ? " · размер ~" + fmtSize(s.total) : "";
-      meta.textContent = `Скачивание ${pct} ${spd}${eta}${sz}`;
-      controls.innerHTML = (s.type === "torrent" ? pauseBtn(jobId) : "") + stopBtn(jobId);
+      const progressText = `Скачивание ${pct} ${spd}${eta}${sz}`;
+      if (meta.textContent !== progressText) meta.textContent = progressText;
+      meta.dataset.value = `${s.percent || 0}`;
+      setMarkupIfChanged(controls, (s.type === "torrent" ? pauseBtn(jobId) : "") + stopBtn(jobId));
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "processing") {
       meta.textContent = "Обработка (склейка видео и звука)…";
-      controls.innerHTML = stopBtn(jobId);
+      setMarkupIfChanged(controls, stopBtn(jobId));
     } else if (s.state === "queued") {
       meta.textContent = "В очереди…";
-      controls.innerHTML = stopBtn(jobId);
+      setMarkupIfChanged(controls, stopBtn(jobId));
     } else if (s.state === "paused") {
       const pct = s.percent != null ? Math.round(s.percent) + "%" : "";
       meta.innerHTML = `<span class="muted">На паузе ${pct}</span>`;
-      controls.innerHTML = resumeBtn(jobId) + recheckBtn(jobId)
-        + `<button class="ghost small" onclick="deleteJob('${jobId}', this)">Удалить с сервера</button>`;
+      setMarkupIfChanged(controls, resumeBtn(jobId) + recheckBtn(jobId)
+        + `<button class="ghost small" onclick="deleteJob('${jobId}', this)">Удалить с сервера</button>`);
       if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
     } else if (s.state === "done") {
       const sz = s.size ? " (" + fmtSize(s.size) + ")" : "";
       // Торрент уехал в библиотеку (SMB) и удалён с сервера — дубля нет,
       // управление файлом теперь в разделе «Библиотека».
-      if (s.in_library) {
-        meta.innerHTML = `<span class="done">Готово${sz} — файлы в разделе `
-          + `«Библиотека» ниже. Остальные файлы раздачи можно докачать здесь же.</span>`;
+      if (s.in_library || s.library_name) {
+        const groupId = PLAYLIST_GROUPS[jobId];
+        const libraryName = s.library_name || s.filename;
+        if (groupId && libraryName) {
+          PLAYLIST_FILES[libraryName] = groupId;
+          localStorage.setItem("playlist_files", JSON.stringify(PLAYLIST_FILES));
+        }
+        meta.innerHTML = `<span class="done">Готово${sz} — файлы в «Библиотеке SMB». `
+          + `Остальные файлы раздачи можно докачать здесь же.</span>`;
         controls.innerHTML = "";
         // Табличку файлов НЕ убираем (раньше убирали): раздача жива и после
         // отправки в библиотеку — по ней докачиваются оставшиеся серии.
@@ -2021,8 +2105,9 @@ async function poll(jobId, el) {
         const det = el.querySelector("details.tfiles");
         if (det) det.remove();
         if (s.type === "torrent") addTorrentFilesToggle(el, jobId);
-        loadLibrary();
         loadFiles();
+        ACTIVE_JOBS.delete(jobId);
+        el.remove();
         return;
       }
       meta.innerHTML = `<span class="done">Готово${sz}</span>`;
@@ -2100,17 +2185,27 @@ async function resumeTorrent(jobId, btn, checkIntegrity = false) {
 async function loadFiles() {
   const list = document.getElementById("serverList");
   try {
-    const { files, disk } = await api("/api/files");
+    const [{ files, disk }, library] = await Promise.all([
+      api("/api/files"), api("/api/library")]);
+    LIBRARY_ENABLED = !!library.enabled;
     showDisk(disk);
-    if (!files.length) {
-      list.innerHTML = '<div class="muted" style="font-size:13px">'
-        + 'Пока нет файлов на сервере.</div>';
+    if (!library.enabled) {
+      list.innerHTML = '<div class="err" style="font-size:13px">'
+        + 'SMB-библиотека не настроена. Задайте SHARE_DIR на сервере.</div>';
       return;
     }
-    list.innerHTML = "";
+    const rows = [];
+    const knownIds = new Set();
     files.forEach(f => {
       const el = document.createElement("div");
       el.className = "job";
+      el.dataset.groupId = PLAYLIST_GROUPS[f.job_id] || f.job_id;
+      el.dataset.groupTitle = PLAYLIST_TITLES[el.dataset.groupId] || f.title || f.filename || "Загрузка";
+      el.dataset.sortName = f.title || f.filename || "Торрент";
+      el.dataset.sortStatus = f.interrupted ? "interrupted" : (f.skeleton ? "library" : "done");
+      el.dataset.sortDate = String(f.mtime || 0);
+      el.dataset.sortSize = String(f.size || 0);
+      knownIds.add(f.job_id);
       const href = "/api/file/" + f.job_id;
       const name = f.title || f.filename || "Торрент";
       let metaLine, controls;
@@ -2152,11 +2247,98 @@ async function loadFiles() {
       if (dl) dl.addEventListener("click", ev => {
         ev.preventDefault(); saveFile(href, f.filename, ev.currentTarget); });
       if (f.torrent) addTorrentFilesToggle(el, f.job_id, f.interrupted);
-      list.appendChild(el);
+      rows.push(el);
     });
+    const serverNames = new Set(files.map(f => f.filename).filter(Boolean));
+    (library.files || []).filter(f => !serverNames.has(f.name)).forEach(f => {
+      const el = document.createElement("div");
+      el.className = "job";
+      const groupId = PLAYLIST_FILES[f.name] || ("library:" + f.name);
+      el.dataset.groupId = groupId;
+      el.dataset.groupTitle = PLAYLIST_TITLES[groupId] || f.name;
+      el.dataset.sortName = f.name;
+      el.dataset.sortStatus = "library";
+      el.dataset.sortDate = String(f.mtime || 0);
+      el.dataset.sortSize = String(f.size || 0);
+      const href = "/api/library/file?name=" + encodeURIComponent(f.name);
+      el.innerHTML =
+        `<div class="name">${escapeHtml(f.name)}</div>
+         <div class="meta">${fmtSize(f.size)} · ${fmtDate(f.mtime)}</div>
+         <div class="controls">
+           <button class="ghost small" data-act="play">Смотреть</button>
+           <a class="dl" href="${href}">Скачать</a>
+           <button class="ghost small" data-act="del">Удалить</button>
+         </div>`;
+      el.querySelector(".dl").addEventListener("click", ev => {
+        ev.preventDefault(); saveFile(href, f.name, ev.currentTarget); });
+      el.querySelector('[data-act="play"]').addEventListener(
+        "click", () => openPlayer(libPlayUrl(f.name), f.name));
+      el.querySelector('[data-act="del"]').addEventListener(
+        "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
+      rows.push(el);
+    });
+
+    // Активные DOM-узлы сохраняются между обновлениями списка; poll() меняет
+    // только поля этой карточки. Завершённую строку заменяет запись каталога.
+    for (const [id, el] of ACTIVE_JOBS) {
+      if (el.dataset.jobId && knownIds.has(el.dataset.jobId)) {
+        ACTIVE_JOBS.delete(id); el.remove(); continue;
+      }
+      if (el.dataset.jobState && !["queued", "downloading", "processing", "paused"].includes(el.dataset.jobState)) {
+        rows.push(el); continue;
+      }
+      rows.push(el);
+    }
+    if (!rows.length) {
+      list.innerHTML = '<div class="muted" style="font-size:13px">Библиотека пуста.</div>';
+      return;
+    }
+    const groups = new Map();
+    rows.forEach(row => {
+      const id = row.dataset.groupId || row.dataset.jobId || "unknown";
+      if (!groups.has(id)) groups.set(id, []);
+      groups.get(id).push(row);
+    });
+    const orderedGroups = [...groups.entries()].map(([id, items]) => {
+      const sortValue = row => {
+        if (LIBRARY_SORT === "name") return (row.dataset.sortName || "").toLocaleLowerCase("ru");
+        if (LIBRARY_SORT === "size") return Number(row.dataset.sortSize || 0);
+        if (LIBRARY_SORT === "status") return row.dataset.sortStatus || "";
+        return Number(row.dataset.sortDate || 0);
+      };
+      items.sort((a, b) => compareLibrary(sortValue(a), sortValue(b)));
+      const complete = items.every(row => !["queued", "downloading", "processing", "paused"].includes(row.dataset.jobState));
+      return { id, items, complete, value: sortValue(items[0]) };
+    });
+    orderedGroups.sort((a, b) => compareLibrary(a.value, b.value));
+    const fragment = document.createDocumentFragment();
+    orderedGroups.forEach(group => {
+      const box = document.createElement("section");
+      box.className = "library-group"; box.dataset.groupId = group.id;
+      box.dataset.complete = String(group.complete);
+      const collapsed = group.complete && COLLAPSED_GROUPS.has(group.id);
+      const title = group.items[0].dataset.groupTitle || group.items[0].dataset.sortName || "Загрузка";
+      const head = document.createElement("div"); head.className = "library-group-head";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "ghost small";
+      toggle.textContent = `${collapsed ? "Развернуть" : "Свернуть"} · ${title} (${group.items.length})`;
+      toggle.disabled = !group.complete;
+      toggle.addEventListener("click", () => {
+        if (COLLAPSED_GROUPS.has(group.id)) COLLAPSED_GROUPS.delete(group.id); else COLLAPSED_GROUPS.add(group.id);
+        localStorage.setItem("library_collapsed", JSON.stringify([...COLLAPSED_GROUPS])); loadFiles();
+      });
+      head.appendChild(toggle); box.appendChild(head);
+      if (!collapsed) group.items.forEach(row => box.appendChild(row));
+      fragment.appendChild(box);
+    });
+    list.replaceChildren(fragment);
   } catch (e) {
     list.innerHTML = `<div class="err" style="font-size:13px">${e.message}</div>`;
   }
+}
+
+function compareLibrary(a, b) {
+  const result = typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b), "ru");
+  return LIBRARY_DESC ? -result : result;
 }
 
 async function deleteServerFile(jobId, btn) {
@@ -2179,52 +2361,7 @@ async function deleteServerFile(jobId, btn) {
 // --- Библиотека: файлы в SMB-витрине (хранятся постоянно) -----------------
 
 async function loadLibrary() {
-  const card = document.getElementById("libraryCard");
-  const list = document.getElementById("libraryList");
-  try {
-    const { enabled, files } = await api("/api/library");
-    const wasEnabled = LIBRARY_ENABLED;
-    LIBRARY_ENABLED = !!enabled;
-    if (!enabled) {                 // витрина не настроена — карточку прячем
-      card.classList.add("hidden");
-      return;
-    }
-    card.classList.remove("hidden");
-    // Витрина только что определилась как доступная — перерисуем списки файлов,
-    // чтобы на них появилась кнопка «В библиотеку».
-    if (!wasEnabled) loadFiles();
-    if (!files.length) {
-      list.innerHTML = '<div class="muted" style="font-size:13px">'
-        + 'Библиотека пуста.</div>';
-      return;
-    }
-    list.innerHTML = "";
-    files.forEach(f => {
-      const el = document.createElement("div");
-      el.className = "job";
-      const href = "/api/library/file?name=" + encodeURIComponent(f.name);
-      el.innerHTML =
-        `<div class="name">${escapeHtml(f.name)}</div>
-         <div class="meta">${fmtSize(f.size)}</div>
-         <div class="controls">
-           <button class="ghost small" data-act="play">Смотреть</button>
-           <a class="dl" href="${href}">Скачать</a>
-           <button class="ghost small" data-act="del">Удалить</button>
-         </div>`;
-      // Имя файла произвольное (кавычки, апострофы) — вешаем обработчики через
-      // замыкание, а не инлайн-onclick, чтобы не ломать HTML/JS.
-      el.querySelector(".dl").addEventListener(
-        "click", ev => { ev.preventDefault();
-          saveFile(href, f.name, ev.currentTarget); });
-      el.querySelector('[data-act="play"]').addEventListener(
-        "click", () => openPlayer(libPlayUrl(f.name), f.name));
-      el.querySelector('[data-act="del"]').addEventListener(
-        "click", ev => deleteLibraryFile(f.name, ev.currentTarget));
-      list.appendChild(el);
-    });
-  } catch (e) {
-    list.innerHTML = `<div class="err" style="font-size:13px">${e.message}</div>`;
-  }
+  return loadFiles();
 }
 
 // Копирует готовый файл задачи в SMB-витрину (постоянное хранилище для ТВ).
@@ -2260,7 +2397,9 @@ function escapeHtml(s) {
   return (s || "").replace(/[&<>"']/g, c => (
     { "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
+function setMarkupIfChanged(el, html) { if (el.innerHTML !== html) el.innerHTML = html; }
 
+placeActionForms();
 init();
 </script>
 </body>

@@ -1,0 +1,18 @@
+[Unit]
+Description=Private Telegram video downloader
+After=network-online.target video-downloader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__/backend
+EnvironmentFile=/etc/video-downloader/telegram.env
+Environment=TELEGRAM_API_BASE=http://127.0.0.1:8000
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/backend/telegram_bot.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
