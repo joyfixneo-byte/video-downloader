@@ -19,10 +19,15 @@ class LibraryUiContract(unittest.TestCase):
     def test_task_groups_use_job_ids_and_playlist_group_ids(self):
         self.assertIn('PLAYLIST_GROUPS[job_id] = groupId', HTML)
         self.assertIn('PLAYLIST_FILES[libraryName] = groupId', HTML)
-        self.assertIn('PLAYLIST_FILES[f.name] || ("library:" + f.name)', HTML)
-        self.assertIn('el.dataset.groupId = PLAYLIST_GROUPS[jobId] || jobId', HTML)
-        self.assertIn('knownIds.has(el.dataset.jobId)', HTML)
+        self.assertIn('f.torrent_job_id || PLAYLIST_FILES[f.name]', HTML)
+        self.assertIn('el.dataset.groupId = PLAYLIST_GROUPS[f.job_id] || f.job_id', HTML)
+        self.assertIn('el.dataset.jobId = f.job_id', HTML)
+        self.assertIn('ACTIVE_JOBS.set(jobId, job)', HTML)
         self.assertIn('const id = row.dataset.groupId || row.dataset.jobId', HTML)
+
+    def test_playlist_id_works_in_http_context(self):
+        self.assertIn('Math.random().toString(36).slice(2)', HTML)
+        self.assertNotIn('crypto.randomUUID()', HTML)
 
     def test_poll_updates_only_changed_progress_markup(self):
         self.assertIn('if (meta.textContent !== progressText) meta.textContent = progressText', HTML)

@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -46,8 +47,13 @@ def make_torrent(name: str, files: list) -> bytes:
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="torrent_files_test_"))
     os.environ["DOWNLOAD_DIR"] = str(tmp)
+    os.environ["DISK_MIN_FREE_MB"] = "1"
     import app as appmod  # noqa: E402  (после DOWNLOAD_DIR, чтобы модуль его подхватил)
     from fastapi.testclient import TestClient
+
+    # This is a synthetic torrent test; it exercises job logic, not the host's
+    # mount configuration. The dedicated staging tests cover SMB isolation.
+    appmod._require_library = lambda: None
 
     # Проверки ниже, где написано «упадёт без aria2 — это ок», раньше молча
     # опирались на то, что aria2 на машине разработчика не установлен. На
@@ -195,10 +201,9 @@ def main():
         share.mkdir()
         appmod.SHARE_PATH = share
         try:
-            appmod.JOBS["drain"] = {"publish_failed": {"b"}}
-            assert appmod._drain_torrent_to_library("drain", drain_dir) is False  # есть провал
+            with patch.object(appmod, "_publish_to_share", side_effect=OSError("SMB write failed")):
+                assert appmod._drain_torrent_to_library("drain", drain_dir) is False
             assert (drain_dir / "Drain" / "E01.mkv").is_file()
-            appmod.JOBS["drain"] = {"publish_failed": set()}
             assert appmod._drain_torrent_to_library("drain", drain_dir) is True
             assert not (drain_dir / "Drain" / "E01.mkv").exists()  # уехал в библиотеку
             assert (drain_dir / ".meta.torrent").is_file(), "скелет раздачи должен остаться"

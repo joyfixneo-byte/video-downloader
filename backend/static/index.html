@@ -821,7 +821,8 @@ function startDownload() {
     targets.push({ url: PARSED.url, title: PARSED.title });
   }
   GAME.start();
-  const groupId = PARSED.type === "playlist" ? "playlist-" + crypto.randomUUID() : null;
+  const groupId = PARSED.type === "playlist"
+    ? "playlist-" + Date.now() + "-" + Math.random().toString(36).slice(2) : null;
   targets.forEach(t => createJob(t, quality, groupId, PARSED.title));
 }
 
@@ -2032,6 +2033,8 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
         // запросы.
         if (!["queued", "downloading", "processing"].includes(container.dataset.jobState)) {
           container.dataset.jobState = "queued";
+          container.dataset.jobId = jobId;
+          ACTIVE_JOBS.set(jobId, container);
           poll(jobId, container);
         }
       }
@@ -2173,6 +2176,8 @@ async function resumeTorrent(jobId, btn, checkIntegrity = false) {
     await api("/api/torrent/" + jobId + "/resume" + q, { method: "POST" });
     const job = btn.closest(".job");
     job.dataset.jobState = "queued";
+    job.dataset.jobId = jobId;
+    ACTIVE_JOBS.set(jobId, job);
     poll(jobId, job);   // карточка переходит в режим живого прогресса
   } catch (e) {
     btn.disabled = false; btn.textContent = old;
@@ -2197,15 +2202,18 @@ async function loadFiles() {
     const rows = [];
     const knownIds = new Set();
     files.forEach(f => {
+      knownIds.add(f.job_id);
+      if (ACTIVE_JOBS.has(f.job_id)) return;
       const el = document.createElement("div");
       el.className = "job";
+      el.dataset.jobId = f.job_id;
       el.dataset.groupId = PLAYLIST_GROUPS[f.job_id] || f.job_id;
       el.dataset.groupTitle = PLAYLIST_TITLES[el.dataset.groupId] || f.title || f.filename || "Загрузка";
       el.dataset.sortName = f.title || f.filename || "Торрент";
       el.dataset.sortStatus = f.interrupted ? "interrupted" : (f.skeleton ? "library" : "done");
+      el.dataset.jobState = f.interrupted ? "interrupted" : "done";
       el.dataset.sortDate = String(f.mtime || 0);
       el.dataset.sortSize = String(f.size || 0);
-      knownIds.add(f.job_id);
       const href = "/api/file/" + f.job_id;
       const name = f.title || f.filename || "Торрент";
       let metaLine, controls;
@@ -2253,9 +2261,9 @@ async function loadFiles() {
     (library.files || []).filter(f => !serverNames.has(f.name)).forEach(f => {
       const el = document.createElement("div");
       el.className = "job";
-      const groupId = PLAYLIST_FILES[f.name] || ("library:" + f.name);
+      const groupId = f.torrent_job_id || PLAYLIST_FILES[f.name] || ("library:" + f.name);
       el.dataset.groupId = groupId;
-      el.dataset.groupTitle = PLAYLIST_TITLES[groupId] || f.name;
+      el.dataset.groupTitle = f.torrent_title || PLAYLIST_TITLES[groupId] || f.name;
       el.dataset.sortName = f.name;
       el.dataset.sortStatus = "library";
       el.dataset.sortDate = String(f.mtime || 0);
@@ -2281,7 +2289,8 @@ async function loadFiles() {
     // Активные DOM-узлы сохраняются между обновлениями списка; poll() меняет
     // только поля этой карточки. Завершённую строку заменяет запись каталога.
     for (const [id, el] of ACTIVE_JOBS) {
-      if (el.dataset.jobId && knownIds.has(el.dataset.jobId)) {
+      if (el.dataset.jobId && knownIds.has(el.dataset.jobId)
+          && !["queued", "downloading", "processing", "paused", "interrupted"].includes(el.dataset.jobState)) {
         ACTIVE_JOBS.delete(id); el.remove(); continue;
       }
       if (el.dataset.jobState && !["queued", "downloading", "processing", "paused"].includes(el.dataset.jobState)) {

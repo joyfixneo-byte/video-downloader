@@ -44,7 +44,14 @@ def db_connect():
     db.execute("""CREATE TABLE IF NOT EXISTS videos (
         video_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL,
         job_id TEXT, filename TEXT, chat_id TEXT NOT NULL, message_id INTEGER,
-        error TEXT, updated REAL NOT NULL)""")
+        error TEXT, updated REAL NOT NULL, notification TEXT,
+        notified INTEGER NOT NULL DEFAULT 1)""")
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(videos)")}
+    if "notification" not in columns:
+        db.execute("ALTER TABLE videos ADD COLUMN notification TEXT")
+    if "notified" not in columns:
+        # Existing terminal rows predate the outbox; do not send old results again.
+        db.execute("ALTER TABLE videos ADD COLUMN notified INTEGER NOT NULL DEFAULT 1")
     db.commit()
     return db
 
@@ -234,46 +241,59 @@ def handle_update(update: dict):
 
 def poll_jobs():
     db = db_connect()
-    rows = db.execute("SELECT * FROM videos WHERE state IN ('queued','downloading','processing')").fetchall()
+    rows = db.execute("SELECT * FROM videos WHERE state IN ('queued','downloading','processing') OR notified=0").fetchall()
     for row in rows:
-        try:
-            job = app_api("GET", f"/api/status/{urllib.parse.quote(row['job_id'])}")
-        except BotError as exc:
-            # A missing in-memory job means the application restarted during this
-            # download. Do not silently create a second task for the same video.
-            if "не найдена" in str(exc).lower() or "not found" in str(exc).lower():
-                state, error = "error", "Сервер перезапустился во время загрузки; проверьте SMB и отправьте ссылку повторно."
-                db.execute("UPDATE videos SET state=?,error=?,updated=? WHERE video_id=?",
-                           (state, error, time.time(), row["video_id"]))
-                db.commit()
-                telegram("sendMessage", {"chat_id": row["chat_id"], "text": f"Не завершено: {row['title']}. {error}"})
-            continue
-        state = job.get("state", "")
-        if state in ACTIVE:
-            db.execute("UPDATE videos SET state=?,updated=? WHERE video_id=?",
-                       (state, time.time(), row["video_id"]))
-            db.commit()
-            continue
-        if state == "done":
-            filename = job.get("library_name") or job.get("filename") or row["title"]
-            message = f"Готово, добавил в SMB-библиотеку: {filename}"
-            db.execute("UPDATE videos SET state='done',filename=?,error=NULL,updated=? WHERE video_id=?",
-                       (filename, time.time(), row["video_id"]))
-        elif state == "cancelled":
-            message = f"Загрузка остановлена: {row['title']}"
-            db.execute("UPDATE videos SET state='cancelled',updated=? WHERE video_id=?",
-                       (time.time(), row["video_id"]))
-        else:
-            error = job.get("error") or f"состояние задачи: {state or 'неизвестно'}"
-            message = f"Не удалось скачать «{row['title']}»: {error}"
-            db.execute("UPDATE videos SET state='error',error=?,updated=? WHERE video_id=?",
-                       (error, time.time(), row["video_id"]))
-        db.commit()
-        telegram("sendMessage", {"chat_id": row["chat_id"], "text": message})
-        if row["message_id"]:
+        if row["state"] in ACTIVE:
             try:
-                telegram("editMessageReplyMarkup", {"chat_id": row["chat_id"],
-                    "message_id": row["message_id"], "reply_markup": {"inline_keyboard": []}})
+                job = app_api("GET", f"/api/status/{urllib.parse.quote(row['job_id'])}")
+            except BotError as exc:
+                # A missing in-memory job means the application restarted during
+                # this download. Queue a durable failure notice; never resubmit it.
+                if "не найдена" not in str(exc).lower() and "not found" not in str(exc).lower():
+                    continue
+                error = "Сервер перезапустился во время загрузки; проверьте SMB и отправьте ссылку повторно."
+                db.execute("UPDATE videos SET state='error',error=?,notification=?,notified=0,updated=? WHERE video_id=?",
+                           (error, f"Не завершено: {row['title']}. {error}", time.time(), row["video_id"]))
+                db.commit()
+            else:
+                state = job.get("state", "")
+                if state in ACTIVE:
+                    db.execute("UPDATE videos SET state=?,updated=? WHERE video_id=?",
+                               (state, time.time(), row["video_id"]))
+                    db.commit()
+                    continue
+                if state == "done":
+                    filename = job.get("library_name") or job.get("filename") or row["title"]
+                    message = f"Готово, добавил в SMB-библиотеку: {filename}"
+                    db.execute("UPDATE videos SET state='done',filename=?,error=NULL,notification=?,notified=0,updated=? WHERE video_id=?",
+                               (filename, message, time.time(), row["video_id"]))
+                elif state == "cancelled":
+                    message = f"Загрузка остановлена: {row['title']}"
+                    db.execute("UPDATE videos SET state='cancelled',notification=?,notified=0,updated=? WHERE video_id=?",
+                               (message, time.time(), row["video_id"]))
+                else:
+                    error = job.get("error") or f"состояние задачи: {state or 'неизвестно'}"
+                    message = f"Не удалось скачать «{row['title']}»: {error}"
+                    db.execute("UPDATE videos SET state='error',error=?,notification=?,notified=0,updated=? WHERE video_id=?",
+                               (error, message, time.time(), row["video_id"]))
+                db.commit()
+
+        pending = db.execute("SELECT * FROM videos WHERE video_id=? AND notified=0",
+                             (row["video_id"],)).fetchone()
+        if not pending:
+            continue
+        try:
+            telegram("sendMessage", {"chat_id": pending["chat_id"],
+                                      "text": pending["notification"]})
+        except BotError:
+            print(f"Telegram notification pending for {pending['video_id']}", flush=True)
+            continue
+        db.execute("UPDATE videos SET notified=1 WHERE video_id=?", (pending["video_id"],))
+        db.commit()
+        if pending["message_id"]:
+            try:
+                telegram("editMessageReplyMarkup", {"chat_id": pending["chat_id"],
+                    "message_id": pending["message_id"], "reply_markup": {"inline_keyboard": []}})
             except BotError:
                 pass
     db.close()

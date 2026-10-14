@@ -38,6 +38,49 @@ class TelegramBotTests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT value FROM settings WHERE key='offset'").fetchone()[0], "25")
                 db.close()
 
+    def test_legacy_database_gets_outbox_columns_without_replaying_old_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bot.sqlite3"
+            raw = bot.sqlite3.connect(path)
+            raw.execute("""CREATE TABLE videos (
+                video_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL,
+                job_id TEXT, filename TEXT, chat_id TEXT NOT NULL, message_id INTEGER,
+                error TEXT, updated REAL NOT NULL)""")
+            raw.execute("INSERT INTO videos(video_id,title,state,chat_id,updated) VALUES('old','Old','done','42',1)")
+            raw.commit(); raw.close()
+            with patch.object(bot, "STATE_DB", path):
+                db = bot.db_connect()
+                row = db.execute("SELECT notification,notified FROM videos WHERE video_id='old'").fetchone()
+                self.assertEqual(tuple(row), (None, 1))
+                db.close()
+
+    def test_failed_terminal_notification_is_retried_after_worker_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bot.sqlite3"
+            with patch.object(bot, "STATE_DB", path):
+                db = bot.db_connect()
+                db.execute("""INSERT INTO videos(video_id,title,state,job_id,chat_id,updated)
+                    VALUES('video1','Video','downloading','job1','42',1)""")
+                db.commit(); db.close()
+                send = patch.object(bot, "telegram", side_effect=[bot.BotError("offline"), {"message_id": 7}])
+                status = patch.object(bot, "app_api", return_value={"state": "done", "library_name": "Video.mp4"})
+                with send as telegram, status as app_api:
+                    bot.poll_jobs()
+                    db = bot.db_connect()
+                    row = db.execute("SELECT state,notified,notification FROM videos WHERE video_id='video1'").fetchone()
+                    self.assertEqual(row["state"], "done")
+                    self.assertEqual(row["notified"], 0)
+                    self.assertIn("Video.mp4", row["notification"])
+                    db.close()
+
+                    # A fresh poll, like a restarted worker, retries delivery and
+                    # does not query or submit a second download.
+                    bot.poll_jobs()
+                    self.assertEqual(telegram.call_count, 2)
+                    self.assertEqual(app_api.call_count, 1)
+                    db = bot.db_connect()
+                    self.assertEqual(db.execute("SELECT notified FROM videos WHERE video_id='video1'").fetchone()[0], 1)
+                    db.close()
     def test_unauthorized_message_does_not_read_url_or_call_api(self):
         with patch.object(bot, "ALLOWED_ID", "123"), \
              patch.object(bot, "handle_video") as handle_video, \
