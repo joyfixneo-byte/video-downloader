@@ -52,6 +52,64 @@ class TelegramBotTests(unittest.TestCase):
                 db = bot.db_connect()
                 row = db.execute("SELECT notification,notified FROM videos WHERE video_id='old'").fetchone()
                 self.assertEqual(tuple(row), (None, 1))
+                self.assertIsNone(db.execute(
+                    "SELECT status_text FROM videos WHERE video_id='old'").fetchone()[0])
+                db.close()
+
+    def test_active_status_edits_same_message_with_download_stats_and_skips_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(bot, "STATE_DB", Path(temp) / "bot.sqlite3"), \
+                 patch.object(bot, "app_api", return_value={
+                     "state": "downloading", "percent": 25, "speed": 2097152,
+                     "eta": 61, "downloaded": 5242880, "total": 20971520,
+                 }), patch.object(bot, "telegram") as telegram:
+                db = bot.db_connect()
+                db.execute("""INSERT INTO videos(video_id,title,state,job_id,chat_id,message_id,updated)
+                    VALUES('v1','Video','downloading','j1','42',7,1)""")
+                db.commit(); db.close()
+                bot.poll_jobs()
+                bot.poll_jobs()
+        self.assertEqual(telegram.call_count, 1)
+        method, payload = telegram.call_args.args
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(payload["message_id"], 7)
+        self.assertIn("25%", payload["text"])
+        self.assertIn("2.0 МБ/с", payload["text"])
+        self.assertIn("~1 мин 1 с", payload["text"])
+        self.assertIn("5.0 МБ из ~20.0 МБ", payload["text"])
+        self.assertEqual(payload["reply_markup"], bot.stop_markup("j1"))
+
+    def test_terminal_status_edits_same_message_and_removes_stop_button(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(bot, "STATE_DB", Path(temp) / "bot.sqlite3"), \
+                 patch.object(bot, "app_api", return_value={
+                     "state": "done", "library_name": "Video.mp4", "size": 3145728,
+                 }), patch.object(bot, "telegram") as telegram:
+                db = bot.db_connect()
+                db.execute("""INSERT INTO videos(video_id,title,state,job_id,chat_id,message_id,updated)
+                    VALUES('v1','Video','downloading','j1','42',7,1)""")
+                db.commit(); db.close()
+                bot.poll_jobs()
+        self.assertEqual(telegram.call_count, 1)
+        method, payload = telegram.call_args.args
+        self.assertEqual(method, "editMessageText")
+        self.assertEqual(payload["message_id"], 7)
+        self.assertIn("Готово (3.0 МБ)", payload["text"])
+        self.assertEqual(payload["reply_markup"], {"inline_keyboard": []})
+
+    def test_already_applied_terminal_edit_counts_as_delivered(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(bot, "STATE_DB", Path(temp) / "bot.sqlite3"), \
+                 patch.object(bot, "app_api", return_value={"state": "done", "library_name": "Video.mp4"}), \
+                 patch.object(bot, "telegram", side_effect=bot.BotError("message is not modified")):
+                db = bot.db_connect()
+                db.execute("""INSERT INTO videos(video_id,title,state,job_id,chat_id,message_id,updated)
+                    VALUES('v1','Video','downloading','j1','42',7,1)""")
+                db.commit(); db.close()
+                bot.poll_jobs()
+                db = bot.db_connect()
+                self.assertEqual(db.execute(
+                    "SELECT notified FROM videos WHERE video_id='v1'").fetchone()[0], 1)
                 db.close()
 
     def test_failed_terminal_notification_is_retried_after_worker_restart(self):

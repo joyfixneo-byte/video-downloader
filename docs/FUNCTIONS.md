@@ -38,7 +38,7 @@ python backend/test_functions_journal.py
 | Удаление задачи и файла с сервера | `POST /api/delete/{job_id}` | «Загрузки» → «Удалить с сервера» |
 | Выбор серий плейлиста галочками | `renderPick()` | Карточка разбора → «Выбрать все» / «Снять все» / чекбоксы в списке |
 
-| Приём YouTube-ссылки в личном Telegram, постановка лучшего качества в SMB, статус, повторная доставка недоставленного результата, отмена и дедупликация по canonical video ID (`backend/telegram_bot.py`) | `POST /api/download`, `GET /api/status/{job_id}`, `POST /api/cancel/{job_id}`, `GET /api/library` | нет веб-интерфейса сайта — использовать личный Telegram-бот, отправить ссылку; для остановки нажать inline-кнопку «Остановить» |
+| Приём YouTube-ссылки в личном Telegram, загрузка в SMB с обновлением в одном сообщении прогресса, скорости, ETA и размера, отмена и дедупликация по canonical video ID (`backend/telegram_bot.py`) | `POST /api/download`, `GET /api/status/{job_id}`, `POST /api/cancel/{job_id}`, `GET /api/library` | нет веб-интерфейса сайта — использовать личный Telegram-бот, отправить ссылку; прогресс обновляется в сообщении загрузки, для остановки нажать inline-кнопку «Остановить» |
 
 ## Единая библиотека SMB
 

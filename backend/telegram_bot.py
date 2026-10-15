@@ -25,7 +25,7 @@ API_BASE = os.environ.get("TELEGRAM_API_BASE", "http://127.0.0.1:8000").rstrip("
 API_PASSWORD = os.environ.get("DOWNLOADER_PASSWORD", "").strip()
 STATE_DB = Path(os.environ.get(
     "TELEGRAM_STATE_DB", Path(__file__).resolve().parent / "data" / "telegram_bot.sqlite3"))
-POLL_SECONDS = 2
+POLL_SECONDS = 5
 ACTIVE = ("queued", "downloading", "processing")
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtube-nocookie.com"}
 
@@ -47,6 +47,8 @@ def db_connect():
         error TEXT, updated REAL NOT NULL, notification TEXT,
         notified INTEGER NOT NULL DEFAULT 1)""")
     columns = {row["name"] for row in db.execute("PRAGMA table_info(videos)")}
+    if "status_text" not in columns:
+        db.execute("ALTER TABLE videos ADD COLUMN status_text TEXT")
     if "notification" not in columns:
         db.execute("ALTER TABLE videos ADD COLUMN notification TEXT")
     if "notified" not in columns:
@@ -146,6 +148,41 @@ def stop_markup(job_id: str):
     return {"inline_keyboard": [[{"text": "Остановить", "callback_data": f"stop:{job_id}"}]]}
 
 
+def _format_size(size: int) -> str:
+    mb = size / 1048576
+    return f"{mb / 1024:.2f} ГБ" if mb >= 1024 else f"{mb:.1f} МБ"
+
+
+def _format_time(seconds: float) -> str:
+    seconds = round(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {seconds} с"
+    return f"{seconds} с"
+
+
+def _status_text(job: dict, title: str) -> str:
+    state = job.get("state")
+    if state == "queued":
+        return f"В очереди: {title}"
+    if state == "processing":
+        return f"Обработка видео: {title}"
+    pct = f"{round(job['percent'])}%" if job.get("percent") is not None else "—"
+    speed = f"{job['speed'] / 1048576:.1f} МБ/с" if job.get("speed") else "—"
+    eta = f"~{_format_time(job['eta'])}" if job.get("eta") else "—"
+    downloaded = _format_size(job.get("downloaded") or 0)
+    total = f"~{_format_size(job['total'])}" if job.get("total") else "неизвестен"
+    return (f"Скачиваю: {title}\nПрогресс: {pct} · Скорость: {speed}\n"
+            f"Осталось: {eta}\nФайл: {downloaded} из {total}")
+
+
+def _message_not_modified(error: BotError) -> bool:
+    return "message is not modified" in str(error).lower()
+
+
 def handle_video(chat_id: str, message_id: int, text: str):
     url = validate_youtube_url(text)
     video_id, title, canonical = get_video_info(url)
@@ -182,7 +219,8 @@ def handle_video(chat_id: str, message_id: int, text: str):
         db.execute("""INSERT INTO videos(video_id,title,state,job_id,chat_id,updated)
             VALUES(?,?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET
             title=excluded.title,state=excluded.state,job_id=excluded.job_id,
-            filename=NULL,chat_id=excluded.chat_id,message_id=NULL,error=NULL,updated=excluded.updated""",
+            filename=NULL,chat_id=excluded.chat_id,message_id=NULL,status_text=NULL,
+            notification=NULL,notified=1,error=NULL,updated=excluded.updated""",
             (video_id, title, "queued", job_id, str(chat_id), time.time()))
         db.commit()
     finally:
@@ -261,10 +299,23 @@ def poll_jobs():
                     db.execute("UPDATE videos SET state=?,updated=? WHERE video_id=?",
                                (state, time.time(), row["video_id"]))
                     db.commit()
+                    text = _status_text(job, row["title"])
+                    if row["message_id"] and text != row["status_text"]:
+                        try:
+                            telegram("editMessageText", {"chat_id": row["chat_id"],
+                                "message_id": row["message_id"], "text": text,
+                                "reply_markup": stop_markup(row["job_id"])})
+                        except BotError as exc:
+                            if not _message_not_modified(exc):
+                                continue
+                        db.execute("UPDATE videos SET status_text=? WHERE video_id=?",
+                                   (text, row["video_id"]))
+                        db.commit()
                     continue
                 if state == "done":
                     filename = job.get("library_name") or job.get("filename") or row["title"]
-                    message = f"Готово, добавил в SMB-библиотеку: {filename}"
+                    size = f" ({_format_size(job['size'])})" if job.get("size") else ""
+                    message = f"Готово{size}, добавил в SMB-библиотеку: {filename}"
                     db.execute("UPDATE videos SET state='done',filename=?,error=NULL,notification=?,notified=0,updated=? WHERE video_id=?",
                                (filename, message, time.time(), row["video_id"]))
                 elif state == "cancelled":
@@ -283,19 +334,19 @@ def poll_jobs():
         if not pending:
             continue
         try:
-            telegram("sendMessage", {"chat_id": pending["chat_id"],
-                                      "text": pending["notification"]})
-        except BotError:
-            print(f"Telegram notification pending for {pending['video_id']}", flush=True)
-            continue
+            if pending["message_id"]:
+                telegram("editMessageText", {"chat_id": pending["chat_id"],
+                    "message_id": pending["message_id"], "text": pending["notification"],
+                    "reply_markup": {"inline_keyboard": []}})
+            else:
+                telegram("sendMessage", {"chat_id": pending["chat_id"],
+                    "text": pending["notification"]})
+        except BotError as exc:
+            if not _message_not_modified(exc):
+                print(f"Telegram notification pending for {pending['video_id']}", flush=True)
+                continue
         db.execute("UPDATE videos SET notified=1 WHERE video_id=?", (pending["video_id"],))
         db.commit()
-        if pending["message_id"]:
-            try:
-                telegram("editMessageReplyMarkup", {"chat_id": pending["chat_id"],
-                    "message_id": pending["message_id"], "reply_markup": {"inline_keyboard": []}})
-            except BotError:
-                pass
     db.close()
 
 

@@ -804,6 +804,7 @@ def _run_download(job_id: str, url: str, quality: str):
                     done = d.get("downloaded_bytes") or 0
                     job["state"] = "downloading"
                     job["percent"] = round(done / total * 100, 1) if total else None
+                    job["downloaded"] = done
                     job["speed"] = d.get("speed")
                     job["eta"] = d.get("eta")
                     job["total"] = total or None
@@ -884,7 +885,7 @@ def download(req: DownloadRequest):
         JOBS[job_id] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": None, "filename": None, "error": None,
-            "cancel": False, "total": None, "size": None,
+            "cancel": False, "downloaded": None, "total": None, "size": None,
         }
     t = threading.Thread(
         target=_run_download, args=(job_id, url, req.quality), daemon=True)
