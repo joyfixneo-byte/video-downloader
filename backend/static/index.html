@@ -187,7 +187,26 @@
   .explorer tr:last-child td { border-bottom:0; }
   .explorer .file-name { overflow-wrap:anywhere; }
   .explorer .file-check { width:42px; }
+  .explorer .file-type { white-space:nowrap; }
   .explorer .file-date, .explorer .file-size { white-space:nowrap; font-variant-numeric:tabular-nums; color:var(--text-2); }
+  @media (max-width:600px) {
+    .explorer-wrap { overflow:visible; border:0; }
+    .explorer { display:block; width:100%; min-width:0; }
+    .explorer thead { display:none; }
+    .explorer tbody { display:block; }
+    .explorer tr { position:relative; display:flex; flex-wrap:wrap; align-items:center;
+      gap:6px 12px; padding:12px 10px; border-bottom:1px solid var(--border); }
+    .explorer tr:last-child { border-bottom:0; }
+    .explorer td { display:inline-flex; align-items:center; padding:0; border:0; }
+    .explorer .file-check { position:absolute; left:10px; top:12px; width:auto; }
+    .explorer .file-name { flex:1 0 100%; box-sizing:border-box; padding-left:36px;
+      min-width:0; font-weight:500; }
+    .explorer .file-type, .explorer .file-size, .explorer .file-date { font-size:13px; }
+    .explorer .file-type::before, .explorer .file-size::before, .explorer .file-date::before {
+      content:attr(data-label) ": "; color:var(--text-2); }
+    .explorer .file-actions { flex:1 0 100%; }
+    .explorer .file-actions .controls { margin-left:36px !important; }
+  }
   .library-groups { min-height:64px; }
   .library-group { margin:14px 0 8px; }
   .library-group-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
@@ -2348,9 +2367,9 @@ function renderLibraryTable(files) {
     const ext = f.name.includes(".") ? f.name.split(".").pop().toUpperCase() : "ФАЙЛ";
     const href = "/api/library/file?name=" + encodeURIComponent(f.name);
     tr.innerHTML = `<td class="file-check"><input type="checkbox" aria-label="Выбрать ${escapeHtml(f.name)}" ${LIBRARY_SELECTED.has(f.name) ? "checked" : ""}></td>
-      <td class="file-name">${escapeHtml(f.name)}</td><td>${escapeHtml(ext)}</td>
-      <td class="file-size">${fmtSize(f.size)}</td><td class="file-date">${fmtDate(f.mtime)}</td>
-      <td><div class="controls" style="margin:0;flex-wrap:nowrap"><button class="ghost small" data-act="play">Смотреть</button><a class="dl small" href="${href}">Скачать</a></div></td>`;
+      <td class="file-name">${escapeHtml(f.name)}</td><td class="file-type" data-label="Тип">${escapeHtml(ext)}</td>
+      <td class="file-size" data-label="Размер">${fmtSize(f.size)}</td><td class="file-date" data-label="Дата">${fmtDate(f.mtime)}</td>
+      <td class="file-actions"><div class="controls" style="margin:0;flex-wrap:nowrap"><button class="ghost small" data-act="play">Смотреть</button><a class="dl small" href="${href}">Скачать</a></div></td>`;
     tr.querySelector("input").addEventListener("change", ev => {
       if (ev.currentTarget.checked) LIBRARY_SELECTED.add(f.name); else LIBRARY_SELECTED.delete(f.name);
       updateLibrarySelection(files);
