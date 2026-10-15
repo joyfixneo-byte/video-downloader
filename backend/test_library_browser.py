@@ -40,7 +40,7 @@ def open_page(page, state):
 
     page.route("**/*", route_handler)
     page.goto(BASE, wait_until="domcontentloaded")
-    page.locator("#actionOpen").wait_for()
+    page.locator("#url").wait_for()
     page.wait_for_function("window.RT_STATE !== 'checking'")
 
 
@@ -49,6 +49,9 @@ def test_playlist_download_starts_over_plain_http():
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         open_page(page, {"files": [], "library": []})
+        assert page.locator("#url").is_visible()
+        assert page.locator("#actionOpen").count() == 0
+        assert page.locator("#gameCard").evaluate("el => el.parentElement.lastElementChild === el")
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.evaluate("""() => {

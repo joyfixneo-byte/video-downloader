@@ -192,15 +192,6 @@
   .library-group { margin:14px 0 8px; }
   .library-group-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .library-group-head button { white-space:normal; text-align:left; }
-  .action-open { position:fixed; right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); z-index:20; }
-  .action-panel { border:0; padding:0; width:min(620px, 100vw); max-width:none; height:100dvh; max-height:none;
-    margin:0 0 0 auto; color:var(--text); background:var(--bg); }
-  .action-panel::backdrop { background:rgba(0,0,0,.5); }
-  .action-panel-inner { height:100%; overflow:auto; padding:20px; padding-bottom:calc(24px + env(safe-area-inset-bottom)); }
-  .action-panel-head { position:sticky; top:-20px; z-index:2; display:flex; justify-content:space-between; align-items:center;
-    gap:12px; padding:12px 0; background:var(--bg); border-bottom:1px solid var(--border); margin-bottom:12px; }
-  @media (min-width:900px) { .action-panel { width:min(560px, 50vw); } }
-
   /* Мини-игра «Тетрис» как экран загрузки */
   #game { display:flex; flex-direction:column; align-items:center; gap:12px; margin:0; }
   .game-head, .game-bar, .game-next { width:min(100%, 300px); display:flex;
@@ -327,15 +318,6 @@
     <button type="button" class="tab-btn" onclick="showTab('torrent', this)">Торренты</button>
     <button type="button" class="tab-btn" onclick="showTab('library', this)">Библиотека</button>
   </div>
-
-  <button type="button" class="ghost action-open gated" id="actionOpen" onclick="openActionPanel()">Ссылка и действия</button>
-  <dialog class="action-panel" id="actionPanel" aria-labelledby="actionPanelTitle">
-    <div class="action-panel-inner">
-      <div class="action-panel-head"><strong id="actionPanelTitle">Ссылка и действия</strong>
-        <button type="button" class="ghost small" onclick="closeActionPanel()">Закрыть</button></div>
-      <div id="actionPanelBody"></div>
-    </div>
-  </dialog>
 
   <div id="tabVideo">
     <!-- Ссылка -->
@@ -478,35 +460,6 @@
     </div>
   </div>
 
-  <!-- Игра «Тетрис» — доступна всегда, не только во время загрузки -->
-  <div class="card" id="gameCard">
-    <div id="game">
-      <div class="game-head">
-        <span>Тетрис</span>
-        <span id="gameScore">Очки: 0 · Линии: 0</span>
-      </div>
-      <div class="game-bar">
-        <span id="gameBest">Рекорд: 0</span>
-        <div class="game-btns">
-          <button class="ghost small" id="pauseBtn" onclick="GAME.playPause()">Играть</button>
-          <button class="ghost small" onclick="GAME.restart()">Заново</button>
-        </div>
-      </div>
-      <div class="game-next">
-        <span>Дальше:</span>
-        <canvas id="next" width="60" height="32"></canvas>
-      </div>
-      <canvas id="board" width="220" height="352"></canvas>
-      <div class="game-controls">
-        <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">←</button>
-        <button class="gbtn" onmousedown="GAME.rotate()" ontouchstart="event.preventDefault();GAME.rotate()">↻</button>
-        <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">↓</button>
-        <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">→</button>
-      </div>
-      <div id="gameOver" class="hidden">Игра окончена</div>
-    </div>
-  </div>
-
   <!-- Задачи -->
   <div class="card hidden gated cond" id="jobsCard">
     <label>Загрузки</label>
@@ -538,6 +491,35 @@
        заполняет applyYtdlp() по данным /api/config. -->
   <div class="muted" id="ytdlpLine"
        style="font-size:12px;text-align:center;margin:18px 0 4px"></div>
+
+  <!-- Игра «Тетрис» — дополнительная функция внизу страницы -->
+  <div class="card" id="gameCard">
+    <div id="game">
+      <div class="game-head">
+        <span>Тетрис</span>
+        <span id="gameScore">Очки: 0 · Линии: 0</span>
+      </div>
+      <div class="game-bar">
+        <span id="gameBest">Рекорд: 0</span>
+        <div class="game-btns">
+          <button class="ghost small" id="pauseBtn" onclick="GAME.playPause()">Играть</button>
+          <button class="ghost small" onclick="GAME.restart()">Заново</button>
+        </div>
+      </div>
+      <div class="game-next">
+        <span>Дальше:</span>
+        <canvas id="next" width="60" height="32"></canvas>
+      </div>
+      <canvas id="board" width="220" height="352"></canvas>
+      <div class="game-controls">
+        <button class="gbtn" onmousedown="GAME.move(-1)" ontouchstart="event.preventDefault();GAME.move(-1)">←</button>
+        <button class="gbtn" onmousedown="GAME.rotate()" ontouchstart="event.preventDefault();GAME.rotate()">↻</button>
+        <button class="gbtn" onmousedown="GAME.soft()" ontouchstart="event.preventDefault();GAME.soft()">↓</button>
+        <button class="gbtn" onmousedown="GAME.move(1)" ontouchstart="event.preventDefault();GAME.move(1)">→</button>
+      </div>
+      <div id="gameOver" class="hidden">Игра окончена</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -569,11 +551,7 @@ const PLAYLIST_TITLES = JSON.parse(localStorage.getItem("playlist_titles") || "{
 const PLAYLIST_FILES = JSON.parse(localStorage.getItem("playlist_files") || "{}");
 const ACTIVE_JOBS = new Map();
 
-function openActionPanel() { document.getElementById("actionPanel").showModal(); }
-function closeActionPanel() { document.getElementById("actionPanel").close(); }
-function placeActionForms() {
-  const body = document.getElementById("actionPanelBody");
-  ["tabVideo", "tabTorrent"].forEach(id => body.appendChild(document.getElementById(id)));
+function initLibraryControls() {
   document.getElementById("librarySort").value = LIBRARY_SORT;
   document.getElementById("libraryDirection").textContent = LIBRARY_DESC ? "Сначала новые" : "Сначала старые";
 }
@@ -2470,7 +2448,7 @@ function escapeHtml(s) {
 }
 function setMarkupIfChanged(el, html) { if (el.innerHTML !== html) el.innerHTML = html; }
 
-placeActionForms();
+initLibraryControls();
 init();
 </script>
 </body>
