@@ -180,28 +180,33 @@
   .job .name { font-size:16px; line-height:22px; font-weight:600;
          margin-bottom:4px; word-break:break-word; }
   .library-tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 12px; }
+  #librarySelectionBar .library-tools { margin:0; }
+  #librarySelectionBar .hint { margin-top:0; }
+  #tabLibrary .card { padding:12px; }
+  .library-sort.active { background:var(--surface-2); border-color:var(--text-2); }
   .explorer-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:var(--r-ctl); }
-  .explorer { width:100%; min-width:560px; border-collapse:collapse; font-size:14px; }
-  .explorer th, .explorer td { padding:9px 10px; border-bottom:1px solid var(--border); text-align:left; }
+  .explorer { width:100%; min-width:560px; border-collapse:collapse; font-size:12px; line-height:18px; }
+  .explorer th, .explorer td { padding:5px 8px; border-bottom:1px solid var(--border); text-align:left; }
   .explorer th { color:var(--text-2); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
   .explorer tr:last-child td { border-bottom:0; }
   .explorer .file-name { overflow-wrap:anywhere; }
   .explorer .file-check { width:42px; }
   .explorer .file-type { white-space:nowrap; }
   .explorer .file-date, .explorer .file-size { white-space:nowrap; font-variant-numeric:tabular-nums; color:var(--text-2); }
+  .library-footer { justify-content:flex-end; margin:8px 0 0; }
   @media (max-width:600px) {
     .explorer-wrap { overflow:visible; border:0; }
     .explorer { display:block; width:100%; min-width:0; }
     .explorer thead { display:none; }
     .explorer tbody { display:block; }
     .explorer tr { position:relative; display:flex; flex-wrap:wrap; align-items:center;
-      gap:6px 12px; padding:12px 10px; border-bottom:1px solid var(--border); }
+      gap:8px 12px; padding:8px 10px; border-bottom:1px solid var(--border); }
     .explorer tr:last-child { border-bottom:0; }
     .explorer td { display:inline-flex; align-items:center; padding:0; border:0; }
-    .explorer .file-check { position:absolute; left:10px; top:12px; width:auto; }
+    .explorer .file-check { position:absolute; left:10px; top:8px; width:auto; }
     .explorer .file-name { flex:1 0 100%; box-sizing:border-box; padding-left:36px;
       min-width:0; font-weight:500; }
-    .explorer .file-type, .explorer .file-size, .explorer .file-date { font-size:13px; }
+    .explorer .file-type, .explorer .file-size, .explorer .file-date { font-size:12px; line-height:18px; }
     .explorer .file-type::before, .explorer .file-size::before, .explorer .file-date::before {
       content:attr(data-label) ": "; color:var(--text-2); }
     .explorer .file-actions { flex:1 0 100%; }
@@ -467,13 +472,21 @@
       <div class="selbar" id="librarySelectionBar">
         <label class="check-row" style="min-height:36px"><input type="checkbox" id="librarySelectAll" onchange="selectAllLibrary(this.checked)">Выбрать все</label>
         <span class="hint" id="librarySelectedCount">Выбрано: 0</span>
-        <button class="small" id="libraryDeleteSelected" onclick="deleteSelectedLibraryFiles()" disabled>Удалить выбранные</button>
+        <div class="library-tools" aria-label="Сортировка файлов">
+          <button type="button" class="ghost small library-sort" data-library-sort="name" onclick="setLibrarySort('name')">Имя</button>
+          <button type="button" class="ghost small library-sort" data-library-sort="date" onclick="setLibrarySort('date')">Дата</button>
+          <button type="button" class="ghost small library-sort" data-library-sort="size" onclick="setLibrarySort('size')">Размер</button>
+          <button type="button" class="ghost small" id="libraryFilesDirection" onclick="toggleLibraryDirection()">Сначала новые</button>
+        </div>
       </div>
       <div class="explorer-wrap" style="margin-top:12px">
         <table class="explorer">
           <thead><tr><th class="file-check"></th><th>Имя</th><th>Тип</th><th>Размер</th><th>Дата</th><th>Действия</th></tr></thead>
           <tbody id="libraryTable"></tbody>
         </table>
+      </div>
+      <div class="selbar library-footer">
+        <button class="small" id="libraryDeleteSelected" onclick="deleteSelectedLibraryFiles()" disabled>Удалить выбранные</button>
       </div>
       <div class="muted" id="libraryEmpty" style="font-size:13px;margin-top:12px"></div>
     </div>
@@ -571,13 +584,28 @@ const PLAYLIST_FILES = JSON.parse(localStorage.getItem("playlist_files") || "{}"
 const ACTIVE_JOBS = new Map();
 
 function initLibraryControls() {
-  document.getElementById("librarySort").value = LIBRARY_SORT;
-  document.getElementById("libraryDirection").textContent = LIBRARY_DESC ? "Сначала новые" : "Сначала старые";
+  syncLibrarySortControls();
 }
-function setLibrarySort(value) { LIBRARY_SORT = value; localStorage.setItem("library_sort", value); loadFiles(); }
+function syncLibrarySortControls() {
+  const fileSort = ["name", "size"].includes(LIBRARY_SORT) ? LIBRARY_SORT : "date";
+  document.getElementById("librarySort").value = LIBRARY_SORT;
+  document.querySelectorAll("[data-library-sort]").forEach(button => {
+    button.classList.toggle("active", button.dataset.librarySort === fileSort);
+    button.setAttribute("aria-pressed", String(button.dataset.librarySort === fileSort));
+  });
+  const direction = fileSort === "date"
+    ? (LIBRARY_DESC ? "Сначала новые" : "Сначала старые")
+    : (LIBRARY_DESC ? "По убыванию" : "По возрастанию");
+  document.getElementById("libraryDirection").textContent = direction;
+  document.getElementById("libraryFilesDirection").textContent = direction;
+}
+function setLibrarySort(value) {
+  LIBRARY_SORT = value; localStorage.setItem("library_sort", value);
+  syncLibrarySortControls(); loadFiles();
+}
 function toggleLibraryDirection() {
   LIBRARY_DESC = !LIBRARY_DESC; localStorage.setItem("library_desc", String(LIBRARY_DESC));
-  document.getElementById("libraryDirection").textContent = LIBRARY_DESC ? "Сначала новые" : "Сначала старые";
+  syncLibrarySortControls();
   loadFiles();
 }
 function toggleCompletedGroups() {
@@ -2362,26 +2390,33 @@ function renderLibraryTable(files) {
   document.getElementById("libraryCount").textContent = `${files.length} файлов`;
   const liveNames = new Set(files.map(f => f.name));
   for (const name of LIBRARY_SELECTED) if (!liveNames.has(name)) LIBRARY_SELECTED.delete(name);
-  files.slice().sort((a, b) => a.name.localeCompare(b.name, "ru", { sensitivity: "base" })).forEach(f => {
+  const sort = ["name", "size"].includes(LIBRARY_SORT) ? LIBRARY_SORT : "date";
+  files.slice().sort((a, b) => {
+    if (sort === "name") return (LIBRARY_DESC ? -1 : 1) * a.name.localeCompare(b.name, "ru", { sensitivity: "base" });
+    const key = sort === "size" ? "size" : "mtime";
+    const left = Number(a[key] || 0), right = Number(b[key] || 0);
+    return compareLibrary(left, right);
+  }).forEach(f => {
     const tr = document.createElement("tr");
     const ext = f.name.includes(".") ? f.name.split(".").pop().toUpperCase() : "ФАЙЛ";
     const href = "/api/library/file?name=" + encodeURIComponent(f.name);
     tr.innerHTML = `<td class="file-check"><input type="checkbox" aria-label="Выбрать ${escapeHtml(f.name)}" ${LIBRARY_SELECTED.has(f.name) ? "checked" : ""}></td>
       <td class="file-name">${escapeHtml(f.name)}</td><td class="file-type" data-label="Тип">${escapeHtml(ext)}</td>
       <td class="file-size" data-label="Размер">${fmtSize(f.size)}</td><td class="file-date" data-label="Дата">${fmtDate(f.mtime)}</td>
-      <td class="file-actions"><div class="controls" style="margin:0;flex-wrap:nowrap"><button class="ghost small" data-act="play">Смотреть</button><a class="dl small" href="${href}">Скачать</a></div></td>`;
+      <td class="file-actions"><div class="controls" style="margin:0;flex-wrap:nowrap"><button class="ghost small" data-act="play">Смотреть</button><a class="dl small" href="${href}">Скачать</a><button class="ghost small" data-act="delete">Удалить</button></div></td>`;
     tr.querySelector("input").addEventListener("change", ev => {
       if (ev.currentTarget.checked) LIBRARY_SELECTED.add(f.name); else LIBRARY_SELECTED.delete(f.name);
       updateLibrarySelection(files);
     });
     tr.querySelector("[data-act=play]").addEventListener("click", () => openPlayer(libPlayUrl(f.name), f.name));
     tr.querySelector(".dl").addEventListener("click", ev => { ev.preventDefault(); saveFile(href, f.name, ev.currentTarget); });
+    tr.querySelector("[data-act=delete]").addEventListener("click", ev => deleteLibraryFile(f.name, ev.currentTarget));
     body.appendChild(tr);
   });
   updateLibrarySelection(files);
 }
 
-function updateLibrarySelection(files = [...document.querySelectorAll("#libraryTable tbody tr")].map(tr => ({ name: tr.querySelector(".file-name")?.textContent }))) {
+function updateLibrarySelection(files = [...document.querySelectorAll("#libraryTable tr")].map(tr => ({ name: tr.querySelector(".file-name")?.textContent }))) {
   const count = LIBRARY_SELECTED.size;
   document.getElementById("librarySelectedCount").textContent = `Выбрано: ${count}`;
   document.getElementById("libraryDeleteSelected").disabled = count === 0;
@@ -2392,12 +2427,25 @@ function updateLibrarySelection(files = [...document.querySelectorAll("#libraryT
 }
 
 function selectAllLibrary(checked) {
-  document.querySelectorAll("#libraryTable tbody tr").forEach(tr => {
+  document.querySelectorAll("#libraryTable tr").forEach(tr => {
     const name = tr.querySelector(".file-name").textContent;
     tr.querySelector("input").checked = checked;
     if (checked) LIBRARY_SELECTED.add(name); else LIBRARY_SELECTED.delete(name);
   });
   updateLibrarySelection();
+}
+
+async function deleteLibraryFile(name, button) {
+  if (!confirm(`Удалить файл «${name}» из библиотеки навсегда?`)) return;
+  button.disabled = true;
+  try {
+    await api("/api/library/delete", { method: "POST", body: JSON.stringify({ name }) });
+    LIBRARY_SELECTED.delete(name);
+    await loadFiles();
+  } catch (e) {
+    button.disabled = false;
+    alert("Не удалось удалить файл: " + e.message);
+  }
 }
 
 async function deleteSelectedLibraryFiles() {
