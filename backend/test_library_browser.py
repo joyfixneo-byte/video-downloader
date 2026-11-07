@@ -22,6 +22,23 @@ def open_page(page, state):
             route.fulfill(json={"enabled": True, "files": state["library"]})
         elif path == "/api/jobs":
             route.fulfill(json={"jobs": []})
+        elif path == "/api/torrents":
+            route.fulfill(json={"torrents": state.get("torrents", [])})
+        elif path == "/api/torrent/manage123/files":
+            route.fulfill(json={"files": [state["torrent_file"]]})
+        elif path in ("/api/torrent/manage123/pause-files", "/api/torrent/manage123/add-files"):
+            data = request.post_data_json
+            state["calls"].append((path, data))
+            paused = path.endswith("pause-files")
+            state["torrent_file"].update(paused=paused, selected=not paused,
+                                         state="paused" if paused else "downloading")
+            route.fulfill(json={"ok": True})
+        elif path in ("/api/torrent/manage123/delete", "/api/torrent/second123/delete"):
+            data = request.post_data_json
+            state["calls"].append((path, data))
+            job_id = path.split("/")[3]
+            state["torrents"][:] = [t for t in state["torrents"] if t["job_id"] != job_id]
+            route.fulfill(json={"ok": True, "warnings": []})
         elif path == "/api/download":
             route.fulfill(json={"job_id": "download123"})
         elif path == "/api/torrent/resume123/resume":
@@ -67,7 +84,48 @@ def test_playlist_download_starts_over_plain_http():
         browser.close()
 
 
-def test_resumed_job_survives_library_refresh_and_torrent_files_share_group():
+def test_torrent_tab_file_controls_and_delete_options():
+    state = {
+        "files": [], "library": [], "calls": [],
+        "torrents": [
+            {"job_id": "manage123", "title": "Active torrent", "state": "downloading", "percent": 25, "speed": 1048576},
+            {"job_id": "second123", "title": "Finished torrent", "state": "done", "percent": 100},
+        ],
+        "torrent_file": {"index": 1, "path": "Show/E01.mkv", "size": 100,
+                         "downloaded": 25, "percent": 25, "selected": True,
+                         "done": False, "state": "downloading", "paused": False},
+    }
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.on("dialog", lambda dialog: dialog.accept())
+        open_page(page, state)
+        page.get_by_role("button", name="Торренты", exact=True).click()
+        active = page.locator('#torrentJobs .job[data-job-id="manage123"]')
+        finished = page.locator('#torrentJobs .job[data-job-id="second123"]')
+        active.get_by_text("Скачивание · 25% · 1.0 МБ/с").wait_for()
+        finished.get_by_text("Готово · 100%").wait_for()
+        active.get_by_text("Файлы в раздаче").click()
+        active.locator('[data-act="pause"]').click()
+        active.get_by_text("На паузе 25%", exact=True).wait_for()
+        active.locator('[data-act="add"]').get_by_text("Продолжить").click()
+        active.get_by_text("качается… 25%", exact=True).wait_for()
+        active.locator('[data-torrent-act="delete"]').click()
+        active.get_by_role("button", name="Удалить раздачу, сохранить файлы").click()
+        active.wait_for(state="detached")
+        finished.locator('[data-torrent-act="delete"]').click()
+        finished.get_by_role("button", name="Удалить раздачу и файлы").click()
+        finished.wait_for(state="detached")
+        assert state["calls"] == [
+            ("/api/torrent/manage123/pause-files", {"files": [1]}),
+            ("/api/torrent/manage123/add-files", {"files": [1]}),
+            ("/api/torrent/manage123/delete", {"delete_files": False}),
+            ("/api/torrent/second123/delete", {"delete_files": True}),
+        ]
+        browser.close()
+
+
+def test_resumed_job_survives_library_refresh_and_library_files_remain_visible():
     state = {
         "files": [{"job_id": "resume123", "filename": None, "title": "Show", "torrent": True,
                    "interrupted": True, "progress": {"percent": 20, "done_files": 0, "total_files": 2},
@@ -91,12 +149,8 @@ def test_resumed_job_survives_library_refresh_and_torrent_files_share_group():
         page.wait_for_function("ACTIVE_JOBS.has('resume123')")
         assert page.locator('#serverList .job[data-job-id="resume123"]').count() == 1
 
-        # The parent task is explicit in the API response, so equal file names
-        # under different jobs stay separate while a single torrent stays grouped.
-        groups = page.locator("#serverList .library-group")
-        page.wait_for_function("document.querySelectorAll('#serverList .library-group').length >= 2")
-        assert page.locator('#serverList .library-group[data-group-id="resume123"] .job').count() == 3
-        assert page.locator('#serverList .library-group[data-group-id="resume123"] [data-sort-name="E01.mkv"]').count() == 1
-        assert page.locator('#serverList .library-group[data-group-id="resume123"] [data-sort-name="E02.mkv"]').count() == 1
-        assert page.locator('#serverList .library-group[data-group-id="other123"] .job').count() == 1
+        # SMB files are displayed in the separate library table.
+        page.wait_for_function("document.querySelectorAll('#libraryTable tr').length === 3")
+        for name in ("E01.mkv", "E02.mkv", "Other.mkv"):
+            assert page.locator("#libraryTable tr").filter(has_text=name).count() == 1
         browser.close()

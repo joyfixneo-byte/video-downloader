@@ -439,6 +439,12 @@
       </div>
     </div>
 
+    <div class="card gated" id="torrentJobsCard">
+      <label>Загрузки торрентов</label>
+      <div class="hint" id="torrentJobsHint">Загрузка…</div>
+      <div class="jobs" id="torrentJobs"></div>
+    </div>
+
     <!-- Rutracker: второй источник. Виден только на инстансе, у которого есть
          доступ к сайту (egress через VPN); иначе вместо него плашка ниже.
          Что именно показать, решает applyRutracker() по данным /api/config. -->
@@ -650,6 +656,7 @@ function showTab(name, btn) {
   document.getElementById("serverCard").classList.toggle("hidden", name !== "video");
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
+  if (name === "torrent" && !document.getElementById("torrentJobsCard").classList.contains("hidden")) loadTorrentJobs();
 }
 
 function lockApp() {
@@ -661,6 +668,7 @@ function unlockApp() {
   document.getElementById("pwCard").classList.add("hidden");
   applyRutracker();  // rutracker-блок — .cond, показываем его сами, по доступу
   loadFiles();
+  loadTorrentJobs();
   resumeJobs();     // вернуть карточки задач, идущих в фоне (после F5)
 }
 
@@ -1106,7 +1114,81 @@ function cancelTorrentFiles() {
   TPICK = null;
 }
 
-function startTorrentJob(jobId, title) { startJobCard(jobId, title, "torrent"); }
+function startTorrentJob(jobId, title) { startJobCard(jobId, title, "torrent"); loadTorrentJobs(); }
+
+let torrentJobsTimer, torrentJobsLoading = false;
+async function loadTorrentJobs() {
+  clearTimeout(torrentJobsTimer);
+  if (torrentJobsLoading || document.getElementById("torrentJobsCard").classList.contains("hidden")) return;
+  torrentJobsLoading = true;
+  const list = document.getElementById("torrentJobs"), hint = document.getElementById("torrentJobsHint");
+  try {
+    const { torrents } = await api("/api/torrents");
+    const ids = new Set(torrents.map(t => t.job_id));
+    [...list.children].forEach(el => { if (!ids.has(el.dataset.jobId)) el.remove(); });
+    hint.textContent = torrents.length ? "" : "На этом сервере пока нет торрентов.";
+    for (const t of torrents) {
+      let el = [...list.children].find(row => row.dataset.jobId === t.job_id);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "job";
+        el.dataset.jobId = t.job_id;
+        el.dataset.torrentList = "true";
+        el.innerHTML = '<div class="name"></div><div class="meta"></div><div class="controls"></div>';
+        list.appendChild(el);
+        addTorrentFilesToggle(el, t.job_id, false, true);
+      }
+      el.dataset.jobState = t.state;
+      el.querySelector(".name").textContent = t.title || "Торрент";
+      const states = { queued: "В очереди", downloading: "Скачивание", processing: "Обработка", paused: "На паузе", interrupted: "Прервано", done: "Готово", error: "Ошибка", cancelled: "Остановлено" };
+      const pct = t.percent != null ? ` · ${Math.round(t.percent)}%` : "";
+      const speed = t.state === "downloading" && t.speed ? ` · ${(t.speed / 1048576).toFixed(1)} МБ/с` : "";
+      const eta = t.state === "downloading" && t.eta ? ` · осталось ~${fmtTime(t.eta)}` : "";
+      el.querySelector(".meta").textContent = (states[t.state] || t.state || "Неизвестно") + pct + speed + eta + (t.error ? " · " + t.error : "");
+      if (el.dataset.busy === "true") continue;
+      const active = ["queued", "downloading", "processing"].includes(t.state);
+      const controls = el.querySelector(".controls");
+      const action = active ? '<button class="ghost small" data-torrent-act="pause">Пауза</button>'
+        : ["paused", "interrupted", "error", "cancelled"].includes(t.state) ? '<button class="ghost small" data-torrent-act="resume">Продолжить</button>' : "";
+      const deletion = el.dataset.deleting === "true"
+        ? '<button class="ghost small" data-torrent-act="delete-keep">Удалить раздачу, сохранить файлы</button><button class="ghost small" data-torrent-act="delete-files">Удалить раздачу и файлы</button><button class="ghost small" data-torrent-act="delete-cancel">Отмена</button>'
+        : '<button class="ghost small" data-torrent-act="delete">Удалить</button>';
+      setMarkupIfChanged(controls, action + deletion);
+    }
+  } catch (e) {
+    hint.textContent = "Не удалось получить торренты: " + e.message;
+  } finally {
+    torrentJobsLoading = false;
+    torrentJobsTimer = setTimeout(loadTorrentJobs, 2000);
+  }
+}
+
+document.getElementById("torrentJobs").addEventListener("click", async ev => {
+  const btn = ev.target.closest("button[data-torrent-act]");
+  if (!btn) return;
+  const el = btn.closest(".job"), id = el.dataset.jobId, action = btn.dataset.torrentAct;
+  if (action === "delete" || action === "delete-cancel") {
+    el.dataset.deleting = action === "delete" ? "true" : "false";
+    loadTorrentJobs();
+    return;
+  }
+  const removing = action.startsWith("delete-");
+  if (removing && !confirm(action === "delete-files" ? "Удалить раздачу и её файлы, включая файлы в библиотеке?" : "Удалить раздачу, сохранив её файлы?")) return;
+  el.dataset.busy = "true";
+  el.querySelectorAll(".controls button").forEach(button => { button.disabled = true; });
+  try {
+    const result = await api("/api/torrent/" + id + "/" + (removing ? "delete" : action), {
+      method: "POST", ...(removing ? { body: JSON.stringify({ delete_files: action === "delete-files" }) } : {}) });
+    if (result.warnings && result.warnings.length) alert(result.warnings.join("\n"));
+    if (removing) loadFiles();
+    el.dataset.busy = "false";
+    await loadTorrentJobs();
+  } catch (e) {
+    el.dataset.busy = "false";
+    el.querySelectorAll(".controls button").forEach(button => { button.disabled = false; });
+    alert("Не удалось: " + e.message);
+  }
+});
 
 // Создаёт карточку в списке загрузок и запускает poll(). Используется и при
 // старте, и при восстановлении карточек после перезагрузки страницы (resumeJobs).
@@ -1927,7 +2009,7 @@ function audioLabel(tr, i) {
 // файла (готов / качается / не выбран) и обновляется каждые 2с, пока раздача
 // активна и табличка раскрыта — так видно, что уже можно скачать, не дожидаясь
 // остальных файлов. Список запрашиваем лениво, при первом раскрытии <details>.
-function addTorrentFilesToggle(container, jobId, interrupted = false) {
+function addTorrentFilesToggle(container, jobId, interrupted = false, collapsed = false) {
   if (container.querySelector("details.tfiles")) return;   // уже добавлена
   const det = document.createElement("details");
   det.className = "tfiles";
@@ -1937,7 +2019,7 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   // Состояние таблички живёт в замыкании — переживает автообновление раз в 2с.
   // По умолчанию порядок как в раздаче (его отдаёт сервер) и без пропущенных
   // файлов: их бывает много, и они мешают видеть, что качается.
-  let files = [];
+  let files = [], refreshTimer;
   let sort = { field: "index", dir: 1 };
   let showSkipped = false;
   // Файлы, которые только что отправили в докачку: сервер подхватит их через
@@ -1969,8 +2051,8 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
     body.className = "tfiles-body";
     // Файл в библиотеке (и удалённый из неё) формально «не выбран», но
     // прятать его нельзя — это как раз то, чем управляет пользователь.
-    const skipped = files.filter(f => f.state === "skipped").length;
-    const shown = (showSkipped ? files : files.filter(f => f.state !== "skipped"))
+    const skipped = files.filter(f => f.state === "skipped" && !f.paused).length;
+    const shown = (showSkipped ? files : files.filter(f => f.state !== "skipped" || f.paused))
       .slice().sort((a, b) => CMP[sort.field](a, b) * sort.dir);
     const head = `<div class="tfile-row tfile-head">
         <span class="tfile-name" data-sort="name">Имя${arrow("name")}</span>
@@ -2011,6 +2093,9 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
               + `<button class="ghost small" onclick="openPlayer(`
               + `${attr(playUrl(jobId, f.path))}, ${attr(f.path)})">Смотреть</button>`
               + `<button class="ghost small" data-act="del" data-path="${escapeHtml(f.path)}">Удалить</button>`;
+          } else if (f.paused) {
+            status = `<span class="muted">На паузе ${f.percent ?? 0}%</span>`;
+            actions = `<button class="ghost small" data-act="add" data-index="${f.index}">Продолжить</button>`;
           } else if (f.selected === false) {
             status = '<span class="muted">не выбран</span>';
             actions = `<button class="ghost small" data-act="add" data-index="${f.index}">Докачать</button>`;
@@ -2019,13 +2104,17 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
             // interrupted — раздача сейчас не качается (упавший сервис), а не
             // просто пока не дошла очередь: не показываем «качается», это
             // вводит в заблуждение, будто прогресс сейчас идёт.
-            status = interrupted
+            const stopped = interrupted || ["paused", "interrupted", "error", "cancelled"].includes(container.dataset.jobState);
+            status = stopped
               ? `<span class="muted">Прервано ${pct}%</span>`
               : `<span class="muted">качается… ${pct}%</span>`;
-            actions = "";
-            if (!interrupted) {
+            actions = `<button class="ghost small" data-act="pause" data-index="${f.index}">Пауза</button>`;
+            if (!stopped) {
               bar = `<div class="tfile-bar"><div class="tfile-bar-fill" style="width:${pct}%"></div></div>`;
             }
+          }
+          if (f.index == null && !f.done && f.state !== "library") {
+            actions = '<span class="muted">Управление недоступно: нет метаданных</span>';
           }
           return `<div class="tfile-row">
             <span class="tfile-name">${escapeHtml(f.path)}</span>
@@ -2040,21 +2129,22 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   };
 
   const refresh = async () => {
+    clearTimeout(refreshTimer);
     try {
       files = (await api("/api/torrent/" + jobId + "/files")).files;
       files.forEach(f => {
-        if (f.state !== "skipped" && f.state !== "gone") pending.delete(f.index);
+        if (f.state !== "skipped" && f.state !== "gone" && !f.paused) pending.delete(f.index);
       });
       render();
     } catch (e) {
       det.querySelector(".tfiles-body").innerHTML =
-        `<span class="err">${e.message}</span>`;
+        `<span class="err">${escapeHtml(e.message)}</span>`;
     }
     const active = ["queued", "downloading", "processing"].includes(container.dataset.jobState);
-    if (det.open && active) setTimeout(refresh, 2000);
+    if (det.open && (active || container.dataset.torrentList) && det.isConnected) refreshTimer = setTimeout(refresh, 2000);
   };
 
-  det.open = true;   // раскрыта сразу — видно прогресс по каждому файлу
+  det.open = !collapsed;
   det.addEventListener("toggle", () => { if (det.open) refresh(); });
 
   // Делегируем клики по кнопкам строк (докачать/удалить) — так не нужно
@@ -2082,6 +2172,10 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
         if (!confirm("Удалить этот файл?")) { btn.disabled = false; return; }
         await api("/api/torrent/" + jobId + "/delete-file", {
           method: "POST", body: JSON.stringify({ path: btn.dataset.path }) });
+      } else if (btn.dataset.act === "pause") {
+        await api("/api/torrent/" + jobId + "/pause-files", {
+          method: "POST", body: JSON.stringify({ files: [+btn.dataset.index] }) });
+        if (container.dataset.torrentList) loadTorrentJobs();
       } else if (btn.dataset.act === "add") {
         await api("/api/torrent/" + jobId + "/add-files", {
           method: "POST", body: JSON.stringify({ files: [+btn.dataset.index] }) });
@@ -2089,7 +2183,9 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
         // Раздача уже качается — файл добавлен на лету, карточку опрашивает
         // уже запущенный poll; второй цикл опроса тут только дублировал бы
         // запросы.
-        if (!["queued", "downloading", "processing"].includes(container.dataset.jobState)) {
+        if (container.dataset.torrentList) {
+          loadTorrentJobs();
+        } else if (!["queued", "downloading", "processing"].includes(container.dataset.jobState)) {
           container.dataset.jobState = "queued";
           container.dataset.jobId = jobId;
           ACTIVE_JOBS.set(jobId, container);
@@ -2104,7 +2200,7 @@ function addTorrentFilesToggle(container, jobId, interrupted = false) {
   });
 
   container.appendChild(det);
-  refresh();   // не ждём клика — список файлов виден сразу
+  if (!collapsed) refresh();
 }
 
 async function poll(jobId, el) {

@@ -112,7 +112,7 @@ def _cleanup_loop():
                     # автоматически не трогаем. Если библиотеки нет — постоянного
                     # хранилища тоже нет, поэтому чистим их по общему retention,
                     # чтобы диск VM не забивался.
-                    if (d / ".torrent_job").exists() and SHARE_PATH is not None:
+                    if (d / ".preserved").exists() or ((d / ".torrent_job").exists() and SHARE_PATH is not None):
                         continue
                     files = [p for p in d.iterdir() if p.is_file()]
                     newest = (max(p.stat().st_mtime for p in files)
@@ -228,7 +228,7 @@ def _torrent_expected_sizes(job_dir: Path) -> dict:
 # список на весь модуль — иначе очередной маркер (как непустой .published)
 # сойдёт за «готовый файл раздачи» там, где его забыли перечислить, и станет
 # результатом задачи.
-SERVICE_FILES = {".torrent_job", ".selected", ".auto_rest", ".published"}
+SERVICE_FILES = {".torrent_job", ".selected", ".auto_rest", ".published", ".paused", ".paused_files", ".preserved"}
 
 
 def _published_map(job_dir: Path) -> dict:
@@ -916,6 +916,36 @@ def list_jobs():
                             "title": job.get("title"), "type": job.get("type"),
                             "percent": job.get("percent")})
     return {"jobs": out}
+
+
+@app.get("/api/torrents", dependencies=[Depends(check_password)])
+def list_torrents():
+    with JOBS_LOCK:
+        jobs = {jid: dict(job) for jid, job in JOBS.items()
+                if job.get("type") == "torrent" and job.get("state") not in ("deleted", "expired")}
+    directories = {d.name: d for d in _iter_job_dirs() if (d / ".torrent_job").is_file()}
+    torrents = []
+    for jid in jobs.keys() | directories.keys():
+        job = jobs.get(jid, {})
+        directory = directories.get(jid)
+        state, percent = job.get("state"), job.get("percent")
+        title = job.get("title")
+        if directory:
+            if not title and (directory / ".meta.torrent").is_file():
+                title = _torrent_root_name(directory / ".meta.torrent")
+            if not state:
+                try:
+                    rows = _torrent_status_files(directory)
+                    selected = [f for f in rows if f.get("selected") or f.get("paused") or f.get("state") == "library"]
+                    total = sum(f.get("size") or 0 for f in selected)
+                    done = sum((f.get("size") or 0) if f.get("done") else (f.get("downloaded") or 0) for f in selected)
+                    percent = min(100, int(done * 100 / total)) if total else None
+                    state = "paused" if (directory / ".paused").exists() or any(f.get("paused") for f in rows) else ("done" if selected and all(f.get("done") for f in selected) else "interrupted")
+                except (OSError, ValueError):
+                    state = "interrupted"
+        torrents.append({"job_id": jid, "title": title or "Торрент", "state": state or "interrupted",
+                         "percent": percent, "speed": job.get("speed"), "eta": job.get("eta"), "error": job.get("error")})
+    return {"torrents": torrents}
 
 
 @app.post("/api/cancel/{job_id}", dependencies=[Depends(check_password)])
@@ -1674,15 +1704,23 @@ def _maybe_continue_unselected(job_id: str, job_dir: Path, meta_target: Path):
         return
     # Уехавшее в библиотеку (файлов на сервере нет, но они скачаны) —
     # не «оставшееся»: иначе авто-докачка качает их по второму разу.
-    remaining = all_indices - selected - _published_indices(job_dir)
+    remaining = all_indices - selected - _published_indices(job_dir) - _paused_indices(job_dir)
     if not remaining:
         return
     if _count_active(JOBS, JOBS_LOCK,
                      ("queued", "downloading", "processing")) >= JOB_CEILING:
         return
-    select = sorted(selected | remaining)
-    (job_dir / ".selected").write_text(",".join(str(i) for i in select))
     with JOBS_LOCK:
+        if (job_dir / ".paused").exists() or JOBS[job_id].get("state") != "done" or JOBS[job_id].get("deleting"):
+            return
+        selected = _selected_indices(job_dir)
+        if selected is None:
+            return
+        remaining = all_indices - selected - _published_indices(job_dir) - _paused_indices(job_dir)
+        if not remaining:
+            return
+        select = sorted(selected | remaining)
+        _write_indices(job_dir / ".selected", set(select))
         JOBS[job_id].update(state="queued", percent=None, speed=None,
                             eta=None, filename=None, error=None, cancel=False)
     _run_torrent(job_id, str(meta_target), select=select)
@@ -1705,12 +1743,16 @@ def _finish_pause(job_id: str, source: str):
         if job is None:
             return None
         add = job.pop("add_files", None)
-        if add:
+        if job.get("deleting"):
+            add = None
+        if add is not None:
+            _write_indices(_job_dir(job_id) / ".selected", add)
+        if add is not None and add and not (_job_dir(job_id) / ".paused").exists():
             job.update(state="queued", percent=None, speed=None, eta=None,
                        filename=None, error=None, pause=False, cancel=False)
         else:
             job.update(state="paused", speed=None, eta=None, pause=False)
-    if add:
+    if add is not None and add and not (_job_dir(job_id) / ".paused").exists():
         return _run_torrent(job_id, source, sorted(add))
     return None
 
@@ -1827,11 +1869,15 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
             cancelled = JOBS.get(job_id, {}).get("cancel")
             paused = JOBS.get(job_id, {}).get("pause")
         if cancelled:
-            proc.terminate()
+            if proc:
+                proc.terminate()
             try:
-                proc.wait(timeout=10)
+                if proc:
+                    proc.wait(timeout=10)
             except Exception:
-                proc.kill()
+                if proc:
+                    proc.kill()
+                    proc.wait()
             shutil.rmtree(job_dir, ignore_errors=True)
             with JOBS_LOCK:
                 JOBS[job_id].update(state="cancelled", filename=None)
@@ -1840,11 +1886,15 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
             # В отличие от отмены — файлы на диске не трогаем, aria2
             # корректно допишет свой .aria2-контрольный файл при terminate()
             # (SIGTERM), поэтому «Продолжить» (/resume) докачает с этого места.
-            proc.terminate()
+            if proc:
+                proc.terminate()
             try:
-                proc.wait(timeout=10)
+                if proc:
+                    proc.wait(timeout=10)
             except Exception:
-                proc.kill()
+                if proc:
+                    proc.kill()
+                    proc.wait()
             return _finish_pause(job_id, source)
 
         if proc:
@@ -2007,6 +2057,17 @@ def _selected_indices(job_dir: Path):
     return {int(x) for x in f.read_text().split(",") if x.strip()}
 
 
+def _paused_indices(job_dir: Path) -> set:
+    path = job_dir / ".paused_files"
+    return {int(x) for x in path.read_text().split(",") if x.strip()} if path.is_file() else set()
+
+
+def _write_indices(path: Path, indices: set):
+    pending = path.with_name(path.name + ".part")
+    pending.write_text(",".join(str(i) for i in sorted(indices)))
+    pending.replace(path)
+
+
 def _natkey(s: str):
     """Ключ «человеческой» сортировки имён: S01E2 раньше S01E10 (цифры
     сравниваем как числа, а не как строки)."""
@@ -2073,6 +2134,7 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
                 for rel, size in on_disk.items()]
         return sorted(rows, key=lambda x: _natkey(x["path"]))
     selected = _selected_indices(job_dir)
+    paused_files = _paused_indices(job_dir)
     published = _published_map(job_dir)
     items = []
     for f in expected:
@@ -2085,6 +2147,9 @@ def _torrent_status_files(job_dir: Path) -> list[dict]:
         done = downloaded is not None and downloaded >= f["size"]
         row = _row(f["path"], f["size"], downloaded or 0, done,
                    index=f["index"], selected=is_selected)
+        row["paused"] = f["index"] in paused_files
+        if row["paused"] and not done:
+            row["state"] = "paused"
         lib = published.get(f["path"]) or published.get(Path(f["path"]).name)
         if lib and not done and not is_selected:
             # Файла на сервере нет, потому что он уехал в витрину. Сверяемся
@@ -2241,6 +2306,10 @@ class TorrentAddFilesRequest(BaseModel):
     files: list[int] = []
 
 
+class TorrentDeleteRequest(BaseModel):
+    delete_files: bool = False
+
+
 @app.post("/api/torrent/{job_id}/delete-file", dependencies=[Depends(check_password)])
 def torrent_delete_file(job_id: str, req: TorrentFileActionRequest):
     """Удаляет один файл раздачи (не всю задачу) — например, ненужную серию."""
@@ -2289,27 +2358,138 @@ def torrent_add_files(job_id: str, req: TorrentAddFilesRequest):
     add = set(req.files)
     if not add:
         raise HTTPException(400, "Не выбраны файлы для докачки")
-    selected = _selected_indices(job_dir) or set()
-    select = sorted(selected | add)
+    valid = {f["index"] for f in _torrent_file_list(meta)}
+    if not add <= valid:
+        raise HTTPException(400, "Некорректные номера файлов")
     # Место нужно только под ДОбавленные файлы — уже скачанные лежат на диске.
     _require_disk_space(_selected_size(str(meta), sorted(add)))
     with JOBS_LOCK:
         job = JOBS.get(safe)
+        if job and job.get("deleting"):
+            raise HTTPException(409, "Раздача удаляется")
+        if not (job_dir / ".torrent_job").is_file() or not meta.is_file():
+            raise HTTPException(404, "Раздача не найдена")
+        selected = _selected_indices(job_dir)
+        select = (valid if selected is None else selected) | add
+        _write_indices(job_dir / ".selected", select)
+        _write_indices(job_dir / ".paused_files", _paused_indices(job_dir) - add)
         if job and job.get("state") in ("queued", "downloading", "processing"):
             # Нажатия копятся в один набор: пять кнопок подряд — один
             # перезапуск aria2, а не пять.
-            job.setdefault("add_files", set()).update(select)
+            job["add_files"] = select
             job["pause"] = True
             return {"ok": True, "queued": True}
-    with JOBS_LOCK:
+        if (job_dir / ".paused").exists():
+            return {"ok": True}
         JOBS[safe] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": None, "filename": None, "error": None,
             "cancel": False, "total": None, "size": None, "type": "torrent",
         }
     threading.Thread(
-        target=_run_torrent, args=(safe, str(meta), select), daemon=True).start()
+        target=_run_torrent, args=(safe, str(meta), sorted(select)), daemon=True).start()
     return {"ok": True}
+
+
+@app.post("/api/torrent/{job_id}/pause-files", dependencies=[Depends(check_password)])
+def torrent_pause_files(job_id: str, req: TorrentAddFilesRequest):
+    job_dir = _job_dir(job_id)
+    meta = job_dir / ".meta.torrent"
+    if not (job_dir / ".torrent_job").is_file() or not meta.is_file():
+        raise HTTPException(400, "Нет метаданных раздачи")
+    valid = {f["index"] for f in _torrent_file_list(meta)}
+    indices = set(req.files)
+    if not indices or not indices <= valid:
+        raise HTTPException(400, "Некорректные номера файлов")
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job and job.get("deleting"):
+            raise HTTPException(409, "Раздача удаляется")
+        if not (job_dir / ".torrent_job").is_file() or not meta.is_file():
+            raise HTTPException(404, "Раздача не найдена")
+        selected = _selected_indices(job_dir)
+        selected = (valid if selected is None else selected) - indices
+        _write_indices(job_dir / ".selected", selected)
+        _write_indices(job_dir / ".paused_files", _paused_indices(job_dir) | indices)
+        if job and job.get("state") in ("queued", "downloading", "processing"):
+            job["add_files"] = selected
+            job["pause"] = True
+    return {"ok": True}
+
+
+@app.post("/api/torrent/{job_id}/delete", dependencies=[Depends(check_password)])
+def torrent_delete(job_id: str, req: TorrentDeleteRequest):
+    job_dir = _job_dir(job_id)
+    if not (job_dir / ".torrent_job").is_file():
+        raise HTTPException(404, "Раздача не найдена")
+    with JOBS_LOCK:
+        if not (job_dir / ".torrent_job").is_file():
+            raise HTTPException(404, "Раздача не найдена")
+        job = JOBS.get(job_id)
+        if job and job.get("deleting"):
+            raise HTTPException(409, "Раздача уже удаляется")
+        if not job:
+            job = JOBS[job_id] = {"type": "torrent", "state": "paused"}
+        job["deleting"] = True
+        job.pop("add_files", None)
+        if job.get("state") in ("queued", "downloading", "processing"):
+            job["pause"] = True
+    deadline = time.monotonic() + 20
+    while True:
+        with JOBS_LOCK:
+            active = (JOBS.get(job_id) or {}).get("state") in ("queued", "downloading", "processing")
+        if not active:
+            break
+        if time.monotonic() >= deadline:
+            with JOBS_LOCK:
+                if JOBS.get(job_id):
+                    JOBS[job_id]["deleting"] = False
+            raise HTTPException(409, "Не удалось вовремя остановить раздачу; повторите удаление")
+        time.sleep(0.1)
+    warnings = []
+    try:
+        if req.delete_files:
+            published_file = job_dir / ".published"
+            try:
+                published = json.loads(published_file.read_text(encoding="utf-8")) if published_file.exists() else {}
+                expected = {f["path"] for f in _torrent_file_list(job_dir / ".meta.torrent")}
+                if not isinstance(published, dict):
+                    raise ValueError("invalid map")
+            except Exception:
+                published, expected = {}, set()
+                warnings.append("Файлы библиотеки с неизвестной принадлежностью сохранены")
+            if SHARE_PATH:
+                for rel, name in published.items():
+                    if not isinstance(rel, str) or rel not in expected or not isinstance(name, str) or Path(name).name != name:
+                        warnings.append("Файл библиотеки с неизвестной принадлежностью сохранён")
+                        continue
+                    shared = any(name in _published_map(d).values() for d in _iter_job_dirs() if d != job_dir)
+                    if shared:
+                        warnings.append(f"Общий файл сохранён: {name}")
+                        continue
+                    if (SHARE_PATH / name).is_symlink():
+                        warnings.append(f"Ссылка в библиотеке сохранена: {name}")
+                        continue
+                    _safe_share_file(name).unlink(missing_ok=True)
+            elif published:
+                warnings.append("Файлы библиотеки сохранены: библиотека недоступна")
+            if not published_file.exists():
+                warnings.append("Старые файлы библиотеки без карты принадлежности сохранены")
+            shutil.rmtree(job_dir)
+        else:
+            (job_dir / ".preserved").touch()
+            for name in SERVICE_FILES - {".preserved", ".torrent_job"}:
+                (job_dir / name).unlink(missing_ok=True)
+            (job_dir / ".meta.torrent").unlink(missing_ok=True)
+            (job_dir / ".torrent_job").unlink()
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+    except Exception as exc:
+        with JOBS_LOCK:
+            if JOBS.get(job_id):
+                JOBS[job_id]["deleting"] = False
+        raise HTTPException(500, f"Не удалось удалить раздачу: {exc}")
+    return {"ok": True, "warnings": warnings}
 
 
 @app.post("/api/torrent/{job_id}/resume", dependencies=[Depends(check_password)])
@@ -2332,6 +2512,8 @@ def torrent_resume(job_id: str, check_integrity: bool = False):
     with JOBS_LOCK:
         job = JOBS.get(safe)
         state = job.get("state") if job else None
+        if job and job.get("deleting"):
+            raise HTTPException(409, "Раздача удаляется")
     if state in ("queued", "downloading", "processing"):
         raise HTTPException(409, "Раздача уже качается")
     _require_disk_space()
@@ -2340,7 +2522,15 @@ def torrent_resume(job_id: str, check_integrity: bool = False):
         raise HTTPException(429, "Сейчас слишком много загрузок — попробуйте позже.")
     title = _torrent_root_name(meta) or "Торрент"
     select = _selected_indices(job_dir)
+    if select == set():
+        raise HTTPException(409, "Нет выбранных файлов для продолжения")
     with JOBS_LOCK:
+        job = JOBS.get(safe)
+        if job and (job.get("deleting") or job.get("state") in ("queued", "downloading", "processing")):
+            raise HTTPException(409, "Раздача занята")
+        if not (job_dir / ".torrent_job").is_file() or not meta.is_file():
+            raise HTTPException(404, "Раздача не найдена")
+        (job_dir / ".paused").unlink(missing_ok=True)
         JOBS[safe] = {
             "state": "queued", "percent": None, "speed": None,
             "eta": None, "title": title, "filename": None, "error": None,
@@ -2349,7 +2539,7 @@ def torrent_resume(job_id: str, check_integrity: bool = False):
         }
     threading.Thread(
         target=_run_torrent,
-        args=(safe, str(meta), sorted(select) if select else None),
+        args=(safe, str(meta), sorted(select) if select is not None else None),
         kwargs={"check_integrity": check_integrity},
         daemon=True).start()
     return {"ok": True}
@@ -2366,8 +2556,13 @@ def torrent_pause(job_id: str):
             raise HTTPException(404, "Задача не найдена")
         if job.get("type") != "torrent":
             raise HTTPException(400, "Пауза доступна только для торрентов")
-        if job.get("state") not in ("queued", "downloading"):
+        if job.get("state") not in ("queued", "downloading", "processing"):
             raise HTTPException(409, "Раздача сейчас не качается")
+        if job.get("deleting"):
+            raise HTTPException(409, "Раздача удаляется")
+        job_dir = _job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / ".paused").touch()
         job["pause"] = True
     return {"ok": True}
 
@@ -2960,6 +3155,8 @@ def _resume_interrupted_torrents():
     for d in _iter_job_dirs():
         if not (d / ".torrent_job").exists():
             continue
+        if (d / ".paused").exists():
+            continue
         meta = d / ".meta.torrent"
         if not meta.is_file():
             continue
@@ -2986,7 +3183,7 @@ def _resume_interrupted_torrents():
             }
         threading.Thread(
             target=_run_torrent,
-            args=(d.name, str(meta), sorted(select) if select else None),
+            args=(d.name, str(meta), sorted(select) if select is not None else None),
             daemon=True).start()
 
 
