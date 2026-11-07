@@ -9,6 +9,7 @@ import ctypes
 import errno
 import re
 import html
+import hashlib
 import json
 import time
 import uuid
@@ -1816,6 +1817,7 @@ def _run_torrent(job_id: str, source: str, select=None, auto_rest: bool = False,
             "--dir", str(job_dir),
             "--seed-time=0",              # не раздаём после докачки — сразу выходим
             "--summary-interval=1",       # строка прогресса раз в секунду
+            "--auto-save-interval=5",     # обновлять карту готовых фрагментов
             "--console-log-level=warn",
             "--file-allocation=none",     # не преаллоцируем весь размер на диск
             "--bt-stop-timeout=300",      # 5 мин без пиров — прекращаем
@@ -2045,6 +2047,55 @@ def _torrent_file_list(torrent_path: Path) -> list[dict]:
         files = [{"path": info[b"name"].decode("utf-8", "replace"),
                   "size": info[b"length"]}]
     return [dict(f, index=i) for i, f in enumerate(files, start=1)]
+
+
+def _torrent_piece_progress(job_dir: Path, files: list[dict]) -> dict[int, int]:
+    """Байты проверенных фрагментов по файлам из контрольного файла aria2."""
+    try:
+        data = (job_dir / ".meta.torrent").read_bytes()
+        if data[:1] != b"d":
+            return {}
+        pos = 1
+        while data[pos:pos + 1] != b"e":
+            key, pos = _bdecode(data, pos)
+            start = pos
+            value, pos = _bdecode(data, pos)
+            if key == b"info":
+                info = value
+                info_hash = hashlib.sha1(data[start:pos]).digest()
+                break
+        else:
+            return {}
+        name = info[b"name"].decode("utf-8", "replace")
+        if name in ("", ".", "..") or "/" in name or "\\" in name:
+            return {}
+        control = _checked_work_path(job_dir / (name + ".aria2"), job_dir)
+        with control.open("rb") as f:
+            raw = f.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024 or len(raw) < 34 or raw[:2] != b"\x00\x01":
+            return {}
+        hash_len = int.from_bytes(raw[6:10], "big")
+        offset = 10 + hash_len
+        if hash_len != 20 or raw[10:offset] != info_hash or len(raw) < offset + 24:
+            return {}
+        piece = int.from_bytes(raw[offset:offset + 4], "big")
+        total = int.from_bytes(raw[offset + 4:offset + 12], "big")
+        length = int.from_bytes(raw[offset + 20:offset + 24], "big")
+        bits = raw[offset + 24:offset + 24 + length]
+        if (piece <= 0 or piece != info[b"piece length"] or total != sum(f["size"] for f in files)
+                or length != ((total + piece - 1) // piece + 7) // 8 or len(bits) != length):
+            return {}
+        result, start = {}, 0
+        for file in files:
+            end = start + file["size"]
+            result[file["index"]] = sum(
+                min(end, (i + 1) * piece) - max(start, i * piece)
+                for i in range(start // piece, (end + piece - 1) // piece)
+                if bits[i // 8] & (0x80 >> (i % 8)))
+            start = end
+        return result
+    except (OSError, ValueError, KeyError, IndexError, TypeError, HTTPException):
+        return {}
 
 
 def _selected_indices(job_dir: Path):
@@ -2295,7 +2346,13 @@ def torrent_job_files(job_id: str):
     job_dir = _job_dir(safe)
     if not job_dir.is_dir():
         raise HTTPException(404, "Задача не найдена")
-    return {"files": _torrent_status_files(job_dir)}
+    files = _torrent_status_files(job_dir)
+    progress = _torrent_piece_progress(job_dir, files)
+    for file in files:
+        if not file["done"] and file.get("index") in progress:
+            file["downloaded"] = progress[file["index"]]
+            file["percent"] = min(99, int(file["downloaded"] * 100 / file["size"])) if file["size"] else 0
+    return {"files": files}
 
 
 class TorrentFileActionRequest(BaseModel):

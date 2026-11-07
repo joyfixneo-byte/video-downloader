@@ -149,6 +149,7 @@ def main():
         # --- 7. add-files ("докачать"): объединяет .selected, не трогает диск ---
         job_dir2 = tmp / "job2"
         job_dir2.mkdir()
+        (job_dir2 / ".torrent_job").touch()
         (job_dir2 / ".meta.torrent").write_bytes(
             make_torrent("Show2", [("A.mkv", 10), ("B.mkv", 20)]))
         (job_dir2 / ".selected").write_text("1")
